@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>内容提交 · 供应商上传入口</title>
+<style>
+  :root {
+    --primary: #1a73e8; --success: #2e9e5b; --danger: #d64545;
+    --bg: #f5f6f8; --card: #ffffff; --border: #e3e5e8; --text: #1f2329; --muted: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--text); display: flex; flex-direction: column; min-height: 100vh; }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+  main { flex: 1; display: flex; justify-content: center; align-items: flex-start; padding: 32px 16px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+          padding: 28px; width: 100%; max-width: 540px; }
+  .card h2 { margin-top: 0; font-size: 16px; }
+  .field { margin-bottom: 18px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  label .req { color: var(--danger); margin-left: 2px; }
+  input[type=text], input[type=file] {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
+    outline: none; transition: border-color .15s;
+  }
+  input[type=text]:focus, input[type=file]:focus { border-color: var(--primary); }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .drop-zone {
+    border: 2px dashed var(--border); border-radius: 10px; padding: 24px;
+    text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+    position: relative;
+  }
+  .drop-zone.drag-over { border-color: var(--primary); background: #eef4fd; }
+  .drop-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  .drop-zone .icon { font-size: 32px; margin-bottom: 8px; }
+  .drop-zone .label { font-size: 14px; font-weight: 500; }
+  .drop-zone .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  #file-preview { margin-top: 10px; font-size: 13px; color: var(--text); }
+  #file-preview .preview-item { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-top: 1px solid var(--border); }
+  #file-preview img { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; background: #eee; }
+  #file-preview video { width: 48px; height: 48px; object-fit: cover; border-radius: 6px; background: #333; }
+  .progress-bar-wrap { background: #e9ecef; border-radius: 6px; height: 8px; margin-top: 8px; display: none; }
+  .progress-bar { height: 8px; border-radius: 6px; background: var(--primary); width: 0; transition: width .2s; }
+  .btn { border: none; border-radius: 8px; padding: 11px 24px; font-size: 14px; cursor: pointer; width: 100%; font-weight: 600; }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:disabled { background: #a8c7f5; cursor: not-allowed; }
+  #status-msg { margin-top: 14px; font-size: 14px; padding: 10px 14px; border-radius: 8px; display: none; }
+  #status-msg.success { background: #ecfdf5; color: var(--success); border: 1px solid #a7f3d0; }
+  #status-msg.error   { background: #fef2f2; color: var(--danger); border: 1px solid #fca5a5; }
+  footer { text-align: center; font-size: 12px; color: var(--muted); padding: 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>内容提交平台</h1>
+  <p>供应商内容上传入口 · 上传后将进入人工+自动审核流程，请确保内容合规</p>
+</header>
+
+<main>
+  <div class="card">
+    <h2>提交内容</h2>
+
+    <div class="field">
+      <label>供应商 ID <span class="req">*</span></label>
+      <input type="text" id="supplier-id" placeholder="请输入您的供应商编号，如 supplier_001" maxlength="64">
+      <div class="hint">由对接负责人提供，用于追踪内容来源</div>
+    </div>
+
+    <div class="field">
+      <label>上传文件 <span class="req">*</span></label>
+      <div class="drop-zone" id="drop-zone">
+        <input type="file" id="file-input" accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.m4v">
+        <div class="icon">📁</div>
+        <div class="label">点击或拖拽文件到此处</div>
+        <div class="sub">支持 JPG / PNG / WEBP / MP4 / MOV · 单文件不超过 200MB</div>
+      </div>
+      <div id="file-preview"></div>
+      <div class="progress-bar-wrap" id="progress-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+    </div>
+
+    <button class="btn btn-primary" id="submit-btn" disabled>提交审核</button>
+    <div id="status-msg"></div>
+  </div>
+</main>
+
+<footer>内容上传后将进入审核队列，审核结果由内容运营团队处理。请勿上传违法违规内容。</footer>
+
+<script>
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const preview = document.getElementById('file-preview');
+const submitBtn = document.getElementById('submit-btn');
+const statusMsg = document.getElementById('status-msg');
+const progressWrap = document.getElementById('progress-wrap');
+const progressBar = document.getElementById('progress-bar');
+
+let selectedFile = null;
+
+function showPreview(file) {
+  selectedFile = file;
+  const url = URL.createObjectURL(file);
+  const isVideo = file.type.startsWith('video/');
+  const size = (file.size / 1024 / 1024).toFixed(2);
+  let mediaEl = '';
+  if (isVideo) {
+    mediaEl = `<video src="${url}" preload="metadata"></video>`;
+  } else {
+    mediaEl = `<img src="${url}" alt="preview">`;
+  }
+  preview.innerHTML = `<div class="preview-item">
+    ${mediaEl}
+    <div>
+      <div style="font-weight:600">${escHtml(file.name)}</div>
+      <div style="color:var(--muted);font-size:12px">${isVideo ? '视频' : '图片'} · ${size} MB</div>
+    </div>
+  </div>`;
+  submitBtn.disabled = false;
+}
+
+function escHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length > 0) showPreview(fileInput.files[0]);
+});
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files.length > 0) showPreview(e.dataTransfer.files[0]);
+});
+
+submitBtn.addEventListener('click', async () => {
+  const supplierId = document.getElementById('supplier-id').value.trim();
+  if (!supplierId) { showStatus('error', '请填写供应商 ID'); return; }
+  if (!selectedFile) { showStatus('error', '请选择要上传的文件'); return; }
+
+  submitBtn.disabled = true;
+  progressWrap.style.display = 'block';
+  progressBar.style.width = '0%';
+  hideStatus();
+
+  const formData = new FormData();
+  formData.append('supplier_id', supplierId);
+  formData.append('file', selectedFile);
+
+  try {
+    // 用 XMLHttpRequest 以便展示上传进度
+    const result = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/upload');
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+          progressBar.style.width = Math.round(e.loaded / e.total * 100) + '%';
+        }
+      };
+      xhr.onload = () => {
+        try { resolve(JSON.parse(xhr.responseText)); }
+        catch (_) { reject(new Error('服务器返回格式错误')); }
+      };
+      xhr.onerror = () => reject(new Error('网络错误，请稍后重试'));
+      xhr.send(formData);
+    });
+
+    progressBar.style.width = '100%';
+    if (result.error) {
+      showStatus('error', result.error);
+      submitBtn.disabled = false;
+    } else {
+      showStatus('success', `上传成功！内容 ID：${result.content_id}，已进入审核队列。`);
+      // 重置表单
+      selectedFile = null;
+      preview.innerHTML = '';
+      fileInput.value = '';
+      document.getElementById('supplier-id').value = '';
+    }
+  } catch (e) {
+    showStatus('error', e.message);
+    submitBtn.disabled = false;
+  } finally {
+    setTimeout(() => { progressWrap.style.display = 'none'; }, 800);
+  }
+});
+
+function showStatus(type, msg) {
+  statusMsg.className = type;
+  statusMsg.textContent = msg;
+  statusMsg.style.display = 'block';
+}
+function hideStatus() { statusMsg.style.display = 'none'; }
+</script>
+</body>
+</html>

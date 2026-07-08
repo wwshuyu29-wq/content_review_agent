@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>内容审核看板</title>
+<style>
+  :root {
+    --pass: #2e9e5b; --reject: #d64545; --pending: #d68f00; --high: #c0392b;
+    --bg: #f5f6f8; --card: #ffffff; --border: #e3e5e8; --text: #1f2329; --muted: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 12px 20px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 10; }
+  header h1 { font-size: 18px; margin: 0; }
+  #reviewer-box { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  #reviewer-box input { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; width: 140px; }
+  .tabs { display: flex; gap: 4px; padding: 10px 20px 0; }
+  .tab { padding: 8px 16px; border-radius: 8px 8px 0 0; cursor: pointer; background: var(--border); color: var(--muted); font-size: 14px; }
+  .tab.active { background: var(--card); color: var(--text); font-weight: 600; }
+  main { padding: 16px 20px; }
+  .stats { display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; font-size: 13px; }
+  .stat-card b { font-size: 18px; display: block; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; cursor: pointer; transition: box-shadow .15s; }
+  .card:hover { box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+  .thumb { width: 100%; height: 140px; background: #eee; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; overflow: hidden; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .card-body { padding: 10px; font-size: 12px; }
+  .card-body .id { color: var(--muted); font-family: monospace; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; color: #fff; margin-top: 6px; }
+  .badge.auto_passed, .badge.human_approved { background: var(--pass); }
+  .badge.auto_rejected, .badge.human_rejected { background: var(--reject); }
+  .badge.needs_human { background: var(--pending); }
+  .badge.queued_for_review { background: var(--muted); }
+  .badge.intake_failed { background: #999; }
+  .risk-tag { display: inline-block; background: #fdecea; color: var(--high); border-radius: 6px; padding: 1px 6px; font-size: 10px; margin-right: 4px; margin-top: 4px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: center; justify-content: center; z-index: 100; }
+  .modal { background: var(--card); border-radius: 12px; padding: 20px; width: 480px; max-width: 92vw; max-height: 88vh; overflow-y: auto; }
+  .modal h3 { margin-top: 0; }
+  .modal .field { margin-bottom: 10px; font-size: 13px; }
+  .modal .field label { color: var(--muted); display: block; margin-bottom: 2px; }
+  .modal img, .modal video { max-width: 100%; border-radius: 8px; margin-bottom: 10px; }
+  .btn { border: none; border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
+  .btn-primary { background: #1a73e8; color: #fff; }
+  .btn-danger { background: var(--reject); color: #fff; }
+  .btn-secondary { background: var(--border); color: var(--text); }
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  textarea { width: 100%; border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 13px; min-height: 60px; resize: vertical; }
+  .close-x { float: right; cursor: pointer; color: var(--muted); font-size: 18px; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #1f2329; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; display: none; z-index: 200; }
+  .warn { color: var(--high); font-size: 12px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>内容审核看板</h1>
+  <div id="reviewer-box">
+    <span>当前工号：</span>
+    <input id="reviewer-input" placeholder="输入你的工号/邮箱前缀" />
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="all">全部内容</div>
+  <div class="tab" data-tab="needs_human">待人工审核（可认领）</div>
+</div>
+
+<main>
+  <div class="stats" id="stats"></div>
+  <div class="grid" id="grid"></div>
+</main>
+
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal-body"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = "";
+let currentTab = "all";
+let currentRecords = [];
+
+function getReviewer() {
+  return document.getElementById("reviewer-input").value.trim();
+}
+document.getElementById("reviewer-input").value = localStorage.getItem("reviewer_id") || "";
+document.getElementById("reviewer-input").addEventListener("input", (e) => {
+  localStorage.setItem("reviewer_id", e.target.value.trim());
+});
+
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  setTimeout(() => t.style.display = "none", 2600);
+}
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    currentTab = tab.dataset.tab;
+    loadRecords();
+  });
+});
+
+async function loadStats() {
+  const res = await fetch(`${API}/api/stats`);
+  const data = await res.json();
+  const box = document.getElementById("stats");
+  const labelMap = {
+    queued_for_review: "待自动审核", auto_passed: "自动通过", auto_rejected: "自动拒绝",
+    needs_human: "待人工审核", human_approved: "人工通过", human_rejected: "人工拒绝",
+    intake_failed: "入库失败"
+  };
+  box.innerHTML = `<div class="stat-card"><b>${data.total}</b>总内容数</div>` +
+    Object.entries(data.by_status).map(([k, v]) =>
+      `<div class="stat-card"><b>${v}</b>${labelMap[k] || k}</div>`).join("");
+}
+
+async function loadRecords() {
+  const url = currentTab === "needs_human" ? `${API}/api/human-queue` : `${API}/api/records`;
+  const res = await fetch(url);
+  const data = await res.json();
+  currentRecords = data.records;
+  renderGrid();
+}
+
+const statusLabel = {
+  queued_for_review: "待自动审核", auto_passed: "自动通过", auto_rejected: "自动拒绝",
+  needs_human: "待人工审核", human_approved: "人工通过", human_rejected: "人工拒绝",
+  intake_failed: "入库失败"
+};
+
+function renderGrid() {
+  const grid = document.getElementById("grid");
+  if (!currentRecords.length) {
+    grid.innerHTML = `<div class="empty">暂无内容</div>`;
+    return;
+  }
+  grid.innerHTML = currentRecords.map(r => {
+    const approved = r.status === "auto_passed" || r.status === "human_approved";
+    const thumb = approved
+      ? `<img src="/media/${r.content_id}" loading="lazy" onerror="this.parentNode.textContent='加载失败'"/>`
+      : `<span>${r.content_type === "video" ? "🎬" : "🖼"} 审核中不展示原图</span>`;
+    const risks = (r.risk_categories || []).map(c => `<span class="risk-tag">${c}</span>`).join("");
+    return `
+      <div class="card" onclick="openDetail('${r.content_id}')">
+        <div class="thumb">${thumb}</div>
+        <div class="card-body">
+          <div class="id">${r.content_id}</div>
+          <div>${r.supplier_id || "-"} · ${r.content_type || "-"}</div>
+          <span class="badge ${r.status}">${statusLabel[r.status] || r.status}</span>
+          <div>${risks}</div>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+async function openDetail(contentId) {
+  const res = await fetch(`${API}/api/records/${contentId}`);
+  const r = await res.json();
+  const overlay = document.getElementById("modal-overlay");
+  const body = document.getElementById("modal-body");
+  const approved = r.status === "auto_passed" || r.status === "human_approved";
+
+  let mediaHtml = "";
+  if (approved) {
+    mediaHtml = r.content_type === "video"
+      ? `<video src="/media/${contentId}" controls></video>`
+      : `<img src="/media/${contentId}" />`;
+  } else {
+    mediaHtml = `<div class="warn">该内容尚未通过审核，看板不展示原图（避免未审核/高风险内容曝光）</div>`;
+  }
+
+  let actionHtml = "";
+  if (r.status === "needs_human") {
+    const claimedByMe = r.claimed_by && r.claimed_by === getReviewer();
+    const claimedByOther = r.claimed_by && r.claimed_by !== getReviewer();
+    if (!r.claimed_by) {
+      actionHtml = `<div class="btn-row"><button class="btn btn-primary" onclick="claim('${contentId}')">认领</button></div>`;
+    } else if (claimedByMe) {
+      actionHtml = `
+        <div class="field"><label>已由你认领 · ${r.claim_time || ""}</label></div>
+        <div class="field"><label>处理结论理由（高风险类别必填且不能过于简单）</label>
+          <textarea id="reason-input" placeholder="写下你的判断依据"></textarea>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="submitDecision('${contentId}','approved')">通过</button>
+          <button class="btn btn-danger" onclick="submitDecision('${contentId}','rejected')">拒绝</button>
+          <button class="btn btn-secondary" onclick="release('${contentId}')">释放认领</button>
+        </div>`;
+    } else if (claimedByOther) {
+      actionHtml = `<div class="warn">已被 ${r.claimed_by} 认领，认领时间 ${r.claim_time || ""}</div>`;
+    }
+  }
+
+  body.innerHTML = `
+    <span class="close-x" onclick="closeModal()">✕</span>
+    <h3>${contentId}</h3>
+    ${mediaHtml}
+    <div class="field"><label>供应商</label>${r.supplier_id || "-"}</div>
+    <div class="field"><label>类型</label>${r.content_type || "-"}</div>
+    <div class="field"><label>提交时间</label>${r.submit_time || "-"}</div>
+    <div class="field"><label>状态</label><span class="badge ${r.status}">${statusLabel[r.status] || r.status}</span></div>
+    <div class="field"><label>自动审核结论</label>${r.auto_verdict || "-"}（风险等级：${r.risk_level || "-"}）</div>
+    <div class="field"><label>风险类别</label>${(r.risk_categories || []).join(", ") || "无"}</div>
+    <div class="field"><label>自动审核依据</label>${r.auto_reason || "-"}</div>
+    ${r.video_note ? `<div class="warn">${r.video_note}</div>` : ""}
+    ${r.human_decision ? `<div class="field"><label>人工结论</label>${r.human_decision} by ${r.human_reviewer}（${r.human_decision_time}）：${r.human_reason}</div>` : ""}
+    ${actionHtml}
+  `;
+  overlay.style.display = "flex";
+}
+
+function closeModal() {
+  document.getElementById("modal-overlay").style.display = "none";
+}
+document.getElementById("modal-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "modal-overlay") closeModal();
+});
+
+async function claim(contentId) {
+  const reviewer = getReviewer();
+  if (!reviewer) { toast("请先在右上角输入你的工号"); return; }
+  const res = await fetch(`${API}/api/claim`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({content_id: contentId, reviewer})
+  });
+  const data = await res.json();
+  if (!res.ok) { toast(data.error || "认领失败"); return; }
+  toast("认领成功");
+  openDetail(contentId);
+  loadRecords();
+}
+
+async function release(contentId) {
+  const reviewer = getReviewer();
+  const res = await fetch(`${API}/api/release`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({content_id: contentId, reviewer})
+  });
+  const data = await res.json();
+  if (!res.ok) { toast(data.error || "释放失败"); return; }
+  toast("已释放认领");
+  closeModal();
+  loadRecords();
+}
+
+async function submitDecision(contentId, decision) {
+  const reviewer = getReviewer();
+  const reason = document.getElementById("reason-input").value.trim();
+  const res = await fetch(`${API}/api/submit`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({content_id: contentId, reviewer, decision, reason})
+  });
+  const data = await res.json();
+  if (!res.ok) { toast(data.error || "提交失败"); return; }
+  toast("提交成功：" + data.status);
+  closeModal();
+  loadRecords();
+  loadStats();
+}
+
+function refreshAll() {
+  loadStats();
+  loadRecords();
+}
+refreshAll();
+setInterval(refreshAll, 8000);
+</script>
+</body>
+</html>

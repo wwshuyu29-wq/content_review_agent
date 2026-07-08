@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据 / 密钥（绝不入库）
+data/
+*.env
+.env
+queue.jsonl
+*.csv
+
+# 供应商上传 / 临时产物
+uploads/
+content-review-*/
+report.md
+
+# 前端
+node_modules/
+dist/
+.vite/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
