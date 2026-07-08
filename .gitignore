@@ -21,6 +21,7 @@ report.md
 node_modules/
 dist/
 .vite/
+*.tsbuildinfo
 
 # 编辑器 / 系统
 .DS_Store
