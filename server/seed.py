@@ -22,14 +22,29 @@ PROJECT_FACTS = {
     "partner": "范丞丞",
     "partnership_type": "短期合作伙伴",
     "is_spokesperson": False,
-    "official_slogan": "出行更简单，AI更懂你",
-    "travel_features": [
-        "AI安排行程",
-        "个性化出游推荐",
-        "智能规划游玩路线",
-        "AI导游跟随讲解",
-        "AR导览实景沉浸式游玩",
-    ],
+    "official_slogan": "再复杂的出行，问小度想想就能搞定！",
+    "pre_post_trip_assistant": {
+        "positioning": "行前/行后AI公共出行助手",
+        "capabilities": [
+            "支持自然语言提出多点、多约束、多方式的出行需求",
+            "支持时间窗口规划",
+            "支持按人群特征和消费偏好规划",
+            "支持公交、骑行、打车组合出行",
+            "支持往返行程闭环规划",
+        ],
+    },
+    "in_trip_walking_companion": {
+        "positioning": "行中AI步行陪伴助手",
+        "capabilities": [
+            "支持语音问答",
+            "支持景点讲解及附近美食、厕所查询",
+            "支持下雨、带儿童、步行场景路线规划",
+            "支持精准游览时间规划",
+            "支持动态调整路线",
+            "支持终点餐饮和商圈推荐",
+            "支持记忆用户出行偏好",
+        ],
+    },
 }
 
 STRUCTURED_RULES = {

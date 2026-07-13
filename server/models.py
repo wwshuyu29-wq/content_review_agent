@@ -34,7 +34,12 @@ class PublishStatus(str, Enum):
 
 def enum_column(enum_type: type[Enum], default: Enum) -> Mapped[Any]:
     return mapped_column(
-        SqlEnum(enum_type, native_enum=False, validate_strings=True),
+        SqlEnum(
+            enum_type,
+            native_enum=False,
+            validate_strings=True,
+            values_callable=lambda members: [member.value for member in members],
+        ),
         default=default,
         nullable=False,
     )
@@ -54,7 +59,8 @@ class Project(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
     current_rule_version_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("rule_versions.id", use_alter=True, name="fk_projects_current_rule_version")
+        ForeignKey("rule_versions.id", use_alter=True, name="fk_projects_current_rule_version"),
+        index=True,
     )
 
     rule_versions: Mapped[List["RuleVersion"]] = relationship(
@@ -89,7 +95,7 @@ class Batch(TimestampMixin, Base):
     __tablename__ = "batches"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
     supplier_id: Mapped[str] = mapped_column(String(200), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="SUBMITTED", nullable=False)
@@ -105,7 +111,7 @@ class ContentItem(TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("batch_id", "external_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), nullable=False)
     external_id: Mapped[str] = mapped_column(String(200), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -142,9 +148,9 @@ class AuditRun(TimestampMixin, Base):
     __tablename__ = "audit_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), nullable=False)
-    content_version_id: Mapped[int] = mapped_column(ForeignKey("content_versions.id"), nullable=False)
-    rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), nullable=False)
+    content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
+    content_version_id: Mapped[int] = mapped_column(ForeignKey("content_versions.id"), index=True, nullable=False)
+    rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), index=True, nullable=False)
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="PENDING", nullable=False)
@@ -177,8 +183,8 @@ class Issue(TimestampMixin, Base):
     __tablename__ = "issues"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    audit_run_id: Mapped[int] = mapped_column(ForeignKey("audit_runs.id"), nullable=False)
-    agent_result_id: Mapped[Optional[int]] = mapped_column(ForeignKey("agent_results.id"))
+    audit_run_id: Mapped[int] = mapped_column(ForeignKey("audit_runs.id"), index=True, nullable=False)
+    agent_result_id: Mapped[Optional[int]] = mapped_column(ForeignKey("agent_results.id"), index=True)
     rule_id: Mapped[str] = mapped_column(String(100), nullable=False)
     category: Mapped[str] = mapped_column(String(100), nullable=False)
     severity: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -199,7 +205,7 @@ class ReviewTask(TimestampMixin, Base):
     __tablename__ = "review_tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), nullable=False)
+    content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
     issue_id: Mapped[Optional[int]] = mapped_column(ForeignKey("issues.id"), unique=True)
     task_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="OPEN", nullable=False)
@@ -217,7 +223,7 @@ class HumanDecision(TimestampMixin, Base):
     __tablename__ = "human_decisions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    review_task_id: Mapped[int] = mapped_column(ForeignKey("review_tasks.id"), nullable=False)
+    review_task_id: Mapped[int] = mapped_column(ForeignKey("review_tasks.id"), index=True, nullable=False)
     decision: Mapped[str] = mapped_column(String(100), nullable=False)
     reviewer: Mapped[str] = mapped_column(String(200), nullable=False)
     note: Mapped[Optional[str]] = mapped_column(Text)

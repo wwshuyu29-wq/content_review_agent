@@ -26,7 +26,7 @@ from server.models import (
     ReviewTask,
     RuleVersion,
 )
-from server.schemas import ContentItemCreate, IssueCreate
+from server.schemas import ContentItemCreate, ContentItemRead, IssueCreate
 from server.seed import seed_default_project
 
 
@@ -183,15 +183,34 @@ def test_seed_default_project_is_idempotent_and_preserves_campaign_facts(tmp_pat
         assert rules.project_facts["partner"] == "范丞丞"
         assert rules.project_facts["partnership_type"] == "短期合作伙伴"
         assert rules.project_facts["is_spokesperson"] is False
-        assert rules.project_facts["official_slogan"] == "出行更简单，AI更懂你"
+        assert rules.project_facts["official_slogan"] == "再复杂的出行，问小度想想就能搞定！"
         assert rules.structured_rules["deny_words"] == ["代言", "代言人"]
-        assert rules.project_facts["travel_features"] == [
-            "AI安排行程",
-            "个性化出游推荐",
-            "智能规划游玩路线",
-            "AI导游跟随讲解",
-            "AR导览实景沉浸式游玩",
-        ]
+        assert rules.project_facts["pre_post_trip_assistant"] == {
+            "positioning": "行前/行后AI公共出行助手",
+            "capabilities": [
+                "支持自然语言提出多点、多约束、多方式的出行需求",
+                "支持时间窗口规划",
+                "支持按人群特征和消费偏好规划",
+                "支持公交、骑行、打车组合出行",
+                "支持往返行程闭环规划",
+            ],
+        }
+        assert rules.project_facts["in_trip_walking_companion"] == {
+            "positioning": "行中AI步行陪伴助手",
+            "capabilities": [
+                "支持语音问答",
+                "支持景点讲解及附近美食、厕所查询",
+                "支持下雨、带儿童、步行场景路线规划",
+                "支持精准游览时间规划",
+                "支持动态调整路线",
+                "支持终点餐饮和商圈推荐",
+                "支持记忆用户出行偏好",
+            ],
+        }
+        serialized_facts = str(rules.project_facts)
+        assert "AR" not in serialized_facts
+        assert "出行更简单，AI更懂你" not in serialized_facts
+        assert "travel_features" not in rules.project_facts
         assert set(rules.dimension_standards) == {
             "compliance",
             "brand",
@@ -211,6 +230,91 @@ def test_get_session_uses_configured_database_url(monkeypatch: pytest.MonkeyPatc
         assert str(session.bind.url) == database_url
     finally:
         session_iterator.close()
+
+
+def test_foreign_keys_used_by_workflow_queries_are_indexed(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    database_inspector = inspect(engine)
+
+    expected_indexed_foreign_keys = {
+        "projects": {"current_rule_version_id"},
+        "rule_versions": {"project_id"},
+        "batches": {"project_id"},
+        "content_items": {"project_id", "batch_id"},
+        "content_versions": {"content_item_id"},
+        "audit_runs": {"content_item_id", "content_version_id", "rule_version_id"},
+        "agent_results": {"audit_run_id"},
+        "issues": {"audit_run_id", "agent_result_id"},
+        "review_tasks": {"content_item_id", "issue_id"},
+        "human_decisions": {"review_task_id"},
+    }
+
+    for table_name, expected_columns in expected_indexed_foreign_keys.items():
+        indexed_columns = {
+            column
+            for index in database_inspector.get_indexes(table_name)
+            for column in index["column_names"]
+        }
+        indexed_columns.update(
+            constraint["column_names"][0]
+            for constraint in database_inspector.get_unique_constraints(table_name)
+            if constraint["column_names"]
+        )
+        assert expected_columns <= indexed_columns, table_name
+
+
+def test_workflow_identity_constraints_are_unique(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    database_inspector = inspect(engine)
+
+    expected_unique_constraints = {
+        "projects": {("name",)},
+        "rule_versions": {("project_id", "version")},
+        "content_items": {("batch_id", "external_id")},
+        "content_versions": {("content_item_id", "version")},
+        "agent_results": {("audit_run_id", "agent_name")},
+        "review_tasks": {("issue_id",)},
+    }
+
+    for table_name, expected_constraints in expected_unique_constraints.items():
+        actual_constraints = {
+            tuple(constraint["column_names"])
+            for constraint in database_inspector.get_unique_constraints(table_name)
+        }
+        assert expected_constraints <= actual_constraints, table_name
+
+
+def test_content_status_enums_store_values_and_serialize_from_orm(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        project = Project(name="枚举测试项目")
+        batch = Batch(project=project, supplier_id="supplier-enum", name="枚举批次")
+        item = ContentItem(
+            project=project,
+            batch=batch,
+            external_id="enum-content",
+            title="枚举标题",
+            format_status=FormatStatus.INCOMPLETE,
+            review_status=ReviewStatus.MANUAL_REQUIRED,
+            publish_status=PublishStatus.NOT_READY,
+        )
+        session.add(item)
+        session.commit()
+        schema = ContentItemRead.model_validate(item)
+
+        assert schema.model_dump(mode="json")["format_status"] == "INCOMPLETE"
+        assert schema.model_dump(mode="json")["review_status"] == "MANUAL_REQUIRED"
+        assert schema.model_dump(mode="json")["publish_status"] == "NOT_READY"
+
+    with engine.connect() as connection:
+        stored = connection.exec_driver_sql(
+            "SELECT format_status, review_status, publish_status FROM content_items"
+        ).one()
+        assert stored == ("INCOMPLETE", "MANUAL_REQUIRED", "NOT_READY")
 
 
 def test_schemas_validate_statuses_and_issue_confidence() -> None:
