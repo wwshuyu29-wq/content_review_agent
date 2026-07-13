@@ -1,317 +1,547 @@
-"""内容审核 Web 后端（FastAPI）。
-
-复用 scripts/text_review 的审核引擎、标准仓库、状态机，Flask/CLI/网页共用同一套逻辑与数据。
-本层只做 HTTP 路由，不重复实现业务逻辑。
-
-数据（默认 data/，已被 .gitignore 忽略）：
-  data/review.csv       审核表（LocalCsvAdapter 载体）
-  data/standards/       分维度标准 + 项目标准 + rules.json
-  data/uploads/         供应商上传的图片
-  data/config.json      审核配置（模型后端/model/项目；key 只走环境变量）
-
-运行：
-  pip install fastapi "uvicorn[standard]" python-multipart
-  uvicorn server.main:app --reload --port 8000
-"""
+"""FastAPI entry point for the database-backed content review workflow."""
 from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 import uuid
-from typing import Optional
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, Generator, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, selectinload
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts.text_review.reviewer import get_reviewer
+from server.db import Base, create_db_engine
+from server.models import (
+    AgentResult,
+    AuditRun,
+    Batch,
+    ContentItem,
+    ContentVersion,
+    HumanDecision,
+    Issue,
+    Project,
+    ReviewTask,
+    RuleVersion,
+)
+from server.schemas import (
+    AgentResultRead,
+    AuditRunRead,
+    BatchRead,
+    ContentItemRead,
+    ContentVersionRead,
+    HumanDecisionRead,
+    IssueRead,
+    ProjectCreate,
+    ProjectRead,
+    ReviewTaskRead,
+    RuleVersionRead,
+)
+from server.seed import seed_default_project
+from server.services.content_service import submit_batch
+from server.services.report_service import build_report
+from server.services.review_service import resolve_task, run_audit
 
-from scripts.text_review import engine, report, schema  # noqa: E402
-from scripts.text_review.reviewer import get_reviewer  # noqa: E402
-from scripts.text_review.standards import get_standards_repo  # noqa: E402
-from scripts.text_review.table_adapter import LocalCsvAdapter  # noqa: E402
 
-# ── 路径 ───────────────────────────────────────────────────
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.environ.get("CR_DATA_DIR", os.path.join(REPO_DIR, "data"))
-TABLE = os.path.join(DATA_DIR, "review.csv")
-STANDARDS_DIR = os.path.join(DATA_DIR, "standards")
-UPLOADS = os.path.join(DATA_DIR, "uploads")
-CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+REPO_DIR = Path(__file__).resolve().parents[1]
+ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+DEFAULT_CONFIG = {"reviewer": "offline", "model": "", "base_url": ""}
 
-ALLOWED_IMAGE = {".jpg", ".jpeg", ".png", ".webp"}
-DEFAULT_CONFIG = {"reviewer": "heuristic", "model": "", "base_url": "", "project": ""}
 
-app = FastAPI(title="内容审核后端")
+def _data_dir() -> Path:
+    return Path(os.environ.get("CR_DATA_DIR", str(REPO_DIR / "data")))
+
+
+def _uploads_dir() -> Path:
+    return _data_dir() / "uploads"
+
+
+def _config_path() -> Path:
+    return _data_dir() / "config.json"
+
+
+def _load_config() -> Dict[str, str]:
+    path = _config_path()
+    if not path.exists():
+        return dict(DEFAULT_CONFIG)
+    with path.open("r", encoding="utf-8") as stream:
+        saved = json.load(stream)
+    return {key: str(saved.get(key, default)) for key, default in DEFAULT_CONFIG.items()}
+
+
+def _save_config(config: Dict[str, str]) -> None:
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(config, stream, ensure_ascii=False, indent=2)
+
+
+def get_session() -> Generator[Session, None, None]:
+    engine = create_db_engine()
+    with Session(engine, expire_on_commit=False) as session:
+        yield session
+
+
+def get_audit_reviewer() -> Any:
+    config = _load_config()
+    if config["model"]:
+        os.environ["ONEAPI_MODEL"] = config["model"]
+    if config["base_url"]:
+        os.environ["ONEAPI_BASE_URL"] = config["base_url"]
+    return get_reviewer(config["reviewer"])
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _data_dir().mkdir(parents=True, exist_ok=True)
+    _uploads_dir().mkdir(parents=True, exist_ok=True)
+    if not _config_path().exists():
+        _save_config(dict(DEFAULT_CONFIG))
+    engine = create_db_engine()
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        seed_default_project(session)
+        session.commit()
+    engine.dispose()
+    yield
+
+
+app = FastAPI(title="内容审核后端", version="2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["*"], allow_headers=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
-# ── 初始化 ─────────────────────────────────────────────────
-def _init():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(UPLOADS, exist_ok=True)
-    repo = get_standards_repo("local", STANDARDS_DIR)
-    repo.scaffold()  # 首次生成分维度标准模板 + rules.json
-    if not os.path.exists(CONFIG_PATH):
-        _save_config(DEFAULT_CONFIG)
-    if not os.path.exists(TABLE):
-        LocalCsvAdapter(TABLE).write_rows([])
+class OrmResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
 
 
-def _load_config() -> dict:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    return {**DEFAULT_CONFIG, **cfg}
+class RuleVersionInput(BaseModel):
+    dimension_standards: Dict[str, Any] = Field(default_factory=dict)
+    project_facts: Dict[str, Any] = Field(default_factory=dict)
+    structured_rules: Dict[str, Any] = Field(default_factory=dict)
+    prompt_version: str = Field(min_length=1, max_length=100)
 
 
-def _save_config(cfg: dict):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+class ProjectDetail(ProjectRead):
+    current_rule_version: Optional[RuleVersionRead] = None
+    rule_versions: List[RuleVersionRead] = Field(default_factory=list)
 
 
-def _adapter():
-    return LocalCsvAdapter(TABLE)
+class ContentSummary(ContentItemRead):
+    versions: List[ContentVersionRead] = Field(default_factory=list)
 
 
-def _repo():
-    return get_standards_repo("local", STANDARDS_DIR)
+class AuditDetail(AuditRunRead):
+    agent_results: List[AgentResultRead] = Field(default_factory=list)
+    issues: List[IssueRead] = Field(default_factory=list)
 
 
-def _public(row: dict) -> dict:
-    r = dict(row)
-    r.pop(schema.COL_AUDIT, None)  # 留痕内部字段，列表不返回
-    # 用 media 字段是否有值判断有无图，不暴露服务器本地路径
-    return r
+class ContentDetail(ContentSummary):
+    latest_audit: Optional[AuditDetail] = None
+    open_tasks: List[ReviewTaskRead] = Field(default_factory=list)
 
 
-_init()
+class BatchDetail(BatchRead):
+    content_count: int
+    contents: List[ContentSummary] = Field(default_factory=list)
 
 
-# ── 内容 / 审核 ────────────────────────────────────────────
-@app.get("/api/rows")
-def list_rows(status: Optional[str] = None):
-    rows = _adapter().read_rows()
-    if status:
-        rows = [r for r in rows if (r.get(schema.COL_STATUS) or "").strip() == status]
-    rows.sort(key=lambda r: r.get(schema.COL_ID, ""), reverse=True)
-    return {"count": len(rows), "rows": [_public(r) for r in rows]}
+class TaskResolveInput(BaseModel):
+    decision: str = Field(min_length=1, max_length=100)
+    reviewer: str = Field(min_length=1, max_length=200)
+    note: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
 
 
-@app.get("/api/rows/{content_id}")
-def get_row(content_id: str):
-    for r in _adapter().read_rows():
-        if r.get(schema.COL_ID) == content_id:
-            return _public(r)
-    raise HTTPException(404, "未找到该记录")
+class ConfigInput(BaseModel):
+    reviewer: Optional[str] = None
+    model: Optional[str] = None
+    base_url: Optional[str] = None
 
 
-@app.post("/api/upload")
-async def upload(
-    supplier_id: str = Form(...),
-    theme: str = Form(""),
-    platform: str = Form(""),
-    title: str = Form(...),
-    body: str = Form(...),
-    publish_time: str = Form(""),
-    file: Optional[UploadFile] = File(None),
+class ConfigResponse(BaseModel):
+    reviewer: str
+    model: str
+    base_url: str
+    key_set: bool
+
+
+class BatchAuditResponse(BaseModel):
+    batch_id: int
+    audited: int
+    audit_run_ids: List[int]
+
+
+def _not_found(entity: str, entity_id: int) -> HTTPException:
+    return HTTPException(status_code=404, detail=f"{entity} {entity_id} not found")
+
+
+def _service_error(error: ValueError) -> HTTPException:
+    message = str(error)
+    status = 404 if "does not exist" in message or "does not belong" in message else 422
+    return HTTPException(status_code=status, detail=message)
+
+
+def _content_summary(item: ContentItem) -> ContentSummary:
+    return ContentSummary.model_validate(item)
+
+
+def _audit_detail(audit: AuditRun) -> AuditDetail:
+    return AuditDetail.model_validate(audit)
+
+
+def _content_detail(item: ContentItem) -> ContentDetail:
+    audits = sorted(item.audit_runs, key=lambda audit: audit.id)
+    return ContentDetail(
+        **ContentItemRead.model_validate(item).model_dump(),
+        versions=[ContentVersionRead.model_validate(version) for version in item.versions],
+        latest_audit=_audit_detail(audits[-1]) if audits else None,
+        open_tasks=[ReviewTaskRead.model_validate(task) for task in item.review_tasks if task.status == "OPEN"],
+    )
+
+
+def _content_query():
+    return select(ContentItem).options(
+        selectinload(ContentItem.versions),
+        selectinload(ContentItem.review_tasks),
+        selectinload(ContentItem.audit_runs).selectinload(AuditRun.agent_results),
+        selectinload(ContentItem.audit_runs).selectinload(AuditRun.issues),
+    )
+
+
+@app.get("/api/projects", response_model=List[ProjectRead])
+def list_projects(session: Session = Depends(get_session)):
+    return list(session.scalars(select(Project).order_by(Project.id)))
+
+
+@app.post("/api/projects", response_model=ProjectRead, status_code=201)
+def create_project(payload: ProjectCreate, session: Session = Depends(get_session)):
+    project = Project(name=payload.name.strip(), description=payload.description)
+    session.add(project)
+    try:
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Project name already exists") from error
+    session.refresh(project)
+    return project
+
+
+@app.get("/api/projects/{project_id}", response_model=ProjectDetail)
+def get_project(project_id: int, session: Session = Depends(get_session)):
+    project = session.scalar(
+        select(Project)
+        .where(Project.id == project_id)
+        .options(selectinload(Project.rule_versions), selectinload(Project.current_rule_version))
+    )
+    if project is None:
+        raise _not_found("Project", project_id)
+    return ProjectDetail(
+        **ProjectRead.model_validate(project).model_dump(),
+        current_rule_version=project.current_rule_version,
+        rule_versions=sorted(project.rule_versions, key=lambda version: version.version),
+    )
+
+
+@app.get("/api/projects/{project_id}/rule-versions", response_model=List[RuleVersionRead])
+def list_rule_versions(project_id: int, session: Session = Depends(get_session)):
+    if session.get(Project, project_id) is None:
+        raise _not_found("Project", project_id)
+    return list(
+        session.scalars(
+            select(RuleVersion).where(RuleVersion.project_id == project_id).order_by(RuleVersion.version)
+        )
+    )
+
+
+@app.post("/api/projects/{project_id}/rule-versions", response_model=RuleVersionRead, status_code=201)
+def create_rule_version(
+    project_id: int,
+    payload: RuleVersionInput,
+    session: Session = Depends(get_session),
 ):
-    """供应商上传：填表 + 传图，生成一行待审记录。"""
-    content_id = uuid.uuid4().hex[:12]
-    media = ""
-    if file is not None and file.filename:
-        ext = os.path.splitext(file.filename.lower())[1]
-        if ext not in ALLOWED_IMAGE:
-            raise HTTPException(400, f"不支持的图片格式 {ext}，仅支持 JPG/PNG/WEBP")
-        media = f"{content_id}{ext}"
-        with open(os.path.join(UPLOADS, media), "wb") as f:
-            f.write(await file.read())
-
-    adapter = _adapter()
-    rows = adapter.read_rows()
-    row = {c: "" for c in schema.ALL_COLUMNS}
-    row.update({
-        schema.COL_ID: content_id,
-        schema.COL_THEME: theme,
-        schema.COL_PLATFORM: platform,
-        schema.COL_TITLE: title,
-        schema.COL_BODY: body,
-        schema.COL_MEDIA: media,
-        schema.COL_PUBLISH_TIME: publish_time,
-        schema.COL_STATUS: schema.ST_SUBMITTED,
-    })
-    rows.append(row)
-    adapter.write_rows(rows)
-    return {"content_id": content_id, "status": schema.ST_SUBMITTED}
+    project = session.get(Project, project_id)
+    if project is None:
+        raise _not_found("Project", project_id)
+    latest = session.scalar(select(func.max(RuleVersion.version)).where(RuleVersion.project_id == project_id)) or 0
+    version = RuleVersion(project=project, version=latest + 1, **payload.model_dump())
+    session.add(version)
+    session.commit()
+    session.refresh(version)
+    return version
 
 
-@app.post("/api/run-batch")
-def run_batch():
-    """一键跑审核：流程三 -> 四 -> 五。模型/项目取自配置。"""
-    cfg = _load_config()
-    if cfg.get("model"):
-        os.environ["ONEAPI_MODEL"] = cfg["model"]
-    if cfg.get("base_url"):
-        os.environ["ONEAPI_BASE_URL"] = cfg["base_url"]
-    reviewer = get_reviewer(cfg.get("reviewer", "heuristic"))
-    standards = _repo().load(cfg.get("project") or None)
-    summary = engine.run_batch(_adapter(), reviewer, standards)
-    return summary
+@app.post("/api/projects/{project_id}/rule-versions/{rule_version_id}/publish", response_model=ProjectRead)
+def publish_rule_version(
+    project_id: int,
+    rule_version_id: int,
+    session: Session = Depends(get_session),
+):
+    project = session.get(Project, project_id)
+    if project is None:
+        raise _not_found("Project", project_id)
+    version = session.get(RuleVersion, rule_version_id)
+    if version is None or version.project_id != project_id:
+        raise _not_found("RuleVersion", rule_version_id)
+    project.current_rule_version = version
+    session.commit()
+    session.refresh(project)
+    return project
 
 
-@app.get("/api/human-queue")
-def human_queue():
-    rows = [r for r in _adapter().read_rows()
-            if (r.get(schema.COL_STATUS) or "").strip() == schema.ST_WAIT_HUMAN]
-    return {"count": len(rows), "rows": [_public(r) for r in rows]}
+async def _parse_contents(contents: str) -> List[Dict[str, Any]]:
+    try:
+        parsed = json.loads(contents)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=422, detail="contents must be valid JSON") from error
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list) or not parsed or not all(isinstance(row, dict) for row in parsed):
+        raise HTTPException(status_code=422, detail="contents must be a non-empty object or array of objects")
+    return parsed
 
 
-@app.post("/api/rows/{content_id}/human")
-def human_decision(content_id: str, payload: dict):
-    """人工审核结论：approved/需修改/deleted。不回炉自动审核。"""
-    decision = payload.get("decision")
-    reason = (payload.get("reason") or "").strip()
-    manual = (payload.get("manual_content") or "").strip()
-    status_map = {
-        "approved": schema.ST_PASS,
-        "need_modify": schema.ST_NEED_MODIFY,
-        "deleted": schema.ST_DELETED,
-    }
-    if decision not in status_map:
-        raise HTTPException(400, "decision 必须是 approved / need_modify / deleted")
-
-    adapter = _adapter()
-    rows = adapter.read_rows()
-    for r in rows:
-        if r.get(schema.COL_ID) == content_id:
-            r[schema.COL_STATUS] = status_map[decision]
-            if reason:
-                r[schema.COL_SUGGESTION] = reason
-            if manual:
-                r[schema.COL_MANUAL_CONTENT] = manual
-            if decision == "approved":
-                # 保留：回填最终列（优先人工内容）
-                r[schema.COL_FINAL_TITLE] = r.get(schema.COL_TITLE, "")
-                r[schema.COL_FINAL_BODY] = manual or r.get(schema.COL_BODY, "")
-            adapter.write_rows(rows)
-            return {"content_id": content_id, "status": r[schema.COL_STATUS]}
-    raise HTTPException(404, "未找到该记录")
+async def _save_uploads(rows: List[Dict[str, Any]], files: Optional[List[UploadFile]]) -> List[Path]:
+    saved_paths: List[Path] = []
+    for index, upload in enumerate(files or []):
+        if not upload.filename:
+            continue
+        suffix = Path(upload.filename).suffix.lower()
+        if suffix not in ALLOWED_IMAGE_SUFFIXES:
+            raise HTTPException(status_code=422, detail=f"Unsupported image format: {suffix}")
+        filename = f"{uuid.uuid4().hex}{suffix}"
+        path = _uploads_dir() / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(await upload.read())
+        saved_paths.append(path)
+        target_index = min(index, len(rows) - 1)
+        payload = rows[target_index].setdefault("payload", {})
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="content payload must be an object")
+        if "media" not in payload:
+            payload["media"] = filename
+        else:
+            media = payload["media"]
+            payload["media"] = media + [filename] if isinstance(media, list) else [media, filename]
+    return saved_paths
 
 
-@app.get("/media/{content_id}")
-def media(content_id: str):
-    for r in _adapter().read_rows():
-        if r.get(schema.COL_ID) == content_id:
-            m = (r.get(schema.COL_MEDIA) or "").strip()
-            fp = os.path.join(UPLOADS, m)
-            if m and os.path.exists(fp):
-                return FileResponse(fp)
-            raise HTTPException(404, "无图片")
-    raise HTTPException(404, "未找到该记录")
+@app.get("/api/batches", response_model=List[BatchRead])
+def list_batches(
+    project_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    query = select(Batch).order_by(Batch.id.desc())
+    if project_id is not None:
+        query = query.where(Batch.project_id == project_id)
+    return list(session.scalars(query))
 
 
-# ── 标准管理（流程一）──────────────────────────────────────
-@app.get("/api/standards")
-def get_standards():
-    repo = _repo()
-    dims = []
-    gdir = os.path.join(STANDARDS_DIR, "global")
-    for key, fname in schema.DIMENSION_FILES.items():
-        fp = os.path.join(gdir, fname)
-        content = ""
-        if os.path.exists(fp):
-            with open(fp, "r", encoding="utf-8") as f:
-                content = f.read()
-        dims.append({"key": key, "name": schema.DIMENSIONS[key], "content": content})
-
-    pdir = os.path.join(STANDARDS_DIR, "projects")
-    projects = []
-    if os.path.isdir(pdir):
-        projects = [os.path.splitext(f)[0] for f in os.listdir(pdir) if f.endswith(".md")]
-
-    rules = repo._load_rules()
-    return {"dimensions": dims, "projects": projects, "rules": rules}
-
-
-@app.put("/api/standards/dimension/{key}")
-def save_dimension(key: str, payload: dict):
-    if key not in schema.DIMENSION_FILES:
-        raise HTTPException(404, "未知维度")
-    gdir = os.path.join(STANDARDS_DIR, "global")
-    os.makedirs(gdir, exist_ok=True)
-    with open(os.path.join(gdir, schema.DIMENSION_FILES[key]), "w", encoding="utf-8") as f:
-        f.write(payload.get("content", ""))
-    return {"ok": True}
-
-
-@app.get("/api/standards/project/{name}")
-def get_project(name: str):
-    fp = os.path.join(STANDARDS_DIR, "projects", f"{name}.md")
-    content = ""
-    if os.path.exists(fp):
-        with open(fp, "r", encoding="utf-8") as f:
-            content = f.read()
-    return {"name": name, "content": content}
+@app.post("/api/batches", response_model=BatchDetail, status_code=201)
+async def create_batch(
+    project_id: int = Form(...),
+    supplier_id: str = Form(...),
+    name: str = Form(...),
+    contents: str = Form(...),
+    files: Optional[List[UploadFile]] = File(None),
+    session: Session = Depends(get_session),
+):
+    rows = await _parse_contents(contents)
+    saved_paths = await _save_uploads(rows, files)
+    try:
+        batch = submit_batch(
+            session,
+            project_id=project_id,
+            supplier_id=supplier_id,
+            name=name,
+            contents=rows,
+        )
+    except IntegrityError as error:
+        session.rollback()
+        for path in saved_paths:
+            path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail="Batch contains duplicate content identifiers") from error
+    except ValueError as error:
+        session.rollback()
+        for path in saved_paths:
+            path.unlink(missing_ok=True)
+        raise _service_error(error) from error
+    return BatchDetail(
+        **BatchRead.model_validate(batch).model_dump(),
+        content_count=len(batch.content_items),
+        contents=[_content_summary(item) for item in batch.content_items],
+    )
 
 
-@app.put("/api/standards/project/{name}")
-def save_project(name: str, payload: dict):
-    pdir = os.path.join(STANDARDS_DIR, "projects")
-    os.makedirs(pdir, exist_ok=True)
-    with open(os.path.join(pdir, f"{name}.md"), "w", encoding="utf-8") as f:
-        f.write(payload.get("content", ""))
-    return {"ok": True}
+@app.get("/api/contents", response_model=List[ContentSummary])
+def list_contents(
+    project_id: Optional[int] = None,
+    batch_id: Optional[int] = None,
+    review_status: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    query = select(ContentItem).options(selectinload(ContentItem.versions)).order_by(ContentItem.id.desc())
+    if project_id is not None:
+        query = query.where(ContentItem.project_id == project_id)
+    if batch_id is not None:
+        query = query.where(ContentItem.batch_id == batch_id)
+    if review_status is not None:
+        query = query.where(ContentItem.review_status == review_status)
+    return [_content_summary(item) for item in session.scalars(query)]
 
 
-@app.put("/api/rules")
-def save_rules(payload: dict):
-    repo = _repo()
-    rules = repo._load_rules()
-    for k in ("deny_words", "recommended", "must_human_keywords", "required_tags"):
-        if k in payload:
-            rules[k] = payload[k]
-    repo._save_rules(rules)
-    return {"ok": True, "rules": rules}
+@app.get("/api/contents/{content_id}", response_model=ContentDetail)
+def get_content(content_id: int, session: Session = Depends(get_session)):
+    item = session.scalar(_content_query().where(ContentItem.id == content_id))
+    if item is None:
+        raise _not_found("ContentItem", content_id)
+    return _content_detail(item)
 
 
-# ── 报告（流程六）+ 规则沉淀（流程七）─────────────────────
-@app.get("/api/report")
-def get_report():
-    return report.build_reports(_adapter().read_rows())
+@app.post("/api/contents/{content_id}/audit", response_model=AuditDetail)
+def audit_content(
+    content_id: int,
+    session: Session = Depends(get_session),
+    reviewer: Any = Depends(get_audit_reviewer),
+):
+    config = _load_config()
+    try:
+        audit = run_audit(session, content_id, reviewer=reviewer, model=config["model"] or None)
+    except ValueError as error:
+        session.rollback()
+        raise _service_error(error) from error
+    return _audit_detail(audit)
 
 
-@app.post("/api/distill-rules")
-def distill(confirm: bool = False, min_freq: int = 2):
-    rows = _adapter().read_rows()
-    proposals = report.distill_rule_proposals(rows, min_freq=min_freq)
-    if not confirm:
-        return {"proposals": proposals, "applied": None}
-    added = report.apply_rule_proposals(_repo(), proposals)
-    return {"proposals": proposals, "applied": added}
+@app.post("/api/batches/{batch_id}/audit", response_model=BatchAuditResponse)
+def audit_batch(
+    batch_id: int,
+    session: Session = Depends(get_session),
+    reviewer: Any = Depends(get_audit_reviewer),
+):
+    batch = session.scalar(
+        select(Batch).where(Batch.id == batch_id).options(selectinload(Batch.content_items))
+    )
+    if batch is None:
+        raise _not_found("Batch", batch_id)
+    config = _load_config()
+    audit_ids = []
+    for item in batch.content_items:
+        try:
+            audit = run_audit(session, item.id, reviewer=reviewer, model=config["model"] or None)
+        except ValueError as error:
+            session.rollback()
+            raise _service_error(error) from error
+        audit_ids.append(audit.id)
+    return BatchAuditResponse(batch_id=batch_id, audited=len(audit_ids), audit_run_ids=audit_ids)
 
 
-# ── 配置（模型/项目；key 只读环境变量）────────────────────
-@app.get("/api/config")
+@app.get("/api/audit-runs", response_model=List[AuditRunRead])
+def list_audit_runs(
+    content_id: Optional[int] = None,
+    batch_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    query = select(AuditRun).join(ContentItem).order_by(AuditRun.id.desc())
+    if content_id is not None:
+        query = query.where(AuditRun.content_item_id == content_id)
+    if batch_id is not None:
+        query = query.where(ContentItem.batch_id == batch_id)
+    return list(session.scalars(query))
+
+
+@app.get("/api/review-tasks", response_model=List[ReviewTaskRead])
+def list_review_tasks(
+    status: Optional[str] = None,
+    project_id: Optional[int] = None,
+    batch_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    query = select(ReviewTask).join(ContentItem).order_by(ReviewTask.id.desc())
+    if status is not None:
+        query = query.where(ReviewTask.status == status)
+    if project_id is not None:
+        query = query.where(ContentItem.project_id == project_id)
+    if batch_id is not None:
+        query = query.where(ContentItem.batch_id == batch_id)
+    return list(session.scalars(query))
+
+
+@app.post("/api/review-tasks/{task_id}/resolve", response_model=HumanDecisionRead)
+def resolve_review_task(
+    task_id: int,
+    payload: TaskResolveInput,
+    session: Session = Depends(get_session),
+):
+    try:
+        return resolve_task(
+            session,
+            task_id,
+            decision=payload.decision,
+            reviewer=payload.reviewer,
+            note=payload.note,
+            payload=payload.payload,
+        )
+    except ValueError as error:
+        session.rollback()
+        raise _service_error(error) from error
+
+
+@app.get("/api/reports")
+def get_report(
+    project_id: int = Query(...),
+    batch_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    try:
+        return build_report(session, project_id=project_id, batch_id=batch_id)
+    except ValueError as error:
+        raise _service_error(error) from error
+
+
+@app.get("/api/config", response_model=ConfigResponse)
 def get_config():
-    cfg = _load_config()
-    return {**cfg, "key_set": bool(os.environ.get("ONEAPI_KEY"))}
+    return ConfigResponse(**_load_config(), key_set=bool(os.environ.get("ONEAPI_KEY")))
 
 
-@app.put("/api/config")
-def put_config(payload: dict):
-    cfg = _load_config()
-    for k in ("reviewer", "model", "base_url", "project"):
-        if k in payload:
-            cfg[k] = payload[k]
-    _save_config(cfg)
-    return {**cfg, "key_set": bool(os.environ.get("ONEAPI_KEY"))}
+@app.put("/api/config", response_model=ConfigResponse)
+def put_config(payload: ConfigInput):
+    config = _load_config()
+    for key, value in payload.model_dump(exclude_none=True).items():
+        config[key] = value
+    _save_config(config)
+    return ConfigResponse(**config, key_set=bool(os.environ.get("ONEAPI_KEY")))
 
 
 @app.get("/api/health")
-def health():
+def health(session: Session = Depends(get_session)):
+    session.scalar(select(func.count(Project.id)))
     return {"ok": True, "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+@app.get("/api/media/{content_id}")
+def media(content_id: int, session: Session = Depends(get_session)):
+    item = session.scalar(
+        select(ContentItem).where(ContentItem.id == content_id).options(selectinload(ContentItem.versions))
+    )
+    if item is None:
+        raise _not_found("ContentItem", content_id)
+    media_value = item.versions[-1].payload.get("media") if item.versions else None
+    filename = media_value[0] if isinstance(media_value, list) and media_value else media_value
+    if not isinstance(filename, str):
+        raise HTTPException(status_code=404, detail="Content has no media")
+    path = _uploads_dir() / Path(filename).name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Media not found")
+    return FileResponse(path)
