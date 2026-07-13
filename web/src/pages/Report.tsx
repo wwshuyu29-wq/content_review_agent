@@ -1,63 +1,49 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, type Batch, type Project, type ReportData } from "../api";
+
+const STATUS_LABELS: Record<string, string> = {
+  NOT_STARTED: "未开始", AI_REVIEWING: "AI 审核中", MANUAL_REQUIRED: "需人工", FIX_PROPOSED: "待确认建议", APPROVED: "已通过", REJECTED: "已拒绝",
+};
+
+function Distribution({ title, values }: { title: string; values: Record<string, number> }) {
+  const entries = Object.entries(values).sort((a, b) => b[1] - a[1]);
+  const max = Math.max(1, ...entries.map(([, value]) => value));
+  return <section className="card"><h3>{title}</h3>{entries.length === 0 ? <p className="empty">暂无数据</p> : <div className="metric-list">{entries.map(([label, value]) => <div className="metric-row" key={label}><span title={label}>{STATUS_LABELS[label] || label}</span><div className="metric-bar"><i style={{ width: `${(value / max) * 100}%` }} /></div><b>{value}</b></div>)}</div>}</section>;
+}
 
 export default function Report() {
-  const [rep, setRep] = useState<any>(null);
-  const [proposals, setProposals] = useState<any>(null);
-  const [msg, setMsg] = useState("");
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [batches, setBatches] = useState<Batch[]>([]);
+  const [projectId, setProjectId] = useState(0);
+  const [batchId, setBatchId] = useState(0);
+  const [report, setReport] = useState<ReportData | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const load = async () => setRep(await api.report());
-  useEffect(() => { load(); }, []);
-
-  const preview = async () => {
-    const r = await api.distill(false);
-    setProposals(r.proposals);
-    setMsg("");
-  };
-  const apply = async () => {
-    const r = await api.distill(true);
-    setMsg(`已写入规则库：${JSON.stringify(r.applied)}`);
-  };
-
-  if (!rep) return <p className="small">加载中…</p>;
-  const g = rep["审核成果"];
-  const q = rep["问题汇总"];
+  useEffect(() => { api.projects().then((data) => { setProjects(data); if (data[0]) setProjectId(data[0].id); }).catch((err: Error) => setError(err.message)); }, []);
+  useEffect(() => { if (!projectId) return; setBatchId(0); api.batches(projectId).then(setBatches).catch((err: Error) => setError(err.message)); }, [projectId]);
+  useEffect(() => {
+    if (!projectId) return;
+    setLoading(true); setError("");
+    api.report(projectId, batchId || undefined).then(setReport).catch((err: Error) => setError(err.message)).finally(() => setLoading(false));
+  }, [projectId, batchId]);
 
   return (
     <div>
-      <h2>审核报告（流程六）</h2>
-
-      <div className="card">
-        <h3>一、审核成果</h3>
-        <span className="stat"><b>{g["内容总数"]}</b>内容总数</span>
-        <span className="stat"><b>{g["通过"]}</b>通过（{Math.round(g["通过率"] * 100)}%）</span>
-        <span className="stat"><b>{g["待人工审核"]}</b>待人工审核</span>
-        <span className="stat"><b>{g["需修改"]}</b>需修改</span>
-        <span className="stat"><b>{g["待供应商补充"]}</b>待供应商补充</span>
-        <span className="stat"><b>{g["已驳回"]}</b>已驳回</span>
+      <div className="page-heading"><div><h2>审核报告</h2><p>按项目或批次查看审核结果与人工介入情况。</p></div></div>
+      <div className="filter-bar card">
+        <div className="field"><label htmlFor="report-project">项目</label><select id="report-project" value={projectId} onChange={(event) => setProjectId(Number(event.target.value))}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
+        <div className="field"><label htmlFor="report-batch">批次</label><select id="report-batch" value={batchId} onChange={(event) => setBatchId(Number(event.target.value))}><option value={0}>全部批次</option>{batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.name}</option>)}</select></div>
       </div>
-
-      <div className="card">
-        <h3>二、问题汇总</h3>
-        <h4 className="small">问题类别分布</h4>
-        <ul>
-          {Object.entries(q["问题类别分布"]).map(([k, v]) => <li key={k}>{k}：{v as number}</li>)}
-        </ul>
-        <h4 className="small">高频问题 Top10</h4>
-        <ul>
-          {q["高频问题Top10"].map((it: [string, number], i: number) => <li key={i}>（{it[1]}次）{it[0]}</li>)}
-        </ul>
-      </div>
-
-      <div className="card">
-        <h3>规则沉淀（流程七）</h3>
-        <div className="btn-row">
-          <button className="btn btn-ghost" onClick={preview}>生成建议</button>
-          <button className="btn btn-primary" onClick={apply} disabled={!proposals}>确认写入规则库</button>
+      {error && <div className="msg err">{error}</div>}
+      {loading && <p className="empty">正在统计...</p>}
+      {report && !loading && <>
+        <div className="report-title"><h3>{report.project.name}</h3><span>{report.batch ? `批次：${report.batch.name}` : "全部批次"}</span></div>
+        <div className="stats-grid">
+          <div className="stat"><b>{report.totals.contents}</b><span>内容总数</span></div><div className="stat"><b>{report.totals.issues}</b><span>问题总数</span></div><div className="stat"><b>{report.totals.tasks}</b><span>人工任务</span></div><div className="stat accent"><b>{Math.round(report.manual_metrics.rate * 100)}%</b><span>人工介入率</span></div>
         </div>
-        {msg && <div className="msg ok">{msg}</div>}
-        {proposals && <pre>{JSON.stringify(proposals, null, 2)}</pre>}
-      </div>
+        <div className="report-grid"><Distribution title="审核状态" values={report.status_counts} /><Distribution title="问题类别" values={report.category_counts} /><Distribution title="规则命中" values={report.rule_counts} /><section className="card"><h3>人工审核</h3><dl className="detail-list"><div><dt>涉及内容</dt><dd>{report.manual_metrics.contents}</dd></div><div><dt>风险任务</dt><dd>{report.manual_metrics.tasks}</dd></div><div><dt>介入占比</dt><dd>{(report.manual_metrics.rate * 100).toFixed(1)}%</dd></div></dl></section></div>
+      </>}
     </div>
   );
 }
