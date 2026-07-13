@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import asdict
 
 from .. import schema
 from .accuracy import AccuracyReviewer
@@ -26,10 +27,48 @@ class MultiAgentReviewer:
             ExternalReviewer(),
         ]
 
+    def _run_agents(self, row: dict, standards) -> list[DimensionResult]:
+        return [agent.review(row, standards, self.llm) for agent in self.agents]
+
+    def review_structured(self, row: dict, standards) -> list[dict]:
+        output = []
+        for result in self._run_agents(row, standards):
+            issues = [asdict(issue) for issue in result.structured_issues]
+            if not issues:
+                for index, reason in enumerate(result.issues):
+                    evidence = result.evidence[index] if index < len(result.evidence) else ""
+                    issues.append(
+                        {
+                            "rule_id": f"{result.dimension.upper()}-{index + 1:03d}",
+                            "category": result.dimension,
+                            "severity": result.risk_level,
+                            "field": "body",
+                            "evidence_quote": evidence,
+                            "reason": reason,
+                            "suggestion": reason,
+                            "auto_fixable": result.risk_level == schema.RISK_LOW,
+                            "human_required": result.risk_level in {
+                                schema.RISK_MID,
+                                schema.RISK_HIGH,
+                                schema.RISK_UNKNOWN,
+                            },
+                            "confidence": result.confidence,
+                        }
+                    )
+            output.append(
+                {
+                    "agent_name": result.dimension,
+                    "status": "NEEDS_LLM" if result.needs_llm else "COMPLETED",
+                    "issues": issues,
+                    "raw_result": asdict(result),
+                }
+            )
+        return output
+
     def review(self, row: dict, standards):
         from ..reviewer import Verdict  # 延迟导入避免环依赖
 
-        results: list[DimensionResult] = [a.review(row, standards, self.llm) for a in self.agents]
+        results = self._run_agents(row, standards)
 
         overall = schema.RISK_NONE
         categories, issues, evidence = [], [], []

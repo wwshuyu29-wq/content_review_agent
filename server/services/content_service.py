@@ -1,0 +1,72 @@
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from server.models import (
+    Batch,
+    ContentItem,
+    ContentVersion,
+    FormatStatus,
+    Project,
+    PublishStatus,
+    ReviewStatus,
+)
+
+
+def _format_status(content: Mapping[str, Any]) -> FormatStatus:
+    required = ("external_id", "title", "body")
+    if any(key not in content or content[key] is None or content[key] == "" for key in required):
+        return FormatStatus.INCOMPLETE
+    if not all(isinstance(content[key], str) for key in required):
+        return FormatStatus.INVALID
+    if "payload" in content and not isinstance(content["payload"], Mapping):
+        return FormatStatus.INVALID
+    return FormatStatus.PASSED
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def submit_batch(
+    session: Session,
+    *,
+    project_id: int,
+    supplier_id: str,
+    name: str,
+    contents: Sequence[Mapping[str, Any]],
+) -> Batch:
+    project = session.get(Project, project_id)
+    if project is None:
+        raise ValueError(f"Project {project_id} does not exist")
+    if not supplier_id.strip() or not name.strip():
+        raise ValueError("supplier_id and name are required")
+
+    batch = Batch(project=project, supplier_id=supplier_id.strip(), name=name.strip())
+    for content in contents:
+        status = _format_status(content)
+        item = ContentItem(
+            project=project,
+            batch=batch,
+            external_id=_text(content.get("external_id")),
+            title=_text(content.get("title")),
+            format_status=status,
+            review_status=ReviewStatus.NOT_STARTED,
+            publish_status=PublishStatus.NOT_READY,
+        )
+        ContentVersion(
+            content_item=item,
+            version=1,
+            source="SUPPLIER",
+            title=_text(content.get("title")),
+            body=_text(content.get("body")),
+            payload=dict(content.get("payload", {})) if isinstance(content.get("payload", {}), Mapping) else {},
+        )
+
+    session.add(batch)
+    session.commit()
+    session.refresh(batch)
+    return batch

@@ -8,11 +8,26 @@ from .. import schema
 
 
 @dataclass
+class StructuredIssue:
+    rule_id: str
+    category: str
+    severity: str
+    field: str
+    evidence_quote: str
+    reason: str
+    suggestion: str
+    auto_fixable: bool
+    human_required: bool
+    confidence: float
+
+
+@dataclass
 class DimensionResult:
     dimension: str                       # schema.DIMENSIONS 的 key
     risk_level: str = schema.RISK_NONE
     issues: list[str] = field(default_factory=list)     # 问题点
     evidence: list[str] = field(default_factory=list)   # 证据/命中片段
+    structured_issues: list[StructuredIssue] = field(default_factory=list)
     confidence: float = 1.0
     needs_llm: bool = False               # True=该维度需 LLM 但当前不可用（弃权）
 
