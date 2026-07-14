@@ -1,14 +1,25 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 
-// 开发时把 /api 和 /media 代理到 FastAPI 后端（默认 8000 端口）
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 5173,
-    proxy: {
-      "/api": "http://localhost:8000",
-      "/media": "http://localhost:8000",
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, ".", "");
+  const apiTarget = env.VITE_API_TARGET || "http://127.0.0.1:8000";
+
+  return {
+    plugins: [react()],
+    server: {
+      port: 5173,
+      proxy: {
+        "/api": apiTarget,
+        "/media": apiTarget,
+      },
     },
-  },
+    preview: {
+      port: 4173,
+      proxy: {
+        "/api": apiTarget,
+        "/media": apiTarget,
+      },
+    },
+  };
 });

@@ -2,13 +2,21 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 
 # 运行时数据 / 密钥（绝不入库）
 data/
+*.db
+*.sqlite
+*.sqlite3
 *.env
 .env
+.env.*
+!.env.example
 queue.jsonl
 *.csv
 
