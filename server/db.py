@@ -59,6 +59,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 ("project_code", "VARCHAR(200)"),
                 ("content_type", "VARCHAR(100)"),
                 ("package_version", "VARCHAR(50)"),
+                ("package_digest", "VARCHAR(64)"),
             ):
                 if column not in rule_columns:
                     connection.exec_driver_sql(f"ALTER TABLE rule_versions ADD COLUMN {column} {sql_type}")

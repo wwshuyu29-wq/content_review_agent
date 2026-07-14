@@ -31,10 +31,8 @@ ISSUE_FIELDS = (
 
 
 def validate_rule_version_identity(project, rule_version: RuleVersion) -> None:
-    if not project.code and not project.content_type:
-        return
     if not project.code or not project.content_type:
-        raise ValueError("configured project is missing code or content_type")
+        raise ValueError("project is missing code or content_type")
     expected = {
         "business_domain": "baidu_maps_marketing_review",
         "document_type": "project_standard",
@@ -46,14 +44,16 @@ def validate_rule_version_identity(project, rule_version: RuleVersion) -> None:
             raise ValueError(f"rule version identity mismatch: {field}")
     if not rule_version.package_version:
         raise ValueError("rule version identity mismatch: package_version")
+    if not rule_version.package_digest:
+        raise ValueError("rule version identity mismatch: package_digest")
 
 
 def _standards_from_rule_version(rule_version: RuleVersion) -> Standards:
     rules = rule_version.structured_rules
     facts_text = "\n".join(f"{key}: {value}" for key, value in rule_version.project_facts.items())
     is_tech = rule_version.content_type == "TECH_MEDIA_REVIEW"
-    legacy_fields = {field: rules.get(field) for field in ("deny_words", "must_human_keywords", "required_tags")}
-    if is_tech and any(value for value in legacy_fields.values()):
+    legacy_fields = {"deny_words", "must_human_keywords", "required_tags", "recommended"} & set(rules)
+    if is_tech and legacy_fields:
         raise ValueError("TECH_MEDIA_REVIEW snapshots cannot contain legacy rule arrays")
     dimensions = rule_version.dimension_standards
     dimension_docs = dimensions.get("standards", dimensions) if isinstance(dimensions, dict) else {}

@@ -11,6 +11,7 @@ from server.db import Base, create_db_engine
 from server.models import Project, RuleVersion
 from server.services.standard_package_service import (
     compile_standard_package,
+    compute_package_digest,
     load_standard_package,
     publish_standard_package,
 )
@@ -104,6 +105,21 @@ def test_rejects_legacy_rule_arrays(standards_root: Path) -> None:
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "0.9")
 
 
+def test_same_version_tampering_is_rejected_by_digest(standards_root: Path, tmp_path: Path) -> None:
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "0.9")
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'tamper.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="科技测评", code=package.metadata.project_code, content_type=package.metadata.content_type)
+        session.add(project)
+        session.flush()
+        publish_standard_package(session, project.id, package)
+        package.project.facts["tampered"] = True
+
+        with pytest.raises(ValueError, match="digest|new package version"):
+            publish_standard_package(session, project.id, package)
+
+
 def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path, tmp_path: Path) -> None:
     package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
     compiled = compile_standard_package(package)
@@ -129,6 +145,7 @@ def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path
         assert version.id == same_version.id
         assert version.version == 1
         assert version.package_version == "0.9"
+        assert version.package_digest == compute_package_digest(compiled)
         assert version.project_code == "bdmap_xdxx_tech_review_2026"
         assert version.dimension_standards["metadata"] == compiled["metadata"]
         assert project.current_rule_version_id == version.id

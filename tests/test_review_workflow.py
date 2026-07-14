@@ -19,11 +19,12 @@ from server.models import (
     PublishStatus,
     ReviewStatus,
     ReviewTask,
+    RuleVersion,
 )
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
 from server.services.report_service import build_report
-from server.services.review_service import resolve_task, run_audit
+from server.services.review_service import _standards_from_rule_version, resolve_task, run_audit
 
 
 class FakeReviewer:
@@ -128,6 +129,27 @@ def test_submit_batch_creates_v1_and_deterministic_format_statuses(tmp_path: Pat
         assert all(item.versions[0].source == "SUPPLIER" for item in batch.content_items)
         assert all(item.review_status is ReviewStatus.NOT_STARTED for item in batch.content_items)
         assert all(item.publish_status is PublishStatus.NOT_READY for item in batch.content_items)
+
+
+def test_run_audit_rejects_missing_project_identity(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project, _, item = submit_valid_content(session)
+        project.code = None
+        with pytest.raises(ValueError, match="missing code"):
+            run_audit(session, item.id, reviewer=FakeReviewer([]), model="model-v1")
+
+
+def test_tech_standards_reject_legacy_keys_even_when_empty() -> None:
+    rule_version = RuleVersion(
+        content_type="TECH_MEDIA_REVIEW",
+        structured_rules={"deny_words": [], "must_human_keywords": [], "required_tags": [], "recommended": {}},
+        dimension_standards={},
+        project_facts={},
+        prompt_version="test",
+    )
+
+    with pytest.raises(ValueError, match="legacy rule arrays"):
+        _standards_from_rule_version(rule_version)
 
 
 def test_run_audit_rejects_configured_project_with_mismatched_snapshot_identity(tmp_path: Path) -> None:

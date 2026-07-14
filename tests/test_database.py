@@ -286,6 +286,67 @@ def test_seed_default_project_is_idempotent_and_uses_tech_review_package(tmp_pat
         assert "must_human_keywords" not in serialized
 
 
+def test_seed_repairs_stale_current_rule_version_pointer(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = seed_default_project(session)
+        stale = RuleVersion(
+            project=project,
+            version=2,
+            package_version="0.8",
+            business_domain="baidu_maps_marketing_review",
+            document_type="project_standard",
+            project_code=project.code,
+            content_type=project.content_type,
+            package_digest="stale",
+            dimension_standards={},
+            project_facts={},
+            structured_rules={},
+            prompt_version="stale",
+        )
+        session.add(stale)
+        session.flush()
+        project.current_rule_version = stale
+        session.flush()
+
+        repaired = seed_default_project(session)
+
+        assert repaired.current_rule_version.package_version == "0.9"
+        assert repaired.current_rule_version.package_digest != "stale"
+
+
+def test_seed_rejects_same_version_snapshot_with_tampered_digest(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(
+            name="百度地图小度想想科技媒体测评",
+            code="bdmap_xdxx_tech_review_2026",
+            content_type="TECH_MEDIA_REVIEW",
+        )
+        tampered = RuleVersion(
+            project=project,
+            version=1,
+            package_version="0.9",
+            package_digest="tampered",
+            business_domain="baidu_maps_marketing_review",
+            document_type="project_standard",
+            project_code=project.code,
+            content_type=project.content_type,
+            dimension_standards={},
+            project_facts={},
+            structured_rules={},
+            prompt_version="tampered",
+        )
+        project.current_rule_version = tampered
+        session.add(project)
+        session.flush()
+
+        with pytest.raises(ValueError, match="digest mismatch"):
+            seed_default_project(session)
+
+
 def test_get_session_uses_configured_database_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     database_url = f"sqlite:///{tmp_path / 'configured.db'}"
     monkeypatch.setenv("DATABASE_URL", database_url)

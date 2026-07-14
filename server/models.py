@@ -93,6 +93,7 @@ class RuleVersion(TimestampMixin, Base):
     project_code: Mapped[Optional[str]] = mapped_column(String(200), index=True)
     content_type: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     package_version: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    package_digest: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     dimension_standards: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     project_facts: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     structured_rules: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)

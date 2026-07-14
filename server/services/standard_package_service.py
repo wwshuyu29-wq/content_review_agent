@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -305,6 +306,16 @@ def compile_standard_package(package: StandardPackage) -> dict[str, Any]:
     }
 
 
+def compute_package_digest(compiled: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        compiled,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def publish_standard_package(session: Session, project_id: int, package: StandardPackage) -> RuleVersion:
     project = session.get(Project, project_id)
     if project is None:
@@ -313,6 +324,8 @@ def publish_standard_package(session: Session, project_id: int, package: Standar
         raise ValueError("project code does not match package")
     if project.content_type != package.metadata.content_type:
         raise ValueError("content_type does not match package")
+    compiled = compile_standard_package(package)
+    package_digest = compute_package_digest(compiled)
     existing = session.scalar(
         select(RuleVersion).where(
             RuleVersion.project_id == project_id,
@@ -320,9 +333,12 @@ def publish_standard_package(session: Session, project_id: int, package: Standar
         )
     )
     if existing is not None:
+        if existing.package_digest != package_digest:
+            raise ValueError(
+                "standard package digest mismatch for existing package_version; publish a new package version"
+            )
         project.current_rule_version = existing
         return existing
-    compiled = compile_standard_package(package)
     latest = session.scalar(select(func.max(RuleVersion.version)).where(RuleVersion.project_id == project_id)) or 0
     version = RuleVersion(
         project=project,
@@ -332,6 +348,7 @@ def publish_standard_package(session: Session, project_id: int, package: Standar
         project_code=package.metadata.project_code,
         content_type=package.metadata.content_type,
         package_version=package.metadata.version,
+        package_digest=package_digest,
         dimension_standards=compiled["dimension_standards"],
         project_facts=compiled["project_facts"],
         structured_rules=compiled["structured_rules"],
