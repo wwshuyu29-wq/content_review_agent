@@ -120,6 +120,8 @@ def run_audit(
     item = session.get(ContentItem, content_item_id)
     if item is None:
         raise ValueError(f"Content item {content_item_id} does not exist")
+    if item.review_status is ReviewStatus.REJECTED:
+        raise ValueError("Rejected content is terminal")
     if item.format_status is not FormatStatus.PASSED:
         raise ValueError("Only content with PASSED format status can be audited")
     if _open_tasks(item):
@@ -129,7 +131,7 @@ def run_audit(
     if rule_version is None:
         raise ValueError("Project has no current rule version")
     content_version = _latest_version(item)
-    reviewer = reviewer or get_reviewer("offline")
+    reviewer = reviewer or get_reviewer("heuristic")
     standards = _standards_from_rule_version(rule_version)
     row = {
         schema.COL_ID: item.external_id,

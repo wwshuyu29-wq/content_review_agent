@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -59,7 +59,8 @@ ALLOWED_IMAGE_TYPES = {
 }
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
-DEFAULT_CONFIG = {"reviewer": "offline", "model": ""}
+DEFAULT_CONFIG = {"reviewer": "heuristic", "model": ""}
+SUPPORTED_REVIEWERS = {"heuristic", "oneapi", "ernie"}
 
 
 def _data_dir() -> Path:
@@ -83,6 +84,17 @@ def _load_config() -> Dict[str, str]:
     return {key: str(saved.get(key, default)) for key, default in DEFAULT_CONFIG.items()}
 
 
+def _validated_config(config: Dict[str, Any]) -> Dict[str, str]:
+    validated = ConfigInput.model_validate(config)
+    reviewer = validated.reviewer
+    model = validated.model
+    if reviewer is None or model is None:
+        raise ValueError("reviewer and model configuration fields are required")
+    if reviewer == "oneapi" and not model:
+        raise ValueError("model is required for oneapi reviewer")
+    return {"reviewer": reviewer, "model": model}
+
+
 def _save_config(config: Dict[str, str]) -> None:
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +103,7 @@ def _save_config(config: Dict[str, str]) -> None:
 
 
 def get_audit_reviewer() -> Any:
-    config = _load_config()
+    config = _validated_config(_load_config())
     if config["model"]:
         os.environ["ONEAPI_MODEL"] = config["model"]
     return get_reviewer(config["reviewer"])
@@ -130,6 +142,14 @@ class RuleVersionInput(BaseModel):
     structured_rules: Dict[str, Any] = Field(default_factory=dict)
     prompt_version: str = Field(min_length=1, max_length=100)
 
+    @field_validator("prompt_version")
+    @classmethod
+    def validate_prompt_version(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("prompt_version is required")
+        return value
+
 
 class ProjectDetail(ProjectRead):
     current_rule_version: Optional[RuleVersionRead] = None
@@ -166,6 +186,24 @@ class ConfigInput(BaseModel):
     reviewer: Optional[str] = None
     model: Optional[str] = None
 
+    @field_validator("reviewer", "model")
+    @classmethod
+    def strip_value(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip() if value is not None else None
+
+    @field_validator("reviewer")
+    @classmethod
+    def validate_reviewer(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in SUPPORTED_REVIEWERS:
+            raise ValueError("reviewer must be one of heuristic, oneapi, ernie")
+        return value
+
+    @model_validator(mode="after")
+    def validate_oneapi_model(self) -> "ConfigInput":
+        if self.reviewer == "oneapi" and self.model is not None and not self.model:
+            raise ValueError("model is required for oneapi reviewer")
+        return self
+
 
 class ConfigResponse(BaseModel):
     reviewer: str
@@ -195,7 +233,7 @@ def _service_error(error: ValueError) -> HTTPException:
     message = str(error)
     if "does not exist" in message or "does not belong" in message:
         status = 404
-    elif "open review tasks" in message:
+    elif "open review tasks" in message or "terminal" in message:
         status = 409
     else:
         status = 422
@@ -565,8 +603,11 @@ def put_config(payload: Dict[str, Any]):
     except ValueError as error:
         raise HTTPException(status_code=422, detail="Invalid configuration") from error
     config = _load_config()
-    for key, value in validated.model_dump(exclude_none=True).items():
-        config[key] = value
+    config.update(validated.model_dump(exclude_none=True))
+    try:
+        config = _validated_config(config)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="Invalid configuration") from error
     _save_config(config)
     return ConfigResponse(**config, key_set=bool(os.environ.get("ONEAPI_KEY")))
 

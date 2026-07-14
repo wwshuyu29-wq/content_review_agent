@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from server import main
 from server.db import create_db_engine
-from server.models import ContentItem, Project
+from server.models import ContentItem, Project, ReviewStatus
 
 
 class FakeReviewer:
@@ -202,6 +202,65 @@ def test_batch_audit_endpoint_audits_all_eligible_contents(api) -> None:
     assert len(client.get("/api/audit-runs", params={"batch_id": batch_id}).json()) == 2
 
 
+def test_project_rule_and_config_reject_invalid_string_values(api) -> None:
+    client, _, _ = api
+    project_id = client.get("/api/projects").json()[0]["id"]
+    rule_payload = {
+        "dimension_standards": {},
+        "project_facts": {},
+        "structured_rules": {},
+        "prompt_version": "   ",
+    }
+
+    assert client.post("/api/projects", json={"name": "   "}).status_code == 422
+    assert client.post(
+        f"/api/projects/{project_id}/rule-versions", json=rule_payload
+    ).status_code == 422
+
+    invalid_configs = (
+        {"reviewer": "   "},
+        {"reviewer": "unsupported"},
+        {"reviewer": "oneapi"},
+        {"reviewer": "oneapi", "model": "   "},
+    )
+    for config in invalid_configs:
+        assert client.put("/api/config", json=config).status_code == 422
+
+
+def test_config_strips_valid_values(api) -> None:
+    client, _, _ = api
+
+    response = client.put(
+        "/api/config",
+        json={"reviewer": " oneapi ", "model": " configured-model "},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reviewer"] == "oneapi"
+    assert response.json()["model"] == "configured-model"
+
+
+def test_reviewer_dependency_rejects_invalid_saved_config(
+    api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, tmp_path = api
+    config_path = tmp_path / "data" / "config.json"
+    config_path.write_text(
+        json.dumps({"reviewer": "unsupported", "model": "model"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reviewer"):
+        main.get_audit_reviewer()
+
+    config_path.write_text(
+        json.dumps({"reviewer": "oneapi", "model": "   "}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="model"):
+        main.get_audit_reviewer()
+
+
 def test_reviewer_dependency_applies_non_secret_config(
     api, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -259,6 +318,38 @@ def test_config_never_exposes_or_accepts_oneapi_key(api) -> None:
     assert updated.status_code == 422
     assert "must-not-be-stored" not in updated.text
     assert "base_url" not in initial.json()
+
+
+def test_rejected_content_audit_returns_conflict_without_reviving_content(api) -> None:
+    client, engine, _ = api
+    project_id = client.get("/api/projects").json()[0]["id"]
+    uploaded = client.post(
+        "/api/batches",
+        data={
+            "project_id": str(project_id),
+            "supplier_id": "rejected",
+            "name": "rejected",
+            "contents": json.dumps([
+                {"external_id": "rejected", "title": "title", "body": "body", "payload": {}}
+            ]),
+        },
+        files=[("files", ("rejected.png", b"image", "image/png"))],
+    ).json()
+    content_id = uploaded["contents"][0]["id"]
+
+    with Session(engine) as session:
+        item = session.get(ContentItem, content_id)
+        assert item is not None
+        item.review_status = ReviewStatus.REJECTED
+        session.commit()
+
+    response = client.post(f"/api/contents/{content_id}/audit")
+
+    assert response.status_code == 409
+    assert "terminal" in response.json()["detail"]
+    detail = client.get(f"/api/contents/{content_id}").json()
+    assert detail["review_status"] == "REJECTED"
+    assert detail["latest_audit"] is None
 
 
 def test_audit_conflict_and_batch_partial_results_are_explicit(api) -> None:

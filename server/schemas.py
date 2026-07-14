@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .models import FormatStatus, PublishStatus, ReviewStatus
 
@@ -15,6 +15,14 @@ class OrmSchema(BaseModel):
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Project name is required")
+        return value
 
 
 class ProjectRead(OrmSchema):
@@ -33,6 +41,14 @@ class RuleVersionCreate(BaseModel):
     project_facts: Dict[str, Any]
     structured_rules: Dict[str, Any]
     prompt_version: str = Field(min_length=1, max_length=100)
+
+    @field_validator("prompt_version")
+    @classmethod
+    def validate_prompt_version(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("prompt_version is required")
+        return value
 
 
 class RuleVersionRead(OrmSchema):

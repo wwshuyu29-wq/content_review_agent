@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -382,6 +383,22 @@ def test_rejecting_risk_closes_sibling_tasks_and_is_terminal(tmp_path: Path) -> 
             assert "closed" in str(error)
         else:
             raise AssertionError("superseded task must not be resolvable")
+
+
+def test_rejected_content_cannot_be_reaudited_or_create_audit_run(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        risk = issue("high", auto_fixable=False, human_required=True)
+        run_audit(session, item.id, reviewer=FakeReviewer([agent_result("external", [risk])]))
+        resolve_task(session, item.review_tasks[0].id, decision="REJECT_RISK", reviewer="legal@example.com")
+        audit_count = len(item.audit_runs)
+
+        with pytest.raises(ValueError, match="Rejected content is terminal"):
+            run_audit(session, item.id, reviewer=FakeReviewer([agent_result()]))
+
+        assert item.review_status is ReviewStatus.REJECTED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert len(item.audit_runs) == audit_count
 
 
 def test_approvals_validate_trimmed_content_and_format_limits(tmp_path: Path) -> None:

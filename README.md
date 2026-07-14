@@ -55,9 +55,11 @@ export DATABASE_URL="postgresql+psycopg://review_user:password@db.example.com:54
 
 应用启动时通过 SQLAlchemy 创建缺失表并幂等写入默认项目。当前没有 Alembic 迁移。本次模型为 `review_tasks` 增加必填版本与审核外键，fresh SQLite 会自动创建完整结构；已有本地演示库必须先停止服务并删除 `data/review.db` 后重启以重建。生产或需保留数据的数据库不得直接删除，部署前必须补充受控迁移。
 
+规则版本等不可变数据目前只通过正常的应用 ORM/API 路径强制保护。直接数据库写入和 SQLAlchemy bulk 操作不在当前保护范围内，需等待 Alembic 迁移与 PostgreSQL 约束/触发器加固。
+
 ### OneAPI
 
-默认审核后端是 `offline`，不会发起网络请求。离线审核仍执行确定性规则；需要语义判断的内容会转人工，不会伪装成自动通过。
+默认审核后端是 `heuristic`，不会发起网络请求。启发式审核仍执行确定性规则；需要语义判断的内容会转人工，不会伪装成自动通过。
 
 真实 OneAPI 审核需要先在审核台将审核后端保存为 `oneapi`，并只从进程环境读取密钥：
 
