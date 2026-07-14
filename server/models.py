@@ -174,7 +174,7 @@ class AuditRun(TimestampMixin, Base):
     content_version: Mapped[ContentVersion] = relationship(back_populates="audit_runs")
     rule_version: Mapped[RuleVersion] = relationship(back_populates="audit_runs")
     agent_results: Mapped[List["AgentResult"]] = relationship(
-        back_populates="audit_run", cascade="all, delete-orphan"
+        back_populates="audit_run", cascade="all, delete-orphan", order_by="AgentResult.id"
     )
     issues: Mapped[List["Issue"]] = relationship(back_populates="audit_run", cascade="all, delete-orphan")
     review_tasks: Mapped[List["ReviewTask"]] = relationship(back_populates="audit_run")
@@ -187,6 +187,11 @@ class AgentResult(TimestampMixin, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     audit_run_id: Mapped[int] = mapped_column(ForeignKey("audit_runs.id"), nullable=False)
     agent_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    agent_id: Mapped[Optional[str]] = mapped_column(String(100))
+    agent_version: Mapped[Optional[str]] = mapped_column(String(100))
+    decision: Mapped[Optional[str]] = mapped_column(String(50))
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    score: Mapped[Optional[int]] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(50), nullable=False)
     raw_result: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
@@ -205,6 +210,10 @@ class Issue(TimestampMixin, Base):
     severity: Mapped[str] = mapped_column(String(50), nullable=False)
     field: Mapped[str] = mapped_column(String(100), nullable=False)
     evidence_quote: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_start: Mapped[Optional[int]] = mapped_column(Integer)
+    evidence_end: Mapped[Optional[int]] = mapped_column(Integer)
+    evidence_asset_id: Mapped[Optional[str]] = mapped_column(String(200))
+    evidence_timestamp: Mapped[Optional[str]] = mapped_column(String(100))
     source_reference: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     suggestion: Mapped[str] = mapped_column(Text, nullable=False)

@@ -3,8 +3,52 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import schema
+
+
+class EvidenceSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    quote: str
+    start: Optional[int] = None
+    end: Optional[int] = None
+    asset_id: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class AgentIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    rule_id: str
+    category: str
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    field: str
+    evidence: EvidenceSpan
+    reason: str
+    suggestion: str
+    source_reference: list[str]
+    auto_fixable: bool
+    human_required: bool
+    confidence: float = Field(ge=0, le=1)
+
+
+class AgentReviewResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    agent_id: Literal[
+        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+    ]
+    agent_version: str
+    decision: Literal["PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"]
+    summary: str
+    score: int = Field(ge=0, le=100)
+    confidence: float = Field(ge=0, le=1)
+    issues: list[AgentIssue]
 
 
 @dataclass

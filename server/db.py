@@ -67,11 +67,30 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_rule_versions_project_package_version "
                 "ON rule_versions (project_id, package_version)"
             )
+        if "agent_results" in table_names:
+            agent_columns = {column["name"] for column in database_inspector.get_columns("agent_results")}
+            for column, sql_type in (
+                ("agent_id", "VARCHAR(100)"),
+                ("agent_version", "VARCHAR(100)"),
+                ("decision", "VARCHAR(50)"),
+                ("summary", "TEXT"),
+                ("score", "INTEGER"),
+            ):
+                if column not in agent_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE agent_results ADD COLUMN {column} {sql_type}")
         if "issues" in table_names:
             issue_columns = {column["name"] for column in database_inspector.get_columns("issues")}
             if "source_reference" not in issue_columns:
                 connection.exec_driver_sql("ALTER TABLE issues ADD COLUMN source_reference JSON")
                 connection.exec_driver_sql("UPDATE issues SET source_reference = '[]' WHERE source_reference IS NULL")
+            for column, sql_type in (
+                ("evidence_start", "INTEGER"),
+                ("evidence_end", "INTEGER"),
+                ("evidence_asset_id", "VARCHAR(200)"),
+                ("evidence_timestamp", "VARCHAR(100)"),
+            ):
+                if column not in issue_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE issues ADD COLUMN {column} {sql_type}")
 
         if "batches" not in table_names:
             return

@@ -153,6 +153,11 @@ class AuditRunRead(OrmSchema):
 class AgentResultCreate(BaseModel):
     audit_run_id: int
     agent_name: str = Field(min_length=1, max_length=100)
+    agent_id: Optional[str] = None
+    agent_version: Optional[str] = None
+    decision: Optional[str] = None
+    summary: Optional[str] = None
+    score: Optional[int] = Field(default=None, ge=0, le=100)
     status: str = Field(min_length=1, max_length=50)
     raw_result: Dict[str, Any] = Field(default_factory=dict)
 
@@ -161,6 +166,11 @@ class AgentResultRead(OrmSchema):
     id: int
     audit_run_id: int
     agent_name: str
+    agent_id: Optional[str]
+    agent_version: Optional[str]
+    decision: Optional[str]
+    summary: Optional[str]
+    score: Optional[int]
     status: str
     raw_result: Dict[str, Any]
     created_at: datetime
@@ -174,6 +184,10 @@ class IssueCreate(BaseModel):
     severity: str = Field(min_length=1, max_length=50)
     field: str = Field(min_length=1, max_length=100)
     evidence_quote: str
+    evidence_start: Optional[int] = None
+    evidence_end: Optional[int] = None
+    evidence_asset_id: Optional[str] = None
+    evidence_timestamp: Optional[str] = None
     source_reference: List[str] = Field(default_factory=list)
     reason: str
     suggestion: str
@@ -191,6 +205,10 @@ class IssueRead(OrmSchema):
     severity: str
     field: str
     evidence_quote: str
+    evidence_start: Optional[int]
+    evidence_end: Optional[int]
+    evidence_asset_id: Optional[str]
+    evidence_timestamp: Optional[str]
     source_reference: List[str] = Field(default_factory=list)
     reason: str
     suggestion: str

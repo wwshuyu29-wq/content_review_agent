@@ -75,6 +75,10 @@ def test_issue_source_reference_round_trips_and_schema_serializes(tmp_path: Path
             severity="HIGH",
             field="body",
             evidence_quote="证据",
+            evidence_start=4,
+            evidence_end=6,
+            evidence_asset_id="asset-1",
+            evidence_timestamp="00:02",
             source_reference=["CLAIM-001"],
             reason="原因",
             suggestion="建议",
@@ -84,14 +88,21 @@ def test_issue_source_reference_round_trips_and_schema_serializes(tmp_path: Path
         session.commit()
         session.expire_all()
         saved = session.get(Issue, issue.id)
-        assert saved.source_reference == ["CLAIM-001"]
-        assert IssueCreate(
+    assert saved.source_reference == ["CLAIM-001"]
+    assert (saved.evidence_start, saved.evidence_end, saved.evidence_asset_id, saved.evidence_timestamp) == (
+        4, 6, "asset-1", "00:02"
+    )
+    assert IssueCreate(
             audit_run_id=saved.audit_run_id,
             rule_id=saved.rule_id,
             category=saved.category,
             severity=saved.severity,
             field=saved.field,
             evidence_quote=saved.evidence_quote,
+            evidence_start=saved.evidence_start,
+            evidence_end=saved.evidence_end,
+            evidence_asset_id=saved.evidence_asset_id,
+            evidence_timestamp=saved.evidence_timestamp,
             reason=saved.reason,
             suggestion=saved.suggestion,
             auto_fixable=saved.auto_fixable,

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from scripts.text_review import schema
 from scripts.text_review.reviewer import get_reviewer
+from scripts.text_review.reviewers.tech_media import TechMediaReviewer
 from scripts.text_review.standards import Standards
 from server.models import (
     AgentResult,
@@ -27,8 +28,9 @@ from server.services.review_profile_service import get_review_profile
 
 MANUAL_SEVERITIES = {"mid", "high", "unknown"}
 ISSUE_FIELDS = (
-    "rule_id", "category", "severity", "field", "evidence_quote", "reason",
-    "suggestion", "source_reference", "auto_fixable", "human_required", "confidence",
+    "rule_id", "category", "severity", "field", "evidence_quote", "evidence_start",
+    "evidence_end", "evidence_asset_id", "evidence_timestamp", "reason", "suggestion",
+    "source_reference", "auto_fixable", "human_required", "confidence",
 )
 
 
@@ -111,7 +113,50 @@ def _derive_state(item: ContentItem, *, approved_when_clear: bool = False) -> No
         item.publish_status = PublishStatus.NOT_READY
 
 
-def _normalize_agent_results(reviewer: Any, row: dict, standards: Standards) -> list[dict]:
+def _normalize_agent_results(
+    reviewer: Any,
+    row: dict,
+    standards: Standards,
+    *,
+    context: Optional[ReviewContext] = None,
+    profile: Any = None,
+) -> list[dict]:
+    if isinstance(reviewer, TechMediaReviewer):
+        structured = reviewer.review_structured(context, profile)
+        normalized = []
+        for result in structured:
+            issues = []
+            for issue in result.issues:
+                evidence = issue.evidence
+                issues.append({
+                    "rule_id": issue.rule_id,
+                    "category": issue.category,
+                    "severity": issue.severity,
+                    "field": issue.field,
+                    "evidence_quote": evidence.quote,
+                    "evidence_start": evidence.start,
+                    "evidence_end": evidence.end,
+                    "evidence_asset_id": evidence.asset_id,
+                    "evidence_timestamp": evidence.timestamp,
+                    "reason": issue.reason,
+                    "suggestion": issue.suggestion,
+                    "source_reference": issue.source_reference,
+                    "auto_fixable": issue.auto_fixable,
+                    "human_required": issue.human_required,
+                    "confidence": issue.confidence,
+                })
+            normalized.append({
+                "agent_name": result.agent_id,
+                "agent_id": result.agent_id,
+                "agent_version": result.agent_version,
+                "decision": result.decision,
+                "summary": result.summary,
+                "score": result.score,
+                "status": result.decision,
+                "issues": issues,
+                "raw_result": result.model_dump(mode="json"),
+            })
+        return normalized
     if hasattr(reviewer, "review_structured"):
         return list(reviewer.review_structured(row, standards))
     verdict = reviewer.review(row, standards)
@@ -154,9 +199,9 @@ def run_audit(
         raise ValueError("Project has no current rule version")
     validate_rule_version_identity(item.project, rule_version)
     content_version = _latest_version(item)
-    reviewer = reviewer or get_reviewer("heuristic")
     standards = _standards_from_rule_version(rule_version)
     profile = get_review_profile(rule_version)
+    reviewer = reviewer or TechMediaReviewer()
     row = {
         schema.COL_ID: item.external_id,
         schema.COL_TITLE: content_version.title,
@@ -205,17 +250,31 @@ def run_audit(
         )
         session.add(persisted)
         persisted_issues.append(persisted)
-    for result_data in _normalize_agent_results(reviewer, row, standards):
+    for result_data in _normalize_agent_results(
+        reviewer, row, standards, context=context, profile=profile
+    ):
         result = AgentResult(
             audit_run=audit,
             agent_name=result_data["agent_name"],
+            agent_id=result_data.get("agent_id"),
+            agent_version=result_data.get("agent_version"),
+            decision=result_data.get("decision"),
+            summary=result_data.get("summary"),
+            score=result_data.get("score"),
             status=result_data.get("status", "COMPLETED"),
             raw_result=dict(result_data.get("raw_result", result_data)),
         )
         session.add(result)
         session.flush()
         for issue_data in result_data.get("issues", []):
-            issue_data = {"source_reference": [], **issue_data}
+            issue_data = {
+                "source_reference": [],
+                "evidence_start": None,
+                "evidence_end": None,
+                "evidence_asset_id": None,
+                "evidence_timestamp": None,
+                **issue_data,
+            }
             missing = [field for field in ISSUE_FIELDS if field not in issue_data]
             if missing:
                 raise ValueError(f"Structured issue missing fields: {', '.join(missing)}")

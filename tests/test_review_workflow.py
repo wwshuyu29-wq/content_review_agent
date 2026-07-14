@@ -165,6 +165,19 @@ def test_run_audit_rejects_configured_project_with_mismatched_snapshot_identity(
             run_audit(session, item.id, reviewer=FakeReviewer([]), model="model-v1")
 
 
+def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        audit = run_audit(session, item.id)
+
+        assert [result.agent_id for result in audit.agent_results] == [
+            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+        ]
+        assert all(result.decision == "PASS" for result in audit.agent_results)
+        assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
+
+
 def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project, _, item = submit_valid_content(session)
