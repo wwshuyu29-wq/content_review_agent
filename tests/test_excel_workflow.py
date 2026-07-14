@@ -469,7 +469,7 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
             payload=supplier_version.payload,
         )
         item.title = "最终标题"
-        item.review_status = ReviewStatus.APPROVED
+        item.review_status = ReviewStatus.PASSED
         item.publish_status = PublishStatus.READY
         session.add_all([audit, low_issue, final_version])
         session.commit()
@@ -491,7 +491,7 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
         assert values["系统内容编号"] == item.id
         assert values["批次编号"] == batch.id
         assert values["格式校验"] == "PASSED"
-        assert values["审核状态"] == "APPROVED"
+        assert values["审核状态"] == "PASSED"
         assert values["发布状态"] == "READY"
         assert values["问题数量"] == 2
         assert values["最高风险等级"] == "high"

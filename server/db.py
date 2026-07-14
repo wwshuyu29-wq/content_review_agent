@@ -39,9 +39,17 @@ def create_db_engine(database_url: Optional[str] = None) -> Engine:
 
 
 def ensure_schema_upgrades(engine: Engine) -> None:
+    Base.metadata.create_all(engine)
     database_inspector = inspect(engine)
     table_names = database_inspector.get_table_names()
     with engine.begin() as connection:
+        if "content_items" in table_names:
+            connection.exec_driver_sql(
+                "UPDATE content_items SET review_status = CASE review_status "
+                "WHEN 'MANUAL_REQUIRED' THEN 'HUMAN_REVIEW_REQUIRED' "
+                "WHEN 'FIX_PROPOSED' THEN 'AUTO_FIX_PENDING' "
+                "WHEN 'APPROVED' THEN 'PASSED' ELSE review_status END"
+            )
         if "projects" in table_names:
             project_columns = {column["name"] for column in database_inspector.get_columns("projects")}
             if "code" not in project_columns:

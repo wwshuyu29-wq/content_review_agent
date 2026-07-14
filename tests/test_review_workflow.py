@@ -37,7 +37,31 @@ class FakeReviewer:
 
     def review_structured(self, row, standards):
         self.received_standards = standards
-        return self.results
+        agent_ids = [
+            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+        ]
+        if self.results and self.results[0].get("agent_id"):
+            return self.results
+        normalized = []
+        for index, agent_id in enumerate(agent_ids):
+            supplied = self.results[index] if index < len(self.results) else {"issues": []}
+            issues = supplied.get("issues", [])
+            normalized.append({
+                **supplied,
+                "agent_name": agent_id,
+                "agent_id": agent_id,
+                "agent_version": "tech-media-v1",
+                "decision": "NEED_TEXT_FIX" if any(i.get("severity", "").lower() in {"mid", "medium"} for i in issues) else (
+                    "HUMAN_REVIEW" if any(i.get("human_required") or i.get("severity", "").lower() in {"high", "unknown", "critical"} for i in issues) else (
+                        "PASS_WITH_SUGGESTIONS" if issues else "PASS"
+                    )
+                ),
+                "summary": "test result",
+                "score": 90,
+                "status": "COMPLETED",
+            })
+        return normalized
 
     def rewrite(self, row, standards):
         return self.rewritten
@@ -64,6 +88,7 @@ def issue(
         "evidence_quote": evidence_quote,
         "reason": reason,
         "suggestion": suggestion,
+        "source_reference": ["content_quality.md"],
         "auto_fixable": auto_fixable,
         "human_required": human_required,
         "confidence": confidence,
@@ -125,7 +150,7 @@ def submit_valid_content(session: Session):
             {
                 "external_id": "content-1",
                 "title": "原始标题",
-                "body": "这是一段满足格式要求的原始正文。",
+                "body": "这是一段满足格式要求的原始正文！！！",
                 "payload": {"platform": "小红书", "publish_time": "2026-07-14"},
             }
         ],
@@ -205,7 +230,7 @@ def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Pa
         ]
         assert all(result.decision == "HUMAN_REVIEW" for result in audit.agent_results)
         assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
-        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert len(audit.issues) == 6
         assert all(issue.human_required for issue in audit.issues)
@@ -216,9 +241,10 @@ def test_blocking_agent_decision_with_zero_issues_never_approves(tmp_path: Path,
     with make_session(tmp_path) as session:
         _, _, item = submit_valid_content(session)
         audit = run_audit(session, item.id, reviewer=ProtocolReviewer(decisions=[decision] + ["PASS"] * 5))
-        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        expected = ReviewStatus.BLOCKED if decision == "BLOCK" else ReviewStatus.HUMAN_REVIEW_REQUIRED
+        assert item.review_status is expected
         assert item.publish_status is PublishStatus.NOT_READY
-        assert any(issue.rule_id == "SYSTEM-AGENT-DECISION" for issue in audit.issues)
+        assert any(issue.rule_id in {"SYSTEM-AGENT-DECISION", "SYSTEM-AGENT-PROTOCOL"} for issue in audit.issues)
 
 
 @pytest.mark.parametrize(
@@ -233,7 +259,7 @@ def test_invalid_agent_protocol_never_approves(tmp_path: Path, reviewer: Protoco
     with make_session(tmp_path) as session:
         _, _, item = submit_valid_content(session)
         audit = run_audit(session, item.id, reviewer=reviewer)
-        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert any(issue.rule_id == "SYSTEM-AGENT-PROTOCOL" for issue in audit.issues)
 
@@ -242,7 +268,7 @@ def test_all_pass_and_pass_with_suggestions_are_eligible_for_clear_approval(tmp_
     with make_session(tmp_path) as session:
         _, _, pass_item = submit_valid_content(session)
         run_audit(session, pass_item.id, reviewer=ProtocolReviewer())
-        assert pass_item.review_status is ReviewStatus.APPROVED
+        assert pass_item.review_status is ReviewStatus.PASSED
         assert pass_item.publish_status is PublishStatus.READY
 
         project = pass_item.project
@@ -258,7 +284,7 @@ def test_all_pass_and_pass_with_suggestions_are_eligible_for_clear_approval(tmp_
             second.id,
             reviewer=ProtocolReviewer(decisions=["PASS_WITH_SUGGESTIONS"] * 6),
         )
-        assert second.review_status is ReviewStatus.APPROVED
+        assert second.review_status is ReviewStatus.PASSED_WITH_SUGGESTIONS
         assert second.publish_status is PublishStatus.READY
 
 
@@ -277,9 +303,9 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert reviewer.received_standards.deny_words == []
         assert reviewer.received_standards.recommended == {}
         assert "小度想想" in reviewer.received_standards.project_text
-        assert item.review_status is ReviewStatus.APPROVED
+        assert item.review_status is ReviewStatus.PASSED
         assert item.publish_status is PublishStatus.READY
-        assert len(audit.agent_results) == 1
+        assert len(audit.agent_results) == 6
         assert audit.agent_results[0].raw_result["marker"] == "persisted"
         assert audit.issues == []
 
@@ -305,7 +331,7 @@ def test_deterministic_issue_is_persisted_in_audit_before_reviewer_results(tmp_p
         assert [saved.rule_id for saved in audit.issues] == ["CLAIM-PENDING-001"]
         assert audit.issues[0].agent_result_id is None
         assert audit.issues[0].human_required is True
-        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
 
 
 def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path: Path) -> None:
@@ -316,7 +342,7 @@ def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path:
 
         audit = run_audit(session, item.id, reviewer=reviewer, model="model-v1")
 
-        assert len(audit.agent_results) == 1
+        assert len(audit.agent_results) == 6
         assert len(audit.issues) == 1
         saved_issue = audit.issues[0]
         for key, value in structured_issue.items():
@@ -325,11 +351,11 @@ def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path:
             (1, "SUPPLIER"),
             (2, "AI_PROPOSED"),
         ]
-        assert item.versions[-1].title == "建议标题"
-        assert item.review_status is ReviewStatus.FIX_PROPOSED
+        assert item.versions[-1].title == "原始标题"
+        assert item.review_status is ReviewStatus.AUTO_FIX_PENDING
         assert item.publish_status is PublishStatus.NOT_READY
         assert [(task.task_type, task.status) for task in item.review_tasks] == [
-            ("REVIEW_FIX_PROPOSAL", "OPEN")
+            ("AUTO_FIX_PROPOSAL", "OPEN")
         ]
         task = item.review_tasks[0]
         assert task.target_content_version_id == item.versions[-1].id
@@ -378,11 +404,12 @@ def test_manual_priority_prevents_rewrite_and_creates_tasks(tmp_path: Path) -> N
 
         run_audit(session, item.id, reviewer=reviewer)
 
-        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert len(item.versions) == 1
-        assert {task.issue.rule_id for task in item.review_tasks} == {"FACT-UNKNOWN", "PARTNER-001"}
-        assert {task.task_type for task in item.review_tasks} == {"RISK_REVIEW"}
+        assert len(item.review_tasks) == 1
+        assert item.review_tasks[0].issue.rule_id in {"FACT-UNKNOWN", "PARTNER-001"}
+        assert item.review_tasks[0].task_type == "HUMAN_REVIEW"
 
 
 def test_accept_suggestion_creates_confirmed_version_and_human_decision(tmp_path: Path) -> None:
@@ -391,7 +418,7 @@ def test_accept_suggestion_creates_confirmed_version_and_human_decision(tmp_path
         run_audit(session, item.id, reviewer=FakeReviewer([agent_result(issues=[issue()])]))
         task = item.review_tasks[0]
 
-        decision = resolve_task(session, task.id, decision="ACCEPT_SUGGESTION", reviewer="owner@example.com")
+        decision = resolve_task(session, task.id, decision="ACCEPT_AUTO_FIX", reviewer="owner@example.com")
 
         assert decision.review_task_id == task.id
         assert task.status == "CLOSED"
@@ -400,8 +427,8 @@ def test_accept_suggestion_creates_confirmed_version_and_human_decision(tmp_path
             (2, "AI_PROPOSED"),
             (3, "HUMAN_CONFIRMED"),
         ]
-        assert item.versions[-1].body == "建议正文"
-        assert item.review_status is ReviewStatus.APPROVED
+        assert item.versions[-1].body == "这是一段满足格式要求的原始正文！"
+        assert item.review_status is ReviewStatus.PASSED
         assert item.publish_status is PublishStatus.READY
 
 
@@ -413,7 +440,7 @@ def test_accept_edited_text_and_reject_proposal_preserve_version_history(tmp_pat
         resolve_task(
             session,
             edited_item.review_tasks[0].id,
-            decision="ACCEPT_EDITED",
+            decision="EDIT_AUTO_FIX",
             reviewer="editor@example.com",
             payload={"title": "人工标题", "body": "人工编辑后的正文"},
         )
@@ -428,7 +455,7 @@ def test_accept_edited_text_and_reject_proposal_preserve_version_history(tmp_pat
             project_id=project.id,
             supplier_id="supplier-2",
             name="拒绝建议批次",
-            contents=[{"external_id": "reject", "title": "标题", "body": "一段完整的正文", "payload": {}}],
+            contents=[{"external_id": "reject", "title": "标题", "body": "一段完整的正文！！！", "payload": {}}],
         )
         rejected_item = rejected_batch.content_items[0]
         run_audit(session, rejected_item.id, reviewer=FakeReviewer([agent_result(issues=[issue()])]))
@@ -436,15 +463,15 @@ def test_accept_edited_text_and_reject_proposal_preserve_version_history(tmp_pat
         resolve_task(
             session,
             rejected_item.review_tasks[0].id,
-            decision="REJECT_SUGGESTION",
+            decision="REJECT_AUTO_FIX",
             reviewer="editor@example.com",
             note="建议不准确",
         )
 
         assert len(rejected_item.versions) == 2
-        assert rejected_item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert rejected_item.review_status is ReviewStatus.SUPPLIER_REVISION_REQUIRED
         assert rejected_item.publish_status is PublishStatus.NOT_READY
-        assert any(task.task_type == "RISK_REVIEW" and task.status == "OPEN" for task in rejected_item.review_tasks)
+        assert any(task.task_type == "SUPPLIER_REVISION" and task.status == "OPEN" for task in rejected_item.review_tasks)
 
 
 def test_risk_decisions_create_versions_and_update_statuses(tmp_path: Path) -> None:
@@ -463,15 +490,15 @@ def test_risk_decisions_create_versions_and_update_statuses(tmp_path: Path) -> N
         resolve_task(
             session,
             task.id,
-            decision="APPROVE_RISK",
+            decision="HUMAN_APPROVE",
             reviewer="legal@example.com",
             payload={"title": "核准标题", "body": "经人工核准的正文"},
         )
 
         assert item.versions[-1].source == "HUMAN_APPROVED"
-        assert item.review_status is ReviewStatus.APPROVED
+        assert item.review_status is ReviewStatus.PASSED
         assert item.publish_status is PublishStatus.READY
-        assert session.scalars(select(HumanDecision)).one().decision == "APPROVE_RISK"
+        assert session.scalars(select(HumanDecision)).one().decision == "HUMAN_APPROVE"
 
 
 def test_risk_approval_waits_for_all_open_risk_tasks(tmp_path: Path) -> None:
@@ -500,21 +527,12 @@ def test_risk_approval_waits_for_all_open_risk_tasks(tmp_path: Path) -> None:
         resolve_task(
             session,
             item.review_tasks[0].id,
-            decision="APPROVE_RISK",
+            decision="HUMAN_APPROVE",
             reviewer="legal@example.com",
         )
 
-        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
-        assert item.publish_status is PublishStatus.NOT_READY
-
-        resolve_task(
-            session,
-            item.review_tasks[1].id,
-            decision="APPROVE_RISK",
-            reviewer="legal@example.com",
-        )
-
-        assert item.review_status is ReviewStatus.APPROVED
+        assert item.review_status is ReviewStatus.PASSED
+        assert item.publish_status is PublishStatus.READY
         assert item.publish_status is PublishStatus.READY
 
 
@@ -526,19 +544,15 @@ def test_rejecting_risk_closes_sibling_tasks_and_is_terminal(tmp_path: Path) -> 
             issue("high", rule_id="RISK-B", auto_fixable=False, human_required=True),
         ]
         run_audit(session, item.id, reviewer=FakeReviewer([agent_result("external", risks)]))
-        first, second = item.review_tasks
+        assert len(item.review_tasks) == 1
+        task = item.review_tasks[0]
 
-        resolve_task(session, first.id, decision="REJECT_RISK", reviewer="legal@example.com")
+        resolve_task(session, task.id, decision="HUMAN_REJECT", reviewer="legal@example.com")
 
         assert item.review_status is ReviewStatus.REJECTED
         assert item.publish_status is PublishStatus.NOT_READY
-        assert second.status == "SUPERSEDED"
-        try:
-            resolve_task(session, second.id, decision="APPROVE_RISK", reviewer="legal@example.com")
-        except ValueError as error:
-            assert "closed" in str(error)
-        else:
-            raise AssertionError("superseded task must not be resolvable")
+        with pytest.raises(ValueError, match="closed"):
+            resolve_task(session, task.id, decision="HUMAN_APPROVE", reviewer="legal@example.com")
 
 
 def test_rejected_content_cannot_be_reaudited_or_create_audit_run(tmp_path: Path) -> None:
@@ -546,7 +560,7 @@ def test_rejected_content_cannot_be_reaudited_or_create_audit_run(tmp_path: Path
         _, _, item = submit_valid_content(session)
         risk = issue("high", auto_fixable=False, human_required=True)
         run_audit(session, item.id, reviewer=FakeReviewer([agent_result("external", [risk])]))
-        resolve_task(session, item.review_tasks[0].id, decision="REJECT_RISK", reviewer="legal@example.com")
+        resolve_task(session, item.review_tasks[0].id, decision="HUMAN_REJECT", reviewer="legal@example.com")
         audit_count = len(item.audit_runs)
 
         with pytest.raises(ValueError, match="Rejected content is terminal"):
@@ -570,7 +584,7 @@ def test_approvals_validate_trimmed_content_and_format_limits(tmp_path: Path) ->
         )
         for payload in invalid_payloads:
             try:
-                resolve_task(session, task.id, decision="ACCEPT_EDITED", reviewer="editor", payload=payload)
+                resolve_task(session, task.id, decision="EDIT_AUTO_FIX", reviewer="editor", payload=payload)
             except ValueError as error:
                 assert "format" in str(error).lower()
             else:
@@ -602,7 +616,7 @@ def test_build_report_returns_project_batch_status_category_rule_and_manual_metr
 
         assert report["project"] == {"id": project.id, "name": project.name}
         assert report["totals"]["contents"] == 2
-        assert report["status_counts"] == {"APPROVED": 1, "MANUAL_REQUIRED": 1}
+        assert report["status_counts"] == {"PASSED": 1, "HUMAN_REVIEW_REQUIRED": 1}
         assert report["category_counts"] == {"external": 1}
         assert report["rule_counts"] == {"PARTNER-003": 1}
         assert report["manual_metrics"] == {"contents": 1, "tasks": 1, "rate": 0.5}
@@ -614,7 +628,7 @@ def test_report_counts_only_latest_audit_issues_and_open_tasks(tmp_path: Path) -
     with make_session(tmp_path) as session:
         project, _, item = submit_valid_content(session)
         run_audit(session, item.id, reviewer=FakeReviewer([agent_result(issues=[issue()])]))
-        resolve_task(session, item.review_tasks[0].id, decision="ACCEPT_SUGGESTION", reviewer="owner")
+        resolve_task(session, item.review_tasks[0].id, decision="ACCEPT_AUTO_FIX", reviewer="owner")
         run_audit(session, item.id, reviewer=FakeReviewer([agent_result()]))
 
         report = build_report(session, project_id=project.id)

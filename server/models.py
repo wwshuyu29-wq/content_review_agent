@@ -21,10 +21,21 @@ class FormatStatus(str, Enum):
 class ReviewStatus(str, Enum):
     NOT_STARTED = "NOT_STARTED"
     AI_REVIEWING = "AI_REVIEWING"
-    MANUAL_REQUIRED = "MANUAL_REQUIRED"
-    FIX_PROPOSED = "FIX_PROPOSED"
-    APPROVED = "APPROVED"
+    HUMAN_REVIEW_REQUIRED = "HUMAN_REVIEW_REQUIRED"
+    SUPPLIER_REVISION_REQUIRED = "SUPPLIER_REVISION_REQUIRED"
+    AUTO_FIX_PENDING = "AUTO_FIX_PENDING"
+    PASSED = "PASSED"
+    PASSED_WITH_SUGGESTIONS = "PASSED_WITH_SUGGESTIONS"
+    BLOCKED = "BLOCKED"
     REJECTED = "REJECTED"
+
+
+class AssetKind(str, Enum):
+    IMAGE = "IMAGE"
+    VIDEO = "VIDEO"
+    SCREENSHOT = "SCREENSHOT"
+    SCREEN_RECORDING = "SCREEN_RECORDING"
+    TEST_LOG = "TEST_LOG"
 
 
 class PublishStatus(str, Enum):
@@ -139,6 +150,12 @@ class ContentItem(TimestampMixin, Base):
     )
     audit_runs: Mapped[List["AuditRun"]] = relationship(back_populates="content_item")
     review_tasks: Mapped[List["ReviewTask"]] = relationship(back_populates="content_item")
+    assets: Mapped[List["Asset"]] = relationship(
+        back_populates="content_item", cascade="all, delete-orphan", order_by="Asset.id"
+    )
+    test_cases: Mapped[List["TestCase"]] = relationship(
+        back_populates="content_item", cascade="all, delete-orphan", order_by="TestCase.id"
+    )
 
 
 class ContentVersion(TimestampMixin, Base):
@@ -156,6 +173,69 @@ class ContentVersion(TimestampMixin, Base):
     content_item: Mapped[ContentItem] = relationship(back_populates="versions")
     audit_runs: Mapped[List["AuditRun"]] = relationship(back_populates="content_version")
     review_tasks: Mapped[List["ReviewTask"]] = relationship(back_populates="target_content_version")
+    test_cases: Mapped[List["TestCase"]] = relationship(back_populates="content_version")
+
+
+class Asset(TimestampMixin, Base):
+    __tablename__ = "assets"
+    __table_args__ = (
+        UniqueConstraint("content_item_id", "asset_id"),
+        UniqueConstraint("content_item_id", "external_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    external_id: Mapped[Optional[str]] = mapped_column(String(200))
+    kind: Mapped[AssetKind] = enum_column(AssetKind, AssetKind.IMAGE)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    storage_key: Mapped[Optional[str]] = mapped_column(String(1000))
+    mime_type: Mapped[Optional[str]] = mapped_column(String(200))
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer)
+    asset_metadata: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
+
+    content_item: Mapped[ContentItem] = relationship(back_populates="assets")
+    evidence: Mapped[List["TestEvidence"]] = relationship(
+        back_populates="asset", cascade="all, delete-orphan"
+    )
+
+
+class TestCase(TimestampMixin, Base):
+    __tablename__ = "test_cases"
+    __table_args__ = (UniqueConstraint("content_item_id", "external_test_case_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
+    content_version_id: Mapped[int] = mapped_column(ForeignKey("content_versions.id"), index=True, nullable=False)
+    external_test_case_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    claim: Mapped[str] = mapped_column(Text, nullable=False)
+    command: Mapped[str] = mapped_column(Text, nullable=False)
+    observed_result: Mapped[str] = mapped_column(Text, nullable=False)
+    city: Mapped[Optional[str]] = mapped_column(String(200))
+    tested_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    app_version: Mapped[Optional[str]] = mapped_column(String(200))
+    device: Mapped[Optional[str]] = mapped_column(String(500))
+    operating_system: Mapped[Optional[str]] = mapped_column(String(500))
+    network_environment: Mapped[Optional[str]] = mapped_column(String(500))
+    test_metadata: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict, nullable=False)
+
+    content_item: Mapped[ContentItem] = relationship(back_populates="test_cases")
+    content_version: Mapped[ContentVersion] = relationship(back_populates="test_cases")
+    evidence: Mapped[List["TestEvidence"]] = relationship(
+        back_populates="test_case", cascade="all, delete-orphan", order_by="TestEvidence.id"
+    )
+
+
+class TestEvidence(TimestampMixin, Base):
+    __tablename__ = "test_evidence"
+    __table_args__ = (UniqueConstraint("test_case_id", "asset_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    test_case_id: Mapped[int] = mapped_column(ForeignKey("test_cases.id"), index=True, nullable=False)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("assets.id"), index=True, nullable=False)
+
+    test_case: Mapped[TestCase] = relationship(back_populates="evidence")
+    asset: Mapped[Asset] = relationship(back_populates="evidence")
 
 
 class AuditRun(TimestampMixin, Base):

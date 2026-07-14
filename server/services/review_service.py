@@ -7,7 +7,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from scripts.text_review import schema
-from scripts.text_review.reviewer import get_reviewer
 from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer
 from scripts.text_review.standards import Standards
 from server.models import (
@@ -25,6 +24,8 @@ from server.models import (
 )
 from server.services.content_service import validate_content_format
 from server.services.deterministic_rule_service import ReviewContext, evaluate_rules
+from server.services.evidence_service import list_content_test_cases
+from server.services.review_arbiter_service import ArbitrationResult, ReviewTaskSpec, arbitrate_review
 from server.services.review_profile_service import get_review_profile
 
 MANUAL_SEVERITIES = {"mid", "high", "unknown"}
@@ -117,15 +118,19 @@ def _validate_agent_protocol(results: list[dict], profile: Any) -> Optional[str]
                 return f"Agent {result.get('agent_id')} has missing or unknown issue references"
         if result.get("decision") == "PASS" and issues:
             return f"Agent {result.get('agent_id')} returned PASS with issues"
-        if result.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}:
+        if result.get("decision") in {"HUMAN_REVIEW", "BLOCK"}:
             if not any(
-                issue.get("human_required") or issue.get("severity") in {"HIGH", "CRITICAL"}
+                issue.get("human_required") or str(issue.get("severity", "")).upper() in {"HIGH", "CRITICAL"}
                 for issue in issues
             ):
                 return f"Agent {result.get('agent_id')} returned a blocking decision without a blocking issue"
+        if result.get("decision") == "NEED_TEXT_FIX" and not any(
+            str(issue.get("severity", "")).upper() in {"MEDIUM", "MID"} for issue in issues
+        ):
+            return f"Agent {result.get('agent_id')} returned NEED_TEXT_FIX without a medium issue"
         if result.get("decision") == "PASS_WITH_SUGGESTIONS":
             if any(
-                issue.get("human_required") or issue.get("severity") != "LOW"
+                issue.get("human_required") or str(issue.get("severity", "")).upper() != "LOW"
                 for issue in issues
             ):
                 return f"Agent {result.get('agent_id')} returned invalid suggestions"
@@ -160,25 +165,52 @@ def _open_tasks(item: ContentItem) -> list[ReviewTask]:
     return [task for task in item.review_tasks if task.status == "OPEN"]
 
 
-def _derive_state(item: ContentItem, *, approved_when_clear: bool = False) -> None:
+def _derive_state(item: ContentItem, *, clear_status: Optional[ReviewStatus] = None) -> None:
     if item.review_status is ReviewStatus.REJECTED:
         item.publish_status = PublishStatus.NOT_READY
         return
     open_tasks = _open_tasks(item)
     if open_tasks:
         item.publish_status = PublishStatus.NOT_READY
-        item.review_status = (
-            ReviewStatus.FIX_PROPOSED
-            if all(task.task_type == "REVIEW_FIX_PROPOSAL" for task in open_tasks)
-            else ReviewStatus.MANUAL_REQUIRED
+        task_statuses = {
+            "BLOCK_REVIEW": ReviewStatus.BLOCKED,
+            "HUMAN_REVIEW": ReviewStatus.HUMAN_REVIEW_REQUIRED,
+            "SUPPLIER_REVISION": ReviewStatus.SUPPLIER_REVISION_REQUIRED,
+            "AUTO_FIX_PROPOSAL": ReviewStatus.AUTO_FIX_PENDING,
+        }
+        item.review_status = next(
+            (task_statuses[task_type] for task_type in task_statuses if any(task.task_type == task_type for task in open_tasks)),
+            ReviewStatus.HUMAN_REVIEW_REQUIRED,
         )
         return
-    if approved_when_clear:
-        item.review_status = ReviewStatus.APPROVED
+    if clear_status in {ReviewStatus.PASSED, ReviewStatus.PASSED_WITH_SUGGESTIONS}:
+        item.review_status = clear_status
         item.publish_status = PublishStatus.READY
-    else:
-        item.review_status = ReviewStatus.MANUAL_REQUIRED
+    elif clear_status is not None:
+        item.review_status = clear_status
         item.publish_status = PublishStatus.NOT_READY
+    else:
+        item.review_status = ReviewStatus.HUMAN_REVIEW_REQUIRED
+        item.publish_status = PublishStatus.NOT_READY
+
+
+def _safe_proposal(content_version: ContentVersion, issues: list[Issue]) -> Optional[tuple[str, str]]:
+    title, body = content_version.title, content_version.body
+    changed = False
+    for issue in issues:
+        if not issue.evidence_quote or not issue.suggestion or issue.field not in {"title", "body"}:
+            continue
+        source = title if issue.field == "title" else body
+        if issue.evidence_quote not in source:
+            continue
+        updated = source.replace(issue.evidence_quote, issue.suggestion)
+        if updated != source:
+            changed = True
+            if issue.field == "title":
+                title = updated
+            else:
+                body = updated
+    return (title, body) if changed else None
 
 
 def _normalize_agent_results(
@@ -305,6 +337,22 @@ def run_audit(
     session.add(audit)
     session.flush()
 
+    database_test_cases = list_content_test_cases(
+        session, item.id, content_version_id=content_version.id
+    )
+    if database_test_cases:
+        context_test_cases = database_test_cases
+        context_evidence_assets = [
+            asset for test_case in database_test_cases for asset in test_case["evidence_assets"]
+        ]
+        context_evidence = [
+            {"test_case_id": test_case["test_case_id"], "asset_id": asset["asset_id"]}
+            for test_case in database_test_cases for asset in test_case["evidence_assets"]
+        ]
+    else:
+        context_test_cases = list(content_version.payload.get("test_cases", []))
+        context_evidence = list(content_version.payload.get("evidence", []))
+        context_evidence_assets = list(content_version.payload.get("evidence_assets", []))
     context = ReviewContext(
         title=content_version.title,
         body=content_version.body,
@@ -312,9 +360,9 @@ def run_audit(
         content_type=item.project.content_type or "",
         project_id=str(item.project_id),
         project_code=item.project.code or "",
-        test_cases=list(content_version.payload.get("test_cases", [])),
-        evidence=list(content_version.payload.get("evidence", [])),
-        evidence_assets=list(content_version.payload.get("evidence_assets", [])),
+        test_cases=context_test_cases,
+        evidence=context_evidence,
+        evidence_assets=context_evidence_assets,
     )
     persisted_issues: list[Issue] = []
     for deterministic in evaluate_rules(profile, context):
@@ -337,9 +385,7 @@ def run_audit(
     agent_result_data = _normalize_agent_results(
         reviewer, row, standards, context=context, profile=profile
     )
-    strict_protocol = isinstance(reviewer, TechMediaReviewer) or any(
-        "agent_id" in result_data for result_data in agent_result_data
-    )
+    strict_protocol = item.project.content_type == "TECH_MEDIA_REVIEW"
     protocol_error = _validate_agent_protocol(agent_result_data, profile) if strict_protocol else None
     persisted_agent_keys: set[tuple[Any, Any, Any]] = set()
     for result_data in agent_result_data:
@@ -406,65 +452,71 @@ def run_audit(
                 persisted_issues.append(persisted)
     session.flush()
 
-    decision_requires_human = strict_protocol and any(
-        result_data.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}
-        for result_data in agent_result_data
+    campaign_result = next(
+        (result for result in agent_result_data if result.get("agent_id") == "CAMPAIGN_EFFECTIVENESS"), None
     )
-    if decision_requires_human and not any(
-        issue.human_required or issue.severity.upper() in {"HIGH", "CRITICAL"}
-        for issue in persisted_issues
-    ):
-        persisted = Issue(
-            audit_run=audit,
-            **_system_issue(
-                rule_id="SYSTEM-AGENT-DECISION",
-                reason="An Agent returned an explicit blocking decision.",
-                suggestion="Complete human review before approval.",
-            ),
-        )
-        session.add(persisted)
-        persisted_issues.append(persisted)
-        session.flush()
+    arbitration = arbitrate_review(
+        [
+            {"agent_id": result.get("agent_id"), "agent_name": result.get("agent_name"), "decision": result.get("decision")}
+            for result in agent_result_data
+        ],
+        persisted_issues,
+        campaign_score=campaign_result.get("score") if campaign_result else None,
+        suggestions=[
+            issue.suggestion for issue in persisted_issues
+            if issue.severity.upper() == "LOW" and issue.suggestion
+        ],
+    )
 
-    manual_issues = [
-        issue for issue in persisted_issues
-        if issue.human_required or issue.severity.lower() in MANUAL_SEVERITIES
-    ]
-    purely_safe_low_risk = bool(persisted_issues) and not manual_issues and all(
-        issue.severity.lower() == "low" and issue.auto_fixable for issue in persisted_issues
-    )
-    if manual_issues or (persisted_issues and not purely_safe_low_risk):
-        for issue in manual_issues or persisted_issues:
+    if arbitration.ai_proposal_allowed:
+        proposed_text = _safe_proposal(content_version, persisted_issues)
+        if proposed_text is None:
+            arbitration = ArbitrationResult(
+                ReviewStatus.HUMAN_REVIEW_REQUIRED,
+                PublishStatus.NOT_READY,
+                (ReviewTaskSpec("HUMAN_REVIEW"),),
+                reason="allowlisted issue could not be applied safely",
+            )
+        else:
+            proposed = _new_version(
+                item,
+                source="AI_PROPOSED",
+                title=proposed_text[0],
+                body=proposed_text[1],
+                payload=content_version.payload,
+            )
+            session.add(proposed)
+            session.flush()
+            session.add(ReviewTask(
+                content_item=item,
+                target_content_version=proposed,
+                audit_run=audit,
+                issue=next(iter(persisted_issues), None),
+                task_type="AUTO_FIX_PROPOSAL",
+            ))
+
+    if not arbitration.ai_proposal_allowed:
+        task_issue_by_rule = {issue.rule_id: issue for issue in persisted_issues}
+        for task_spec in arbitration.task_specs:
+            linked_issue = next(
+                (task_issue_by_rule[key] for key in task_spec.issue_keys if key in task_issue_by_rule),
+                next(iter(persisted_issues), None),
+            )
             session.add(ReviewTask(
                 content_item=item,
                 target_content_version=content_version,
                 audit_run=audit,
-                issue=issue,
-                task_type="RISK_REVIEW",
+                issue=linked_issue,
+                task_type=task_spec.task_type,
             ))
-        session.flush()
-        _derive_state(item)
-    elif purely_safe_low_risk:
-        proposed_title, proposed_body = reviewer.rewrite(row, standards)
-        proposed = _new_version(
-            item,
-            source="AI_PROPOSED",
-            title=proposed_title,
-            body=proposed_body,
-            payload=content_version.payload,
-        )
-        session.add(proposed)
-        session.flush()
-        session.add(ReviewTask(
-            content_item=item,
-            target_content_version=proposed,
-            audit_run=audit,
-            task_type="REVIEW_FIX_PROPOSAL",
-        ))
-        session.flush()
-        _derive_state(item)
-    else:
-        _derive_state(item, approved_when_clear=True)
+    session.flush()
+    item.review_status = arbitration.review_status
+    item.publish_status = (
+        arbitration.publish_status
+        if arbitration.review_status in {ReviewStatus.PASSED, ReviewStatus.PASSED_WITH_SUGGESTIONS}
+        and not _open_tasks(item)
+        else PublishStatus.NOT_READY
+    )
 
     audit.status = "COMPLETED"
     audit.completed_at = datetime.utcnow()
@@ -496,47 +548,60 @@ def resolve_task(
     payload = dict(payload or {})
     target = task.target_content_version
     allowed = {
-        "REVIEW_FIX_PROPOSAL": {"ACCEPT_SUGGESTION", "ACCEPT_EDITED", "REJECT_SUGGESTION"},
-        "RISK_REVIEW": {"APPROVE_RISK", "REJECT_RISK"},
+        "AUTO_FIX_PROPOSAL": {
+            "ACCEPT_AUTO_FIX", "EDIT_AUTO_FIX", "REJECT_AUTO_FIX",
+            "ACCEPT_SUGGESTION", "ACCEPT_EDITED", "REJECT_SUGGESTION",
+        },
+        "HUMAN_REVIEW": {"HUMAN_APPROVE", "HUMAN_REJECT", "APPROVE_RISK", "REJECT_RISK"},
+        "BLOCK_REVIEW": {"HUMAN_APPROVE", "HUMAN_REJECT", "APPROVE_RISK", "REJECT_RISK"},
+        "SUPPLIER_REVISION": {"SUPPLIER_REVISION_SUBMITTED"},
     }
     if decision not in allowed.get(task.task_type, set()):
         raise ValueError(f"Decision {decision} is invalid for {task.task_type}")
 
-    approved_when_clear = False
-    if decision == "ACCEPT_SUGGESTION":
+    clear_status: Optional[ReviewStatus] = None
+    if decision in {"ACCEPT_AUTO_FIX", "ACCEPT_SUGGESTION"}:
         if target.source != "AI_PROPOSED":
             raise ValueError("Task target is not an AI proposed version")
         session.add(_new_version(
             item, source="HUMAN_CONFIRMED", title=target.title, body=target.body, payload=target.payload
         ))
-        approved_when_clear = True
-    elif decision == "ACCEPT_EDITED":
+        clear_status = ReviewStatus.PASSED
+    elif decision in {"EDIT_AUTO_FIX", "ACCEPT_EDITED"}:
         title, body = validate_content_format(payload.get("title"), payload.get("body"))
         session.add(_new_version(
             item, source="HUMAN_EDITED", title=title, body=body, payload=target.payload
         ))
-        approved_when_clear = True
-    elif decision == "REJECT_SUGGESTION":
+        clear_status = ReviewStatus.PASSED
+    elif decision in {"REJECT_AUTO_FIX", "REJECT_SUGGESTION"}:
         session.add(ReviewTask(
             content_item=item,
-            target_content_version=target,
+            target_content_version=task.audit_run.content_version,
             audit_run=task.audit_run,
-            task_type="RISK_REVIEW",
+            task_type="SUPPLIER_REVISION",
         ))
-    elif decision == "APPROVE_RISK":
-        title = payload.get("title", target.title)
-        body = payload.get("body", target.body)
-        title, body = validate_content_format(title, body)
-        session.add(_new_version(
-            item, source="HUMAN_APPROVED", title=title, body=body, payload=target.payload
-        ))
-        approved_when_clear = True
-    elif decision == "REJECT_RISK":
+    elif decision in {"HUMAN_APPROVE", "APPROVE_RISK"}:
+        if "title" in payload or "body" in payload:
+            title = payload.get("title", target.title)
+            body = payload.get("body", target.body)
+            title, body = validate_content_format(title, body)
+            session.add(_new_version(
+                item, source="HUMAN_APPROVED", title=title, body=body, payload=target.payload
+            ))
+        clear_status = ReviewStatus.PASSED
+    elif decision in {"HUMAN_REJECT", "REJECT_RISK"}:
         item.review_status = ReviewStatus.REJECTED
+        item.publish_status = PublishStatus.NOT_READY
         for candidate in _open_tasks(item):
             if candidate.id != task.id:
                 candidate.status = "SUPERSEDED"
                 candidate.closed_at = datetime.utcnow()
+    elif decision == "SUPPLIER_REVISION_SUBMITTED":
+        title, body = validate_content_format(payload.get("title"), payload.get("body"))
+        session.add(_new_version(
+            item, source="SUPPLIER_REVISION", title=title, body=body, payload=target.payload
+        ))
+        clear_status = ReviewStatus.NOT_STARTED
 
     task.status = "CLOSED"
     task.closed_at = datetime.utcnow()
@@ -549,7 +614,8 @@ def resolve_task(
     )
     session.add(human_decision)
     session.flush()
-    _derive_state(item, approved_when_clear=approved_when_clear)
+    if item.review_status is not ReviewStatus.REJECTED:
+        _derive_state(item, clear_status=clear_status)
     session.commit()
     session.refresh(human_decision)
     return human_decision

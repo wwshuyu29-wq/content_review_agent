@@ -19,26 +19,28 @@ class FakeReviewer:
     name = "api-fake-reviewer"
 
     def review_structured(self, row, standards):
+        agent_ids = [
+            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+        ]
         return [
             {
-                "agent_name": "quality",
+                "agent_name": agent_id,
+                "agent_id": agent_id,
+                "agent_version": "tech-media-v1",
+                "decision": "PASS_WITH_SUGGESTIONS" if agent_id == "CONTENT_QUALITY" else "PASS",
+                "summary": "api test",
+                "score": 90,
                 "status": "COMPLETED",
-                "issues": [
-                    {
-                        "rule_id": "QUALITY-API-001",
-                        "category": "quality",
-                        "severity": "low",
-                        "field": "body",
-                        "evidence_quote": "！！！",
-                        "reason": "重复标点",
-                        "suggestion": "改为单个感叹号",
-                        "auto_fixable": True,
-                        "human_required": False,
-                        "confidence": 0.98,
-                    }
-                ],
+                "issues": [{
+                    "rule_id": "QUALITY-API-001", "category": "quality", "severity": "low",
+                    "field": "body", "evidence_quote": "！！！", "reason": "重复标点",
+                    "suggestion": "！", "source_reference": ["content_quality.md"],
+                    "auto_fixable": True, "human_required": False, "confidence": 0.98,
+                }] if agent_id == "CONTENT_QUALITY" else [],
                 "raw_result": {"source": "fake"},
             }
+            for agent_id in agent_ids
         ]
 
     def rewrite(self, row, standards):
@@ -147,12 +149,12 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     detail = client.get(f"/api/contents/{item['id']}")
     assert detail.status_code == 200
     content = detail.json()
-    assert content["review_status"] == "FIX_PROPOSED"
+    assert content["review_status"] == "AUTO_FIX_PENDING"
     assert [version["source"] for version in content["versions"]] == ["SUPPLIER", "AI_PROPOSED"]
     assert content["latest_audit"]["agent_results"][0]["raw_result"] == {"source": "fake"}
     assert content["latest_audit"]["issues"][0]["rule_id"] == "QUALITY-API-001"
     task = content["open_tasks"][0]
-    assert task["task_type"] == "REVIEW_FIX_PROPOSAL"
+    assert task["task_type"] == "AUTO_FIX_PROPOSAL"
 
     tasks = client.get("/api/review-tasks", params={"status": "OPEN", "project_id": project["id"]})
     assert tasks.status_code == 200
@@ -160,13 +162,13 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
 
     resolved = client.post(
         f"/api/review-tasks/{task['id']}/resolve",
-        json={"decision": "ACCEPT_SUGGESTION", "reviewer": "owner@example.com", "note": "确认"},
+        json={"decision": "ACCEPT_AUTO_FIX", "reviewer": "owner@example.com", "note": "确认"},
     )
     assert resolved.status_code == 200
-    assert resolved.json()["decision"] == "ACCEPT_SUGGESTION"
+    assert resolved.json()["decision"] == "ACCEPT_AUTO_FIX"
 
     final_content = client.get(f"/api/contents/{item['id']}").json()
-    assert final_content["review_status"] == "APPROVED"
+    assert final_content["review_status"] == "PASSED"
     assert final_content["publish_status"] == "READY"
     assert final_content["versions"][-1]["source"] == "HUMAN_CONFIRMED"
     assert final_content["open_tasks"] == []
@@ -175,7 +177,7 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     assert report.status_code == 200
     assert report.json()["totals"] == {"contents": 1, "issues": 1, "tasks": 0}
     assert report.json()["historical_totals"] == {"issues": 1, "tasks": 1}
-    assert report.json()["status_counts"] == {"APPROVED": 1}
+    assert report.json()["status_counts"] == {"PASSED": 1}
 
 
 def test_default_heuristic_audit_routes_to_human_review(api) -> None:
@@ -199,9 +201,9 @@ def test_default_heuristic_audit_routes_to_human_review(api) -> None:
     assert response.status_code == 200
     assert response.json()["agent_results"][0]["decision"] == "HUMAN_REVIEW"
     detail = client.get(f"/api/contents/{content_id}").json()
-    assert detail["review_status"] == "MANUAL_REQUIRED"
+    assert detail["review_status"] == "HUMAN_REVIEW_REQUIRED"
     assert detail["publish_status"] == "NOT_READY"
-    assert len(detail["open_tasks"]) == 6
+    assert len(detail["open_tasks"]) == 1
 
 
 def test_batch_audit_endpoint_audits_all_eligible_contents(api) -> None:

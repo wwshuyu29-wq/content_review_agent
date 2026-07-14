@@ -152,6 +152,7 @@ def test_create_all_defines_every_workflow_table(tmp_path: Path) -> None:
 
     assert set(inspect(engine).get_table_names()) == {
         "agent_results",
+        "assets",
         "audit_runs",
         "batches",
         "content_items",
@@ -161,6 +162,8 @@ def test_create_all_defines_every_workflow_table(tmp_path: Path) -> None:
         "projects",
         "review_tasks",
         "rule_versions",
+        "test_cases",
+        "test_evidence",
     }
 
 
@@ -533,6 +536,9 @@ def test_foreign_keys_used_by_workflow_queries_are_indexed(tmp_path: Path) -> No
         "issues": {"audit_run_id", "agent_result_id"},
         "review_tasks": {"content_item_id", "target_content_version_id", "audit_run_id", "issue_id"},
         "human_decisions": {"review_task_id"},
+        "assets": {"content_item_id"},
+        "test_cases": {"content_item_id", "content_version_id"},
+        "test_evidence": {"test_case_id", "asset_id"},
     }
 
     for table_name, expected_columns in expected_indexed_foreign_keys.items():
@@ -565,6 +571,9 @@ def test_workflow_identity_constraints_are_unique(tmp_path: Path) -> None:
             ("audit_run_id", "agent_id", "agent_version"),
         },
         "review_tasks": {("issue_id",)},
+        "assets": {("content_item_id", "asset_id"), ("content_item_id", "external_id")},
+        "test_cases": {("content_item_id", "external_test_case_id")},
+        "test_evidence": {("test_case_id", "asset_id")},
     }
 
     for table_name, expected_constraints in expected_unique_constraints.items():
@@ -588,7 +597,7 @@ def test_content_status_enums_store_values_and_serialize_from_orm(tmp_path: Path
             external_id="enum-content",
             title="枚举标题",
             format_status=FormatStatus.INCOMPLETE,
-            review_status=ReviewStatus.MANUAL_REQUIRED,
+            review_status=ReviewStatus.HUMAN_REVIEW_REQUIRED,
             publish_status=PublishStatus.NOT_READY,
         )
         session.add(item)
@@ -596,14 +605,14 @@ def test_content_status_enums_store_values_and_serialize_from_orm(tmp_path: Path
         schema = ContentItemRead.model_validate(item)
 
         assert schema.model_dump(mode="json")["format_status"] == "INCOMPLETE"
-        assert schema.model_dump(mode="json")["review_status"] == "MANUAL_REQUIRED"
+        assert schema.model_dump(mode="json")["review_status"] == "HUMAN_REVIEW_REQUIRED"
         assert schema.model_dump(mode="json")["publish_status"] == "NOT_READY"
 
     with engine.connect() as connection:
         stored = connection.exec_driver_sql(
             "SELECT format_status, review_status, publish_status FROM content_items"
         ).one()
-        assert stored == ("INCOMPLETE", "MANUAL_REQUIRED", "NOT_READY")
+        assert stored == ("INCOMPLETE", "HUMAN_REVIEW_REQUIRED", "NOT_READY")
 
 
 def test_schemas_validate_statuses_and_issue_confidence() -> None:
@@ -632,3 +641,33 @@ def test_schemas_validate_statuses_and_issue_confidence() -> None:
             human_required=True,
             confidence=1.1,
         )
+
+
+def test_schema_upgrade_maps_legacy_review_statuses_and_preserves_rejected(tmp_path: Path) -> None:
+    import server.db as db_module
+
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="legacy-status")
+        batch = Batch(project=project, supplier_id="supplier", name="batch")
+        for index, status in enumerate(("MANUAL_REQUIRED", "FIX_PROPOSED", "APPROVED", "REJECTED")):
+            batch.content_items.append(ContentItem(
+                project=project, external_id=str(index), title=status,
+                review_status=ReviewStatus.NOT_STARTED,
+            ))
+        session.add(batch)
+        session.commit()
+    with engine.begin() as connection:
+        for index, status in enumerate(("MANUAL_REQUIRED", "FIX_PROPOSED", "APPROVED", "REJECTED")):
+            connection.exec_driver_sql(
+                "UPDATE content_items SET review_status = ? WHERE external_id = ?", (status, str(index))
+            )
+
+    db_module.ensure_schema_upgrades(engine)
+
+    with engine.connect() as connection:
+        values = connection.exec_driver_sql(
+            "SELECT review_status FROM content_items ORDER BY external_id"
+        ).scalars().all()
+    assert values == ["HUMAN_REVIEW_REQUIRED", "AUTO_FIX_PENDING", "PASSED", "REJECTED"]

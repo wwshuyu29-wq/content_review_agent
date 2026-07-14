@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .models import FormatStatus, PublishStatus, ReviewStatus
+from .models import AssetKind, FormatStatus, PublishStatus, ReviewStatus
 
 
 class OrmSchema(BaseModel):
@@ -258,3 +258,75 @@ class HumanDecisionRead(OrmSchema):
     note: Optional[str]
     payload: Dict[str, Any]
     created_at: datetime
+
+
+class AssetCreate(BaseModel):
+    content_item_id: int
+    asset_id: str = Field(min_length=1, max_length=200)
+    external_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    kind: AssetKind
+    filename: str = Field(min_length=1, max_length=500)
+    storage_key: Optional[str] = Field(default=None, max_length=1000)
+    mime_type: Optional[str] = Field(default=None, max_length=200)
+    size_bytes: Optional[int] = Field(default=None, ge=0)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssetRead(OrmSchema):
+    id: int
+    content_item_id: int
+    asset_id: str
+    external_id: Optional[str]
+    kind: AssetKind
+    filename: str
+    storage_key: Optional[str]
+    mime_type: Optional[str]
+    size_bytes: Optional[int]
+    asset_metadata: Dict[str, Any]
+    created_at: datetime
+
+
+class TestCaseCreate(BaseModel):
+    content_item_id: int
+    content_version_id: int
+    external_test_case_id: str = Field(min_length=1, max_length=200)
+    claim: str = Field(min_length=1)
+    command: str = Field(min_length=1)
+    observed_result: str = Field(min_length=1)
+    city: Optional[str] = None
+    tested_at: Optional[datetime] = None
+    app_version: Optional[str] = None
+    device: Optional[str] = None
+    operating_system: Optional[str] = None
+    network_environment: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class TestEvidenceRead(OrmSchema):
+    id: int
+    test_case_id: int
+    asset_id: int
+    asset: AssetRead
+
+
+class TestCaseRead(OrmSchema):
+    id: int
+    content_item_id: int
+    content_version_id: int
+    external_test_case_id: str
+    claim: str
+    command: str
+    observed_result: str
+    city: Optional[str]
+    tested_at: Optional[datetime]
+    app_version: Optional[str]
+    device: Optional[str]
+    operating_system: Optional[str]
+    network_environment: Optional[str]
+    test_metadata: Dict[str, Any]
+    evidence: List[TestEvidenceRead] = Field(default_factory=list)
+
+
+class TestEvidenceCreate(BaseModel):
+    test_case_id: int
+    asset_id: int
