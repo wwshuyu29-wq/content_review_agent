@@ -168,7 +168,7 @@ def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIs
             missing.append(field)
     if not missing:
         return []
-    return [_issue(rule, field="body", evidence=trigger, reason=f"出现实测触发词，但缺少结构化证据字段：{', '.join(missing)}", suggestion="补充可追溯的测试场景和证据")] 
+    return [_issue(rule, field="body", evidence=trigger, reason=f"出现实测触发词，但缺少结构化证据字段：{', '.join(missing)}", suggestion="补充可追溯的测试场景和证据")]
 
 
 def _required_term_issue(rule: RuleSpec, context: ReviewContext, profile: ReviewProfile) -> list[StructuredIssue]:
