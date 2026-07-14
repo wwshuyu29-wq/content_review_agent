@@ -1,0 +1,23 @@
+approved_claims:
+  - claim_id: CLAIM-001
+    text: 百度地图中的小度想想支持自然语言提出多点、多约束、多方式的出行需求
+    source_reference: [project.yaml]
+  - claim_id: CLAIM-002
+    text: 小度想想支持时间窗口规划和往返行程闭环
+    source_reference: [project.yaml]
+  - claim_id: CLAIM-003
+    text: 小度想想支持行程中继续询问沿途信息和周边服务
+    source_reference: [project.yaml]
+pending_claims:
+  - claim_id: PENDING-001
+    text: 小度想想可以记住常去地点和出行习惯
+    reason: 待官方确认
+    source_reference: [project.yaml]
+  - claim_id: PENDING-002
+    text: 小度想想可以自动筛选、比较酒店并判断最划算
+    reason: 待官方确认，必须人工审核
+    source_reference: [project.yaml]
+  - claim_id: PENDING-003
+    text: 所有城市、设备和网络环境均支持全部能力
+    reason: 待验证
+    source_reference: [project.yaml]

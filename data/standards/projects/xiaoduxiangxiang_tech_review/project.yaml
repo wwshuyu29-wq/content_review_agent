@@ -1,0 +1,15 @@
+business_domain: baidu_maps_marketing_review
+document_type: project_standard
+project_code: bdmap_xdxx_tech_review_2026
+content_type: TECH_MEDIA_REVIEW
+version: "0.9"
+name: 百度地图小度想想科技媒体测评
+facts:
+  brand: 百度地图
+  product: 小度想想
+  capabilities:
+    - 多点、多约束、多交通方式和时间窗口规划
+    - 少换乘、少走路、低成本等偏好
+    - 往返闭环需求
+    - 行走中继续询问沿途信息和周边服务
+  official_slogan: 再复杂的出行，问小度想想就能搞定！

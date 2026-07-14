@@ -1,0 +1,10 @@
+platform_requirements:
+  xiaohongshu:
+    status: PENDING
+    requirements: []
+  douyin:
+    status: PENDING
+    requirements: []
+  weibo:
+    status: PENDING
+    requirements: []

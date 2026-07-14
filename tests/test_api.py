@@ -70,11 +70,13 @@ def test_startup_seeds_project_and_supports_project_rule_workflow(api) -> None:
     projects = client.get("/api/projects")
     assert projects.status_code == 200
     seeded = projects.json()[0]
-    assert seeded["name"] == "百度地图小度想想 × 范丞丞短期合作"
+    assert seeded["name"] == "百度地图小度想想科技媒体测评"
+    assert seeded["code"] == "bdmap_xdxx_tech_review_2026"
+    assert seeded["content_type"] == "TECH_MEDIA_REVIEW"
 
     detail = client.get(f"/api/projects/{seeded['id']}")
     assert detail.status_code == 200
-    assert detail.json()["current_rule_version"]["version"] == 1
+    assert detail.json()["current_rule_version"]["version"] == 9
 
     created = client.post("/api/projects", json={"name": "API 测试项目", "description": "项目说明"})
     assert created.status_code == 201

@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+from sqlalchemy.orm import Session
+
+from server.db import Base, create_db_engine
+from server.models import Project, RuleVersion
+from server.services.standard_package_service import (
+    compile_standard_package,
+    load_standard_package,
+    publish_standard_package,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def standards_root(tmp_path: Path) -> Path:
+    root = tmp_path / "standards"
+    shutil.copytree(REPO_ROOT / "data" / "standards", root)
+    return root
+
+
+def test_loads_only_matching_tech_media_package(standards_root: Path) -> None:
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+    assert package.metadata.business_domain == "baidu_maps_marketing_review"
+    assert package.metadata.document_type == "project_standard"
+    assert package.metadata.content_type == "TECH_MEDIA_REVIEW"
+    assert package.metadata.project_code == "bdmap_xdxx_tech_review_2026"
+    assert "PENDING-002" in {claim.claim_id for claim in package.pending_claims}
+    serialized = json.dumps(package.model_dump(), ensure_ascii=False)
+    assert "范丞丞" not in serialized
+    assert "代言" not in serialized
+    assert "deny_words" not in serialized
+    assert "must_human_keywords" not in serialized
+
+
+def test_rejects_cross_domain_or_unresolved_rule_reference(standards_root: Path) -> None:
+    project_file = standards_root / "projects" / "xiaoduxiangxiang_tech_review" / "project.yaml"
+    project_file.write_text(
+        project_file.read_text(encoding="utf-8").replace(
+            "business_domain: baidu_maps_marketing_review",
+            "business_domain: other",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="business_domain"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_rejects_unsupported_project_standard_version(standards_root: Path) -> None:
+    project_file = standards_root / "projects" / "xiaoduxiangxiang_tech_review" / "project.yaml"
+    project_file.write_text(
+        project_file.read_text(encoding="utf-8").replace('version: "0.9"', 'version: "1.0"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="version"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
+    rules_file = standards_root / "rules" / "deterministic_rules.json"
+    rules = json.loads(rules_file.read_text(encoding="utf-8"))
+    rules["rules"][0]["source_reference"] = ["CLAIM-DOES-NOT-EXIST"]
+    rules_file.write_text(json.dumps(rules, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="CLAIM-DOES-NOT-EXIST"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path, tmp_path: Path) -> None:
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+    compiled = compile_standard_package(package)
+
+    assert compiled["metadata"]["version"] == "0.9"
+    assert compiled["structured_rules"]["rules"]
+    assert compiled["project_facts"]["project_code"] == "bdmap_xdxx_tech_review_2026"
+
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'standard.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(
+            name="科技测评",
+            code="bdmap_xdxx_tech_review_2026",
+            content_type="TECH_MEDIA_REVIEW",
+        )
+        session.add(project)
+        session.flush()
+        version = publish_standard_package(session, project.id, package)
+        session.commit()
+
+        assert version.version == 9
+        assert version.dimension_standards["metadata"] == compiled["metadata"]
+        assert project.current_rule_version_id == version.id
+        assert session.get(RuleVersion, version.id).structured_rules == compiled["structured_rules"]

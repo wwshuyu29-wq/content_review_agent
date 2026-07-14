@@ -140,11 +140,11 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert audit.content_version.version == 1
         assert audit.rule_version_id == project.current_rule_version_id
         assert audit.model == "model-v1"
-        assert audit.prompt_version == "review-prompt-v1"
+        assert audit.prompt_version == "tech_media_review-0.9"
         assert audit.status == "COMPLETED"
-        assert reviewer.received_standards.deny_words == ["代言", "代言人"]
-        assert reviewer.received_standards.recommended["范丞丞代言百度地图"] == "范丞丞与百度地图开展短期合作"
-        assert "短期合作伙伴" in reviewer.received_standards.project_text
+        assert reviewer.received_standards.deny_words == []
+        assert reviewer.received_standards.recommended == {}
+        assert "小度想想" in reviewer.received_standards.project_text
         assert item.review_status is ReviewStatus.APPROVED
         assert item.publish_status is PublishStatus.READY
         assert len(audit.agent_results) == 1

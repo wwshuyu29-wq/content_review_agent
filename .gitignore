@@ -9,7 +9,9 @@ htmlcov/
 venv/
 
 # 运行时数据 / 密钥（绝不入库）
-data/
+data/*
+!data/standards/
+!data/standards/**
 *.db
 *.sqlite
 *.sqlite3

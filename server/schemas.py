@@ -14,6 +14,8 @@ class OrmSchema(BaseModel):
 
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    code: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    content_type: Optional[str] = Field(default=None, min_length=1, max_length=100)
     description: Optional[str] = None
 
     @field_validator("name")
@@ -28,6 +30,8 @@ class ProjectCreate(BaseModel):
 class ProjectRead(OrmSchema):
     id: int
     name: str
+    code: Optional[str]
+    content_type: Optional[str]
     description: Optional[str]
     current_rule_version_id: Optional[int]
     created_at: datetime

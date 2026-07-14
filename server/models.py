@@ -58,6 +58,8 @@ class Project(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    code: Mapped[Optional[str]] = mapped_column(String(200), unique=True, index=True)
+    content_type: Mapped[Optional[str]] = mapped_column(String(100), index=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
     current_rule_version_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("rule_versions.id", use_alter=True, name="fk_projects_current_rule_version"),

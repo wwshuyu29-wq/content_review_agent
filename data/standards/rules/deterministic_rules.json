@@ -1,0 +1,23 @@
+{
+  "rules": [
+    {
+      "rule_id": "TEST-EVIDENCE-001",
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
+      "matcher": "evidence_required",
+      "severity": "HIGH",
+      "action": "HUMAN_REVIEW",
+      "auto_fixable": false,
+      "source_reference": ["CLAIM-001"]
+    },
+    {
+      "rule_id": "CLAIM-PENDING-001",
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
+      "matcher": "exact_phrase",
+      "phrases": ["可以自动筛选、比较酒店并判断最划算"],
+      "severity": "HIGH",
+      "action": "HUMAN_REVIEW",
+      "auto_fixable": false,
+      "source_reference": ["PENDING-002"]
+    }
+  ]
+}

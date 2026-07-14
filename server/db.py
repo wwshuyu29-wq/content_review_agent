@@ -40,17 +40,23 @@ def create_db_engine(database_url: Optional[str] = None) -> Engine:
 
 def ensure_schema_upgrades(engine: Engine) -> None:
     database_inspector = inspect(engine)
-    if "batches" not in database_inspector.get_table_names():
-        return
-
-    batch_columns = {column["name"] for column in database_inspector.get_columns("batches")}
-    has_import_token = "import_token" in batch_columns
-    has_unique_import_token = _has_unique_import_token(database_inspector)
-
-    if has_import_token and has_unique_import_token:
-        return
-
+    table_names = database_inspector.get_table_names()
     with engine.begin() as connection:
+        if "projects" in table_names:
+            project_columns = {column["name"] for column in database_inspector.get_columns("projects")}
+            if "code" not in project_columns:
+                connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN code VARCHAR(200)")
+            if "content_type" not in project_columns:
+                connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN content_type VARCHAR(100)")
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_projects_code_unique ON projects (code)"
+            )
+        if "batches" not in table_names:
+            return
+
+        batch_columns = {column["name"] for column in database_inspector.get_columns("batches")}
+        has_import_token = "import_token" in batch_columns
+        has_unique_import_token = _has_unique_import_token(database_inspector)
         if not has_import_token:
             connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN import_token VARCHAR(128)")
         if not has_unique_import_token:

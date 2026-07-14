@@ -275,7 +275,12 @@ def list_projects(session: Session = Depends(get_session)):
 
 @app.post("/api/projects", response_model=ProjectRead, status_code=201)
 def create_project(payload: ProjectCreate, session: Session = Depends(get_session)):
-    project = Project(name=payload.name.strip(), description=payload.description)
+    project = Project(
+        name=payload.name.strip(),
+        code=payload.code.strip() if payload.code else None,
+        content_type=payload.content_type.strip() if payload.content_type else None,
+        description=payload.description,
+    )
     session.add(project)
     try:
         session.commit()
