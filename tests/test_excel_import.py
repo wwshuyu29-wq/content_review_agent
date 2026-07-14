@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import importlib
 import json
 import stat
 import struct
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -68,6 +69,29 @@ def assert_has_error(preview, text: str, row_index: int = 0) -> None:
     assert any(text in error for error in preview.rows[row_index].errors), preview.rows[row_index].errors
 
 
+@pytest.fixture(autouse=True)
+def isolate_preview_root_registry(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY",
+        str(tmp_path / "preview-roots.json"),
+    )
+
+
+def test_default_preview_root_registry_path_is_not_cwd_dependent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY", raising=False)
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+
+    monkeypatch.chdir(first_cwd)
+    first_path = excel_import_service._preview_root_registry_path()
+    monkeypatch.chdir(second_cwd)
+
+    assert excel_import_service._preview_root_registry_path() == first_path
+    assert first_path.is_absolute()
+
+
 def test_build_import_template_has_exact_chinese_columns() -> None:
     workbook = load_workbook(BytesIO(build_import_template()), read_only=True)
 
@@ -117,6 +141,22 @@ def test_preview_rejects_missing_required_headers(tmp_path: Path, missing_header
 
     with pytest.raises(ValueError, match=missing_header):
         preview_import(xlsx, None, tmp_path / "imports")
+
+
+def test_preview_accepts_workbook_with_only_required_headers(tmp_path: Path) -> None:
+    xlsx = write_workbook(
+        tmp_path / "required-only.xlsx",
+        [valid_row()[: len(REQUIRED_COLUMNS)]],
+        REQUIRED_COLUMNS,
+    )
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+
+    assert preview.total_count == 1
+    assert preview.valid_count == 1
+    assert preview.rows[0].normalized["image_filename"] is None
+    assert preview.rows[0].normalized["publish_time"] is None
+    assert preview.rows[0].normalized["note"] is None
 
 
 def test_preview_rejects_blank_and_duplicate_headers(tmp_path: Path) -> None:
@@ -356,3 +396,167 @@ def test_preview_token_is_opaque_and_metadata_is_persisted_without_raw_file_byte
     json.loads(metadata_bytes)
     assert xlsx.read_bytes() not in metadata_bytes
     assert archive.read_bytes() not in metadata_bytes
+
+
+def _preview_manifest(temp_root: Path, token: str) -> Path:
+    return temp_root / token / "preview.json"
+
+
+def test_preview_survives_module_registry_reset_and_reload(tmp_path: Path, monkeypatch) -> None:
+    registry = tmp_path / "preview-roots.json"
+    monkeypatch.setenv("CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY", str(registry))
+    xlsx = write_workbook(tmp_path / "restart.xlsx", [valid_row()])
+    temp_root = tmp_path / "imports"
+    preview = preview_import(xlsx, None, temp_root)
+
+    excel_import_service._preview_locations.clear()
+    reloaded = importlib.reload(excel_import_service)
+
+    loaded = reloaded.load_preview(preview.token)
+    assert reloaded._preview_to_dict(loaded) == reloaded._preview_to_dict(preview)
+    registry_payload = json.loads(registry.read_text(encoding="utf-8"))
+    assert registry_payload == {"roots": [str(temp_root.resolve())], "version": 1}
+    assert str(temp_root) not in preview.token
+
+
+def test_consume_preview_survives_module_registry_reset_and_reload(tmp_path: Path, monkeypatch) -> None:
+    registry = tmp_path / "preview-roots.json"
+    monkeypatch.setenv("CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY", str(registry))
+    xlsx = write_workbook(tmp_path / "restart-consume.xlsx", [valid_row()])
+    temp_root = tmp_path / "imports"
+    preview = preview_import(xlsx, None, temp_root)
+    preview_dir = temp_root / preview.token
+
+    excel_import_service._preview_locations.clear()
+    reloaded = importlib.reload(excel_import_service)
+    consumed = reloaded.consume_preview(preview.token)
+
+    assert reloaded._preview_to_dict(consumed) == reloaded._preview_to_dict(preview)
+    assert not preview_dir.exists()
+    with pytest.raises(ValueError, match="不存在|失效"):
+        reloaded.consume_preview(preview.token)
+
+
+def test_expired_preview_is_rejected_and_cleaned_up(tmp_path: Path) -> None:
+    xlsx = write_workbook(tmp_path / "expired.xlsx", [valid_row()])
+    temp_root = tmp_path / "imports"
+    preview = preview_import(xlsx, None, temp_root)
+    preview_dir = temp_root / preview.token
+    manifest = _preview_manifest(temp_root, preview.token)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="过期|失效"):
+        load_preview(preview.token)
+
+    assert not preview_dir.exists()
+
+
+def test_consume_preview_returns_once_and_removes_persisted_preview(tmp_path: Path) -> None:
+    xlsx = write_workbook(tmp_path / "consume.xlsx", [valid_row()])
+    temp_root = tmp_path / "imports"
+    preview = preview_import(xlsx, None, temp_root)
+    preview_dir = temp_root / preview.token
+
+    consumed = excel_import_service.consume_preview(preview.token)
+
+    assert consumed == preview
+    assert not preview_dir.exists()
+    with pytest.raises(ValueError, match="不存在|失效"):
+        excel_import_service.consume_preview(preview.token)
+
+
+def test_formula_cells_are_reported_with_readable_row_and_field_errors(tmp_path: Path) -> None:
+    xlsx = write_workbook(tmp_path / "formula.xlsx", [valid_row(title="=1+1")])
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+
+    assert_has_error(preview, "第 2 行")
+    assert_has_error(preview, "标题")
+    assert_has_error(preview, "公式")
+
+
+def test_formula_only_rows_still_trigger_500_row_limit(tmp_path: Path) -> None:
+    formula_rows = [[None] * 7 + ["=ROW()"] for _ in range(501)]
+    xlsx = write_workbook(tmp_path / "formula-overflow.xlsx", formula_rows)
+    temp_root = tmp_path / "imports"
+
+    with pytest.raises(ValueError, match="500"):
+        preview_import(xlsx, None, temp_root)
+
+    assert list(temp_root.iterdir()) == []
+
+
+def test_preview_rejects_more_than_1000_zip_entries_and_cleans_up(tmp_path: Path) -> None:
+    assert excel_import_service.MAX_ZIP_ENTRIES == 1000
+    xlsx = write_workbook(tmp_path / "entries.xlsx", [valid_row()])
+    archive = write_zip(
+        tmp_path / "entries.zip",
+        [(f"image-{index}.jpg", b"") for index in range(1001)],
+    )
+    temp_root = tmp_path / "imports"
+
+    with pytest.raises(ValueError, match="1000"):
+        preview_import(xlsx, archive, temp_root)
+
+    assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.update(total_count=99),
+        lambda payload: payload["rows"][0].update(valid=False),
+        lambda payload: payload["rows"][0]["normalized"].update(unexpected="value"),
+        lambda payload: payload["rows"][0].update(row_number="2"),
+        lambda payload: payload.update(unexpected="value"),
+        lambda payload: payload.update(expires_at="not-a-timestamp"),
+    ],
+)
+def test_load_preview_rejects_tampered_manifest_schema_and_counts(tmp_path: Path, mutate) -> None:
+    xlsx = write_workbook(tmp_path / "tampered.xlsx", [valid_row()])
+    temp_root = tmp_path / "imports"
+    preview = preview_import(xlsx, None, temp_root)
+    manifest = _preview_manifest(temp_root, preview.token)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    mutate(payload)
+    manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="预览数据无效"):
+        load_preview(preview.token)
+
+
+class _LazyWorksheet:
+    def iter_rows(self, *, values_only: bool = False):
+        if values_only:
+            yield IMPORT_COLUMNS
+        else:
+            yield tuple(_FormulaAwareCell(value, "s", f"A{index}") for index, value in enumerate(IMPORT_COLUMNS, 1))
+        raise BadZipFile("broken worksheet XML")
+
+
+class _FormulaAwareCell:
+    def __init__(self, value: object, data_type: str, coordinate: str) -> None:
+        self.value = value
+        self.data_type = data_type
+        self.coordinate = coordinate
+
+
+class _LazyWorkbook:
+    worksheets = [_LazyWorksheet()]
+
+    def close(self) -> None:
+        pass
+
+
+def test_lazy_workbook_iteration_error_is_wrapped_and_preview_is_cleaned_up(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(excel_import_service, "load_workbook", lambda *args, **kwargs: _LazyWorkbook())
+    temp_root = tmp_path / "imports"
+
+    with pytest.raises(ValueError, match="Excel.*解析"):
+        preview_import(tmp_path / "lazy.xlsx", None, temp_root)
+
+    assert list(temp_root.iterdir()) == []

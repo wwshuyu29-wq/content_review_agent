@@ -7,7 +7,7 @@ import shutil
 import stat
 import threading
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from secrets import token_urlsafe
@@ -34,7 +34,12 @@ MAX_IMPORT_ROWS = 500
 EXCEL_CELL_TEXT_LIMIT = 32_767
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_ZIP_BYTES = 200 * 1024 * 1024
+MAX_ZIP_ENTRIES = 1000
 MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+PREVIEW_TTL = timedelta(hours=2)
+PREVIEW_MANIFEST_VERSION = 1
+PREVIEW_ROOT_REGISTRY_ENV = "CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY"
+DEFAULT_PREVIEW_ROOT_REGISTRY = Path(__file__).resolve().parents[2] / "data" / "preview-roots.json"
 ALLOWED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 _COLUMN_KEYS = {
     "供应商内容编号": "external_id",
@@ -47,6 +52,21 @@ _COLUMN_KEYS = {
     "备注": "note",
 }
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
+_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+_PREVIEW_KEYS = frozenset(
+    {
+        "version",
+        "token",
+        "expires_at",
+        "rows",
+        "warnings",
+        "total_count",
+        "valid_count",
+        "error_count",
+    }
+)
+_ROW_KEYS = frozenset({"row_number", "normalized", "errors", "warnings", "valid"})
+_NORMALIZED_KEYS = frozenset(_COLUMN_KEYS.values())
 
 
 @dataclass(frozen=True)
@@ -120,11 +140,14 @@ def preview_import(xlsx_path: Path, zip_path: Optional[Path], temp_root: Path) -
             valid_count=valid_count,
             error_count=len(rows) - valid_count,
         )
-        _write_preview(manifest, preview)
+        expires_at = datetime.now(timezone.utc) + PREVIEW_TTL
+        _write_preview(manifest, preview, expires_at)
         location = _PreviewLocation(root, preview_dir.resolve(), manifest.resolve())
         with _preview_locations_lock:
+            _register_preview_root(root)
             _preview_locations[token] = location
             registered = True
+        cleanup_expired_previews()
         return preview
     except Exception:
         if registered:
@@ -135,14 +158,67 @@ def preview_import(xlsx_path: Path, zip_path: Optional[Path], temp_root: Path) -
 
 
 def load_preview(token: str) -> ImportPreview:
-    if not isinstance(token, str) or not token:
+    location = _resolve_preview_location(token)
+    try:
+        preview, expires_at = _load_preview_manifest(location, token)
+    except _ExpiredPreviewError as exc:
+        _remove_preview(token, location)
+        raise ValueError("导入预览已过期") from exc
+    return preview
+
+
+def consume_preview(token: str) -> ImportPreview:
+    location = _resolve_preview_location(token)
+    consumed_dir = location.preview_dir.with_name(location.preview_dir.name + ".consuming")
+    with _preview_locations_lock:
+        try:
+            location.preview_dir.rename(consumed_dir)
+        except FileNotFoundError as exc:
+            _preview_locations.pop(token, None)
+            raise ValueError("导入 token 不存在或已失效") from exc
+        except OSError as exc:
+            raise ValueError("导入预览无法消费") from exc
+        _preview_locations.pop(token, None)
+
+    consumed_location = _PreviewLocation(location.temp_root, consumed_dir, consumed_dir / "preview.json")
+    try:
+        preview, _ = _load_preview_manifest(consumed_location, token)
+        return preview
+    finally:
+        shutil.rmtree(consumed_dir, ignore_errors=True)
+
+
+class _ExpiredPreviewError(ValueError):
+    pass
+
+
+def _resolve_preview_location(token: str) -> _PreviewLocation:
+    if not isinstance(token, str) or not _TOKEN_PATTERN.fullmatch(token):
         raise ValueError("无效的导入 token")
 
     with _preview_locations_lock:
         location = _preview_locations.get(token)
+        if location is None:
+            location = _find_persisted_preview(token)
+            if location is not None:
+                _preview_locations[token] = location
     if location is None:
         raise ValueError("导入 token 不存在或已失效")
+    return location
 
+
+def _find_persisted_preview(token: str) -> Optional[_PreviewLocation]:
+    for root in _load_preview_roots():
+        preview_dir = root / token
+        manifest = preview_dir / "preview.json"
+        if preview_dir.is_dir() and manifest.is_file():
+            return _PreviewLocation(root, preview_dir, manifest)
+    return None
+
+
+def _load_preview_manifest(
+    location: _PreviewLocation, token: str
+) -> Tuple[ImportPreview, datetime]:
     try:
         preview_dir = location.preview_dir.resolve(strict=True)
         manifest = location.manifest.resolve(strict=True)
@@ -155,38 +231,97 @@ def load_preview(token: str) -> ImportPreview:
 
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        preview = _preview_from_dict(payload)
+        preview, expires_at = _preview_from_dict(payload)
     except (OSError, TypeError, KeyError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("导入预览数据无效") from exc
     if preview.token != token:
         raise ValueError("导入预览 token 不匹配")
-    return preview
+    if expires_at <= datetime.now(timezone.utc):
+        raise _ExpiredPreviewError("导入预览已过期")
+    return preview, expires_at
+
+
+def _remove_preview(token: str, location: _PreviewLocation) -> None:
+    with _preview_locations_lock:
+        _preview_locations.pop(token, None)
+    shutil.rmtree(location.preview_dir, ignore_errors=True)
+
+
+def _preview_root_registry_path() -> Path:
+    configured = os.environ.get(PREVIEW_ROOT_REGISTRY_ENV)
+    return Path(configured).expanduser().resolve() if configured else DEFAULT_PREVIEW_ROOT_REGISTRY.resolve()
+
+
+def _register_preview_root(root: Path) -> None:
+    registry = _preview_root_registry_path()
+    roots = _load_preview_roots()
+    if root in roots:
+        return
+    roots.append(root)
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(registry, {"version": 1, "roots": sorted(str(path) for path in roots)})
+
+
+def _load_preview_roots() -> List[Path]:
+    registry = _preview_root_registry_path()
+    if not registry.exists():
+        return []
+    try:
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {"version", "roots"}:
+            raise ValueError
+        if type(payload["version"]) is not int or payload["version"] != 1:
+            raise ValueError
+        if not isinstance(payload["roots"], list) or not all(
+            isinstance(root, str) and Path(root).is_absolute() for root in payload["roots"]
+        ):
+            raise ValueError
+        roots = [Path(root).resolve() for root in payload["roots"]]
+        if len(roots) != len(set(roots)):
+            raise ValueError
+        return roots
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("导入预览根目录配置无效") from exc
 
 
 def _read_rows(xlsx_path: Path) -> List[ImportRowPreview]:
     try:
-        workbook = load_workbook(xlsx_path, read_only=True, data_only=True)
+        workbook = load_workbook(xlsx_path, read_only=True, data_only=False)
     except Exception as exc:
         raise ValueError("Excel 文件无法读取") from exc
 
     try:
-        worksheet = workbook.worksheets[0]
-        iterator = worksheet.iter_rows(values_only=True)
         try:
-            raw_headers = next(iterator)
-        except StopIteration as exc:
-            raise ValueError("Excel 表头不能为空") from exc
-        headers = _validate_headers(raw_headers)
-        indexes = {header: index for index, header in enumerate(headers)}
+            worksheet = workbook.worksheets[0]
+            iterator = worksheet.iter_rows()
+            try:
+                header_cells = next(iterator)
+            except StopIteration as exc:
+                raise ValueError("Excel 表头不能为空") from exc
+            for cell in header_cells:
+                if cell.data_type == "f":
+                    raise ValueError(f"Excel 表头不允许公式：{cell.coordinate}")
+            headers = _validate_headers(tuple(cell.value for cell in header_cells))
+            indexes = {header: index for index, header in enumerate(headers)}
 
-        rows: List[ImportRowPreview] = []
-        for row_number, values in enumerate(iterator, start=2):
-            if _is_blank_row(values):
-                continue
-            if len(rows) >= MAX_IMPORT_ROWS:
-                raise ValueError("Excel 最多允许 500 条内容")
-            rows.append(_normalize_row(row_number, values, indexes))
-        return rows
+            rows: List[ImportRowPreview] = []
+            for row_number, cells in enumerate(iterator, start=2):
+                values = tuple(cell.value for cell in cells)
+                if _is_blank_row(values):
+                    continue
+                if len(rows) >= MAX_IMPORT_ROWS:
+                    raise ValueError("Excel 最多允许 500 条内容")
+                formula_indexes = {
+                    index for index, cell in enumerate(cells) if cell.data_type == "f"
+                }
+                rows.append(
+                    _normalize_row(row_number, values, indexes, headers, formula_indexes)
+                )
+            return rows
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("Excel 工作表解析失败") from exc
     finally:
         workbook.close()
 
@@ -213,13 +348,26 @@ def _is_blank_row(values: Tuple[Any, ...]) -> bool:
 
 
 def _normalize_row(
-    row_number: int, values: Tuple[Any, ...], indexes: Dict[str, int]
+    row_number: int,
+    values: Tuple[Any, ...],
+    indexes: Dict[str, int],
+    headers: Tuple[str, ...],
+    formula_indexes: set[int],
 ) -> ImportRowPreview:
     normalized: Dict[str, Any] = {}
-    errors: List[str] = []
+    errors = [
+        f"第 {row_number} 行 {headers[index]} 不允许公式"
+        for index in sorted(formula_indexes)
+        if index < len(headers)
+    ]
 
     for column in IMPORT_COLUMNS:
-        raw_value = values[indexes[column]] if column in indexes and indexes[column] < len(values) else None
+        index = indexes.get(column)
+        raw_value = (
+            values[index]
+            if index is not None and index < len(values) and index not in formula_indexes
+            else None
+        )
         key = _COLUMN_KEYS[column]
         if column == "计划发布时间":
             normalized[key], date_error = _normalize_date(raw_value)
@@ -288,7 +436,9 @@ def _inspect_zip(zip_path: Path) -> Tuple[Dict[str, ZipInfo], List[str]]:
     total_size = 0
     try:
         with ZipFile(zip_path) as archive:
-            for info in archive.infolist():
+            if len(archive.filelist) > MAX_ZIP_ENTRIES:
+                raise ValueError(f"ZIP 文件条目不能超过 {MAX_ZIP_ENTRIES} 个")
+            for info in archive.filelist:
                 _validate_zip_path(info.filename)
                 if info.flag_bits & 0x1:
                     raise ValueError(f"ZIP 包含加密文件：{info.filename}")
@@ -414,36 +564,130 @@ def _extract_referenced_images(
         raise ValueError("ZIP 图片解压失败") from exc
 
 
-def _write_preview(path: Path, preview: ImportPreview) -> None:
+def _write_preview(path: Path, preview: ImportPreview, expires_at: datetime) -> None:
     payload = _preview_to_dict(preview)
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("x", encoding="utf-8") as output:
-        json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
-        output.flush()
-        os.fsync(output.fileno())
-    temporary.replace(path)
+    payload["version"] = PREVIEW_MANIFEST_VERSION
+    payload["expires_at"] = expires_at.isoformat()
+    _write_json_atomic(path, payload)
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{token_urlsafe(8)}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _preview_to_dict(preview: ImportPreview) -> Dict[str, Any]:
     return asdict(preview)
 
 
-def _preview_from_dict(payload: Dict[str, Any]) -> ImportPreview:
-    rows = [
-        ImportRowPreview(
-            row_number=int(row["row_number"]),
-            normalized=dict(row["normalized"]),
-            errors=list(row["errors"]),
-            warnings=list(row["warnings"]),
-            valid=bool(row["valid"]),
-        )
-        for row in payload["rows"]
-    ]
-    return ImportPreview(
-        token=str(payload["token"]),
-        rows=rows,
-        warnings=list(payload["warnings"]),
-        total_count=int(payload["total_count"]),
-        valid_count=int(payload["valid_count"]),
-        error_count=int(payload["error_count"]),
+def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime]:
+    if not isinstance(payload, dict) or set(payload) != _PREVIEW_KEYS:
+        raise ValueError("预览字段无效")
+    if type(payload["version"]) is not int or payload["version"] != PREVIEW_MANIFEST_VERSION:
+        raise ValueError("预览版本无效")
+    if not isinstance(payload["token"], str) or not _TOKEN_PATTERN.fullmatch(payload["token"]):
+        raise ValueError("预览 token 无效")
+    expires_at = _parse_manifest_expiry(payload["expires_at"])
+    if not isinstance(payload["rows"], list) or len(payload["rows"]) > MAX_IMPORT_ROWS:
+        raise ValueError("预览行数无效")
+    if not _is_string_list(payload["warnings"]):
+        raise ValueError("预览警告无效")
+
+    rows = [_row_from_dict(row) for row in payload["rows"]]
+    row_numbers = [row.row_number for row in rows]
+    if row_numbers != sorted(set(row_numbers)):
+        raise ValueError("预览行号无效")
+
+    valid_count = sum(row.valid for row in rows)
+    expected_counts = (len(rows), valid_count, len(rows) - valid_count)
+    stored_counts = (
+        payload["total_count"],
+        payload["valid_count"],
+        payload["error_count"],
     )
+    if any(type(value) is not int or value < 0 for value in stored_counts):
+        raise ValueError("预览计数类型无效")
+    if stored_counts != expected_counts:
+        raise ValueError("预览计数不匹配")
+
+    return (
+        ImportPreview(
+            token=payload["token"],
+            rows=rows,
+            warnings=list(payload["warnings"]),
+            total_count=expected_counts[0],
+            valid_count=expected_counts[1],
+            error_count=expected_counts[2],
+        ),
+        expires_at,
+    )
+
+
+def _row_from_dict(payload: Any) -> ImportRowPreview:
+    if not isinstance(payload, dict) or set(payload) != _ROW_KEYS:
+        raise ValueError("预览行字段无效")
+    if type(payload["row_number"]) is not int or payload["row_number"] < 2:
+        raise ValueError("预览行号无效")
+    normalized = payload["normalized"]
+    if not isinstance(normalized, dict) or set(normalized) != _NORMALIZED_KEYS:
+        raise ValueError("预览标准化字段无效")
+    if any(value is not None and not isinstance(value, str) for value in normalized.values()):
+        raise ValueError("预览标准化值无效")
+    if not _is_string_list(payload["errors"]) or not _is_string_list(payload["warnings"]):
+        raise ValueError("预览行消息无效")
+    if type(payload["valid"]) is not bool or payload["valid"] != (not payload["errors"]):
+        raise ValueError("预览行状态无效")
+    return ImportRowPreview(
+        row_number=payload["row_number"],
+        normalized=dict(normalized),
+        errors=list(payload["errors"]),
+        warnings=list(payload["warnings"]),
+        valid=payload["valid"],
+    )
+
+
+def _parse_manifest_expiry(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("预览过期时间无效")
+    expires_at = datetime.fromisoformat(value)
+    if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+        raise ValueError("预览过期时间无时区")
+    expires_at = expires_at.astimezone(timezone.utc)
+    if expires_at > datetime.now(timezone.utc) + PREVIEW_TTL + timedelta(minutes=1):
+        raise ValueError("预览过期时间超出限制")
+    return expires_at
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def cleanup_expired_previews() -> int:
+    removed = 0
+    now = datetime.now(timezone.utc)
+    with _preview_locations_lock:
+        for root in _load_preview_roots():
+            if not root.is_dir():
+                continue
+            for preview_dir in root.iterdir():
+                if not preview_dir.is_dir() or not _TOKEN_PATTERN.fullmatch(preview_dir.name):
+                    continue
+                manifest = preview_dir / "preview.json"
+                try:
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                    preview, expires_at = _preview_from_dict(payload)
+                    if preview.token != preview_dir.name or expires_at > now:
+                        continue
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                _preview_locations.pop(preview.token, None)
+                shutil.rmtree(preview_dir, ignore_errors=True)
+                removed += 1
+    return removed
