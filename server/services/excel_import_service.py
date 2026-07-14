@@ -17,6 +17,7 @@ from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from server.models import Batch, FormatStatus
@@ -214,6 +215,7 @@ def confirm_import(
         raise ValueError("导入预览已过期") from exc
 
     saved_paths: List[Path] = []
+    commit_completed = False
     try:
         contents = _build_confirm_contents(preview, location, saved_paths)
         batch = submit_batch(
@@ -226,13 +228,22 @@ def confirm_import(
             commit=False,
         )
         session.commit()
-        session.refresh(batch)
+        commit_completed = True
+    except IntegrityError:
+        if not commit_completed:
+            session.rollback()
+            _delete_saved_paths(saved_paths)
+            existing = session.scalar(select(Batch).where(Batch.import_token == token))
+            if existing is not None:
+                return existing
+        raise
     except Exception:
-        session.rollback()
-        for path in saved_paths:
-            path.unlink(missing_ok=True)
+        if not commit_completed:
+            session.rollback()
+            _delete_saved_paths(saved_paths)
         raise
 
+    session.refresh(batch)
     _remove_preview(token, location)
     return batch
 
@@ -247,6 +258,11 @@ def _data_dir() -> Path:
 
 def _uploads_dir() -> Path:
     return _data_dir() / "uploads"
+
+
+def _delete_saved_paths(saved_paths: List[Path]) -> None:
+    for path in saved_paths:
+        path.unlink(missing_ok=True)
 
 
 def _build_confirm_contents(

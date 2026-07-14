@@ -5,7 +5,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Generator, Optional
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -36,6 +36,38 @@ def create_db_engine(database_url: Optional[str] = None) -> Engine:
             cursor.close()
 
     return engine
+
+
+def ensure_schema_upgrades(engine: Engine) -> None:
+    database_inspector = inspect(engine)
+    if "batches" not in database_inspector.get_table_names():
+        return
+
+    batch_columns = {column["name"] for column in database_inspector.get_columns("batches")}
+    has_import_token = "import_token" in batch_columns
+    has_unique_import_token = _has_unique_import_token(database_inspector)
+
+    if has_import_token and has_unique_import_token:
+        return
+
+    with engine.begin() as connection:
+        if not has_import_token:
+            connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN import_token VARCHAR(128)")
+        if not has_unique_import_token:
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_batches_import_token_unique "
+                "ON batches (import_token)"
+            )
+
+
+def _has_unique_import_token(database_inspector) -> bool:
+    for constraint in database_inspector.get_unique_constraints("batches"):
+        if constraint.get("column_names") == ["import_token"]:
+            return True
+    for index in database_inspector.get_indexes("batches"):
+        if index.get("unique") and index.get("column_names") == ["import_token"]:
+            return True
+    return False
 
 
 _engine: Optional[Engine] = None

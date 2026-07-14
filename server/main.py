@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from scripts.text_review.reviewer import get_reviewer
-from server.db import Base, get_db_engine, get_session
+from server.db import Base, ensure_schema_upgrades, get_db_engine, get_session
 from server.models import (
     AgentResult,
     AuditRun,
@@ -117,6 +117,7 @@ async def lifespan(_app: FastAPI):
         _save_config(dict(DEFAULT_CONFIG))
     engine = get_db_engine()
     Base.metadata.create_all(engine)
+    ensure_schema_upgrades(engine)
     with Session(engine) as session:
         seed_default_project(session)
         session.commit()

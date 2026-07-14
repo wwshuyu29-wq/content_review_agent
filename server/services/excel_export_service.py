@@ -45,6 +45,7 @@ _SEVERITY_RANK = {
     "high": 4,
 }
 _MANUAL_SEVERITIES = {"mid", "medium", "high", "unknown"}
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 _LONG_TEXT_COLUMNS = {
     "正文",
     "问题分类",
@@ -81,15 +82,21 @@ def export_batch(session: Session, batch_id: int) -> bytes:
     worksheet = workbook.active
     worksheet.title = "批次导出"
     headers = list(IMPORT_COLUMNS) + list(EXPORT_COLUMNS)
-    worksheet.append(headers)
+    worksheet.append([_sanitize_excel_value(value) for value in headers])
 
     for item in sorted(batch.content_items, key=lambda content: content.id):
-        worksheet.append(_row_for_item(batch, item))
+        worksheet.append([_sanitize_excel_value(value) for value in _row_for_item(batch, item)])
 
     _style_worksheet(worksheet, headers)
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
+
+
+def _sanitize_excel_value(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return f"'{value}"
+    return value
 
 
 def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:

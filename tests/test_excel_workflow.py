@@ -28,6 +28,7 @@ from server.models import (
 )
 from server.seed import seed_default_project
 from server.services import excel_import_service
+from server.services.content_service import submit_batch
 from server.services.excel_import_service import IMPORT_COLUMNS, preview_import
 
 
@@ -219,6 +220,59 @@ def test_confirm_import_copies_referenced_preview_images_by_exact_filename_per_r
         assert Path(payloads["row-first"]["media"]).name == payloads["row-first"]["media"]
 
 
+def test_confirm_import_keeps_committed_media_when_refresh_fails_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    xlsx = write_workbook(
+        tmp_path / "refresh-failure.xlsx",
+        [supplier_row("row-with-image", image_filename="photo.png")],
+    )
+    archive = write_zip(tmp_path / "refresh-failure.zip", [("photo.png", b"durable-image")])
+    preview = preview_import(xlsx, archive, tmp_path / "previews")
+
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        original_refresh = session.refresh
+        failed = False
+
+        def fail_first_batch_refresh(instance, *args, **kwargs):
+            nonlocal failed
+            if isinstance(instance, Batch) and not failed:
+                failed = True
+                raise RuntimeError("connection lost after commit")
+            return original_refresh(instance, *args, **kwargs)
+
+        monkeypatch.setattr(session, "refresh", fail_first_batch_refresh)
+
+        with pytest.raises(RuntimeError, match="connection lost after commit"):
+            confirm_import(
+                session,
+                preview.token,
+                project_id=project.id,
+                supplier_id="supplier-images",
+                batch_name="图片导入",
+            )
+
+        committed = session.scalar(select(Batch).where(Batch.import_token == preview.token))
+        assert committed is not None
+        payload = payload_by_supplier_id(committed)["row-with-image"]
+        media_path = tmp_path / "data" / "uploads" / payload["media"]
+        assert media_path.read_bytes() == b"durable-image"
+        assert (tmp_path / "previews" / preview.token).exists()
+
+        retry = confirm_import(
+            session,
+            preview.token,
+            project_id=project.id,
+            supplier_id="ignored",
+            batch_name="重复确认不应新建",
+        )
+
+        assert retry.id == committed.id
+        assert session.scalar(select(func.count(Batch.id))) == 1
+        assert media_path.read_bytes() == b"durable-image"
+
+
 def test_confirm_import_is_idempotent_for_same_token_without_duplicate_content(tmp_path: Path) -> None:
     xlsx = write_workbook(tmp_path / "idempotent.xlsx", [supplier_row("content-1")])
     preview = preview_import(xlsx, None, tmp_path / "previews")
@@ -247,6 +301,74 @@ def test_confirm_import_is_idempotent_for_same_token_without_duplicate_content(t
         assert [item.id for item in second.content_items] == first_content_ids
         assert session.scalar(select(func.count(Batch.id))) == 1
         assert session.scalar(select(func.count(ContentItem.id))) == 1
+
+
+def test_confirm_import_returns_existing_batch_after_concurrent_import_token_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'workflow.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as setup_session:
+        project = seed_default_project(setup_session)
+        project_id = project.id
+        setup_session.commit()
+
+    xlsx = write_workbook(
+        tmp_path / "integrity-conflict.xlsx",
+        [supplier_row("losing-row", image_filename="photo.png")],
+    )
+    archive = write_zip(tmp_path / "integrity-conflict.zip", [("photo.png", b"losing-image")])
+    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    winner_id: int | None = None
+
+    with Session(engine) as session:
+        original_flush = session.flush
+        inserted_winner = False
+
+        def insert_winner_then_flush(*args, **kwargs):
+            nonlocal inserted_winner, winner_id
+            has_losing_batch = any(
+                isinstance(instance, Batch) and instance.import_token == preview.token
+                for instance in session.new
+            )
+            if has_losing_batch and not inserted_winner:
+                inserted_winner = True
+                with Session(engine) as winner_session:
+                    winner = submit_batch(
+                        winner_session,
+                        project_id=project_id,
+                        supplier_id="winner",
+                        name="已提交批次",
+                        contents=[
+                            {
+                                "external_id": "winner-row",
+                                "title": "已提交标题",
+                                "body": "已提交正文",
+                                "payload": {"supplier_external_id": "winner-row"},
+                            }
+                        ],
+                        import_token=preview.token,
+                    )
+                    winner_id = winner.id
+            return original_flush(*args, **kwargs)
+
+        monkeypatch.setattr(session, "flush", insert_winner_then_flush)
+
+        batch = confirm_import(
+            session,
+            preview.token,
+            project_id=project_id,
+            supplier_id="loser",
+            batch_name="并发失败批次",
+        )
+
+        assert winner_id is not None
+        assert batch.id == winner_id
+        assert batch.supplier_id == "winner"
+        assert session.scalar(select(func.count(Batch.id))) == 1
+        assert session.scalar(select(func.count(ContentItem.id))) == 1
+        uploads_dir = tmp_path / "data" / "uploads"
+        assert not uploads_dir.exists() or list(uploads_dir.iterdir()) == []
 
 
 def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Path) -> None:
@@ -390,6 +512,102 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
         assert worksheet.auto_filter.ref == f"A1:{get_column_letter(len(headers))}2"
         assert worksheet["E2"].alignment.wrap_text is True
         assert worksheet["AA2"].alignment.wrap_text is True
+
+
+def test_export_batch_sanitizes_formula_like_strings(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = Batch(project=project, supplier_id="supplier-a", name="公式注入导出")
+        item = ContentItem(
+            project=project,
+            batch=batch,
+            external_id="safe-system-id",
+            title="@供应商标题",
+            format_status=FormatStatus.PASSED,
+        )
+        supplier_payload = {
+            "supplier_external_id": "=supplier-id",
+            "campaign_theme": "+campaign",
+            "platform": "-platform",
+            "title": "@title",
+            "body": "\tbody",
+            "image_filename": "\rimage.png",
+            "publish_time": "=2026-08-01",
+            "note": "+note",
+        }
+        supplier_version = ContentVersion(
+            content_item=item,
+            version=1,
+            source="SUPPLIER",
+            title="@title",
+            body="\tbody",
+            payload=supplier_payload,
+        )
+        audit = AuditRun(
+            content_item=item,
+            content_version=supplier_version,
+            rule_version=project.current_rule_version,
+            model="@model",
+            prompt_version="prompt-x",
+            status="COMPLETED",
+        )
+        result = AgentResult(
+            audit_run=audit,
+            agent_name="quality",
+            status="COMPLETED",
+            raw_result={},
+        )
+        Issue(
+            audit_run=audit,
+            agent_result=result,
+            rule_id="+RULE-1",
+            category="-category",
+            severity="high",
+            field="body",
+            evidence_quote="\tevidence",
+            reason="=reason",
+            suggestion="\rsuggestion",
+            auto_fixable=False,
+            human_required=True,
+            confidence=0.99,
+        )
+        ContentVersion(
+            content_item=item,
+            version=2,
+            source="=HUMAN_APPROVED",
+            title="+final title",
+            body="-final body",
+            payload=supplier_payload,
+        )
+        session.add(batch)
+        session.commit()
+
+        workbook = load_workbook(BytesIO(export_batch(session, batch.id)), data_only=False)
+        worksheet = workbook.active
+        headers = [cell.value for cell in worksheet[1]]
+        expected_literals = {
+            "供应商内容编号": "'=supplier-id",
+            "活动主题": "'+campaign",
+            "平台": "'-platform",
+            "标题": "'@title",
+            "正文": "'\tbody",
+            "图片文件名": "'\rimage.png",
+            "计划发布时间": "'=2026-08-01",
+            "备注": "'+note",
+            "问题分类": "'-category",
+            "命中规则": "'+RULE-1",
+            "问题原因": "'=reason",
+            "原文证据": "'\tevidence",
+            "修改建议": "'\rsuggestion",
+            "最终标题": "'+final title",
+            "最终正文": "'-final body",
+            "最终版本来源": "'=HUMAN_APPROVED",
+            "审核模型": "'@model",
+        }
+        for header, expected in expected_literals.items():
+            cell = worksheet.cell(row=2, column=headers.index(header) + 1)
+            assert cell.data_type == "s", header
+            assert cell.value == expected
 
 
 def test_export_batch_raises_for_missing_batch(tmp_path: Path) -> None:

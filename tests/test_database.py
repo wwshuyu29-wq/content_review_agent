@@ -35,6 +35,29 @@ def make_sqlite_engine(tmp_path: Path) -> Engine:
     return create_db_engine(f"sqlite:///{tmp_path / 'review.db'}")
 
 
+def create_legacy_schema_without_import_token(engine: Engine) -> None:
+    for table in Base.metadata.sorted_tables:
+        if table.name != "batches":
+            table.create(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE batches (
+                id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                supplier_id VARCHAR(200) NOT NULL,
+                name VARCHAR(200) NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                PRIMARY KEY (id),
+                FOREIGN KEY(project_id) REFERENCES projects (id)
+            )
+            """
+        )
+        connection.exec_driver_sql("CREATE INDEX ix_batches_project_id ON batches (project_id)")
+
+
 def test_database_url_builds_sqlite_engine_with_foreign_keys(tmp_path: Path) -> None:
     engine = make_sqlite_engine(tmp_path)
 
@@ -69,6 +92,61 @@ def test_create_all_defines_every_workflow_table(tmp_path: Path) -> None:
         "review_tasks",
         "rule_versions",
     }
+
+
+def test_schema_upgrade_adds_import_token_to_legacy_batches_and_confirm_import_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import server.db as db_module
+    from openpyxl import Workbook
+    from server.services import excel_import_service
+    from server.services.excel_import_service import IMPORT_COLUMNS, confirm_import, preview_import
+
+    engine = make_sqlite_engine(tmp_path)
+    create_legacy_schema_without_import_token(engine)
+    legacy_columns = {column["name"] for column in inspect(engine).get_columns("batches")}
+    assert "import_token" not in legacy_columns
+
+    db_module.ensure_schema_upgrades(engine)
+
+    upgraded = inspect(engine)
+    upgraded_columns = {column["name"] for column in upgraded.get_columns("batches")}
+    unique_indexes = {
+        tuple(index["column_names"])
+        for index in upgraded.get_indexes("batches")
+        if index.get("unique")
+    }
+    unique_constraints = {
+        tuple(constraint["column_names"])
+        for constraint in upgraded.get_unique_constraints("batches")
+    }
+    assert "import_token" in upgraded_columns
+    assert ("import_token",) in unique_indexes | unique_constraints
+
+    monkeypatch.setenv("CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY", str(tmp_path / "preview-roots.json"))
+    monkeypatch.setenv("CR_DATA_DIR", str(tmp_path / "data"))
+    excel_import_service._preview_locations.clear()
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(list(IMPORT_COLUMNS))
+    worksheet.append(["legacy-row", "活动主题", "小红书", "标题", "正文", None, "2026-08-01", "备注"])
+    xlsx = tmp_path / "legacy-import.xlsx"
+    workbook.save(xlsx)
+    preview = preview_import(xlsx, None, tmp_path / "previews")
+
+    with Session(engine) as session:
+        project = seed_default_project(session)
+        batch = confirm_import(
+            session,
+            preview.token,
+            project_id=project.id,
+            supplier_id="legacy-supplier",
+            batch_name="升级后导入",
+        )
+
+        assert batch.import_token == preview.token
+        assert batch.content_items[0].external_id == "legacy-row"
+        assert session.scalar(select(Batch).where(Batch.import_token == preview.token)) is batch
 
 
 def test_metadata_compiles_for_postgresql() -> None:
