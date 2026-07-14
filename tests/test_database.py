@@ -270,6 +270,42 @@ def test_legacy_duplicate_audits_survive_review_key_upgrade(tmp_path: Path) -> N
             )
 
 
+def test_schema_upgrade_reports_duplicate_audit_review_keys(tmp_path: Path) -> None:
+    import server.db as db_module
+
+    engine = make_sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE audit_runs (
+                id INTEGER PRIMARY KEY,
+                content_item_id INTEGER NOT NULL,
+                content_version_id INTEGER NOT NULL,
+                rule_version_id INTEGER NOT NULL,
+                model VARCHAR(200) NOT NULL,
+                prompt_version VARCHAR(100) NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                completed_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                review_key VARCHAR(200)
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO audit_runs VALUES "
+            "(1, 10, 20, 30, ?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?),"
+            "(2, 10, 21, 30, ?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)",
+            ("legacy", "v1", "COMPLETED", "duplicate-review-key") * 2,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=r"audit_runs.*review_key.*duplicate-review-key",
+    ):
+        db_module.ensure_schema_upgrades(engine)
+
+
 def test_schema_upgrade_adds_audit_and_agent_idempotency_indexes(tmp_path: Path) -> None:
     import server.db as db_module
 

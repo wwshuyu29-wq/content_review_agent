@@ -130,6 +130,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             if "review_key" not in audit_columns:
                 connection.exec_driver_sql("ALTER TABLE audit_runs ADD COLUMN review_key VARCHAR(200)")
             connection.exec_driver_sql("DROP INDEX IF EXISTS ix_audit_runs_content_rule")
+            _raise_duplicate_groups(connection, "audit_runs", ("review_key",))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_audit_runs_review_key "
                 "ON audit_runs (review_key)"
