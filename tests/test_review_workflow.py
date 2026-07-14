@@ -130,6 +130,16 @@ def test_submit_batch_creates_v1_and_deterministic_format_statuses(tmp_path: Pat
         assert all(item.publish_status is PublishStatus.NOT_READY for item in batch.content_items)
 
 
+def test_run_audit_rejects_configured_project_with_mismatched_snapshot_identity(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project, _, item = submit_valid_content(session)
+        project.content_type = "OTHER_CONTENT"
+        session.flush()
+
+        with pytest.raises(ValueError, match="content_type"):
+            run_audit(session, item.id, reviewer=FakeReviewer([]), model="model-v1")
+
+
 def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project, _, item = submit_valid_content(session)

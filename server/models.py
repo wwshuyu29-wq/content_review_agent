@@ -80,11 +80,19 @@ class Project(TimestampMixin, Base):
 
 class RuleVersion(TimestampMixin, Base):
     __tablename__ = "rule_versions"
-    __table_args__ = (UniqueConstraint("project_id", "version"),)
+    __table_args__ = (
+        UniqueConstraint("project_id", "version"),
+        UniqueConstraint("project_id", "package_version"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    business_domain: Mapped[Optional[str]] = mapped_column(String(200))
+    document_type: Mapped[Optional[str]] = mapped_column(String(100))
+    project_code: Mapped[Optional[str]] = mapped_column(String(200), index=True)
+    content_type: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    package_version: Mapped[Optional[str]] = mapped_column(String(50), index=True)
     dimension_standards: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     project_facts: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     structured_rules: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)

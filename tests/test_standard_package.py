@@ -55,15 +55,33 @@ def test_rejects_cross_domain_or_unresolved_rule_reference(standards_root: Path)
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
 
 
-def test_rejects_unsupported_project_standard_version(standards_root: Path) -> None:
-    project_file = standards_root / "projects" / "xiaoduxiangxiang_tech_review" / "project.yaml"
+def test_loads_future_semantic_version_from_matching_project_directory(standards_root: Path) -> None:
+    source = standards_root / "projects" / "xiaoduxiangxiang_tech_review"
+    future = standards_root / "projects" / "future_tech_review"
+    shutil.copytree(source, future)
+    project_file = future / "project.yaml"
     project_file.write_text(
-        project_file.read_text(encoding="utf-8").replace('version: "0.9"', 'version: "1.0"'),
+        project_file.read_text(encoding="utf-8")
+        .replace("bdmap_xdxx_tech_review_2026", "future_tech_review_2027")
+        .replace('version: "0.9"', 'version: "1.0"'),
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="version"):
-        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+    package = load_standard_package(standards_root, "future_tech_review_2027", "1.0")
+
+    assert package.metadata.project_code == "future_tech_review_2027"
+    assert package.metadata.version == "1.0"
+
+
+def test_rejects_unknown_top_level_package_fields(standards_root: Path) -> None:
+    project_file = standards_root / "projects" / "xiaoduxiangxiang_tech_review" / "project.yaml"
+    project_file.write_text(
+        project_file.read_text(encoding="utf-8") + "unexpected_field: true\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unexpected_field"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "0.9")
 
 
 def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
@@ -74,6 +92,16 @@ def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
 
     with pytest.raises(ValueError, match="CLAIM-DOES-NOT-EXIST"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_rejects_legacy_rule_arrays(standards_root: Path) -> None:
+    rules_file = standards_root / "rules" / "deterministic_rules.json"
+    rules = json.loads(rules_file.read_text(encoding="utf-8"))
+    rules["deny_words"] = ["legacy"]
+    rules_file.write_text(json.dumps(rules, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="deny_words"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "0.9")
 
 
 def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path, tmp_path: Path) -> None:
@@ -95,9 +123,13 @@ def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path
         session.add(project)
         session.flush()
         version = publish_standard_package(session, project.id, package)
+        same_version = publish_standard_package(session, project.id, package)
         session.commit()
 
-        assert version.version == 9
+        assert version.id == same_version.id
+        assert version.version == 1
+        assert version.package_version == "0.9"
+        assert version.project_code == "bdmap_xdxx_tech_review_2026"
         assert version.dimension_standards["metadata"] == compiled["metadata"]
         assert project.current_rule_version_id == version.id
         assert session.get(RuleVersion, version.id).structured_rules == compiled["structured_rules"]

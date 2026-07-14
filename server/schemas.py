@@ -59,6 +59,11 @@ class RuleVersionRead(OrmSchema):
     id: int
     project_id: int
     version: int
+    business_domain: Optional[str]
+    document_type: Optional[str]
+    project_code: Optional[str]
+    content_type: Optional[str]
+    package_version: Optional[str]
     dimension_standards: Dict[str, Any]
     project_facts: Dict[str, Any]
     structured_rules: Dict[str, Any]

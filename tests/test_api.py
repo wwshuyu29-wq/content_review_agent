@@ -76,26 +76,30 @@ def test_startup_seeds_project_and_supports_project_rule_workflow(api) -> None:
 
     detail = client.get(f"/api/projects/{seeded['id']}")
     assert detail.status_code == 200
-    assert detail.json()["current_rule_version"]["version"] == 9
+    assert detail.json()["current_rule_version"]["version"] == 1
 
     created = client.post("/api/projects", json={"name": "API 测试项目", "description": "项目说明"})
     assert created.status_code == 201
     project = created.json()
 
-    rule_payload = {
+    raw_payload = {
         "dimension_standards": {"quality": "不得使用重复标点"},
         "project_facts": {"product": "测试产品"},
         "structured_rules": {"deny_words": []},
         "prompt_version": "prompt-v1",
     }
-    rule = client.post(f"/api/projects/{project['id']}/rule-versions", json=rule_payload)
-    assert rule.status_code == 201
-    assert rule.json()["version"] == 1
-    assert client.post(
-        f"/api/projects/{project['id']}/rule-versions/{rule.json()['id']}/publish"
-    ).status_code == 200
+    raw_rule = client.post(f"/api/projects/{project['id']}/rule-versions", json=raw_payload)
+    assert raw_rule.status_code == 422
 
-    versions = client.get(f"/api/projects/{project['id']}/rule-versions")
+    package_rule = client.post(
+        f"/api/projects/{seeded['id']}/rule-versions",
+        json={"project_code": "bdmap_xdxx_tech_review_2026", "package_version": "0.9"},
+    )
+    assert package_rule.status_code == 200
+    assert package_rule.json()["version"] == 1
+    assert package_rule.json()["package_version"] == "0.9"
+
+    versions = client.get(f"/api/projects/{seeded['id']}/rule-versions")
     assert versions.status_code == 200
     assert [entry["version"] for entry in versions.json()] == [1]
 

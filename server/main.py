@@ -48,6 +48,7 @@ from server.seed import seed_default_project
 from server.services.content_service import submit_batch
 from server.services.report_service import build_report
 from server.services.review_service import resolve_task, run_audit
+from server.services.standard_package_service import load_standard_package, publish_standard_package
 
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -137,19 +138,9 @@ class OrmResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class RuleVersionInput(BaseModel):
-    dimension_standards: Dict[str, Any] = Field(default_factory=dict)
-    project_facts: Dict[str, Any] = Field(default_factory=dict)
-    structured_rules: Dict[str, Any] = Field(default_factory=dict)
-    prompt_version: str = Field(min_length=1, max_length=100)
-
-    @field_validator("prompt_version")
-    @classmethod
-    def validate_prompt_version(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("prompt_version is required")
-        return value
+class RuleVersionPackageInput(BaseModel):
+    project_code: str = Field(min_length=1, max_length=200)
+    package_version: str = Field(min_length=1, max_length=50)
 
 
 class ProjectDetail(ProjectRead):
@@ -318,39 +309,31 @@ def list_rule_versions(project_id: int, session: Session = Depends(get_session))
     )
 
 
-@app.post("/api/projects/{project_id}/rule-versions", response_model=RuleVersionRead, status_code=201)
-def create_rule_version(
+@app.post("/api/projects/{project_id}/rule-versions", response_model=RuleVersionRead)
+def publish_rule_version_package(
     project_id: int,
-    payload: RuleVersionInput,
+    payload: RuleVersionPackageInput,
     session: Session = Depends(get_session),
 ):
     project = session.get(Project, project_id)
     if project is None:
         raise _not_found("Project", project_id)
-    latest = session.scalar(select(func.max(RuleVersion.version)).where(RuleVersion.project_id == project_id)) or 0
-    version = RuleVersion(project=project, version=latest + 1, **payload.model_dump())
-    session.add(version)
-    session.commit()
-    session.refresh(version)
-    return version
-
-
-@app.post("/api/projects/{project_id}/rule-versions/{rule_version_id}/publish", response_model=ProjectRead)
-def publish_rule_version(
-    project_id: int,
-    rule_version_id: int,
-    session: Session = Depends(get_session),
-):
-    project = session.get(Project, project_id)
-    if project is None:
-        raise _not_found("Project", project_id)
-    version = session.get(RuleVersion, rule_version_id)
-    if version is None or version.project_id != project_id:
-        raise _not_found("RuleVersion", rule_version_id)
-    project.current_rule_version = version
-    session.commit()
-    session.refresh(project)
-    return project
+    if not project.code or not project.content_type:
+        raise HTTPException(
+            status_code=422,
+            detail="Project must have code and content_type before publishing a standard package",
+        )
+    if payload.project_code != project.code:
+        raise HTTPException(status_code=422, detail="project_code does not match project identity")
+    try:
+        package = load_standard_package(REPO_DIR / "data" / "standards", project.code, payload.package_version)
+        version = publish_standard_package(session, project.id, package)
+        session.commit()
+        session.refresh(version)
+        return version
+    except ValueError as exc:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 async def _parse_contents(contents: str) -> List[Dict[str, Any]]:

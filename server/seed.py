@@ -8,26 +8,26 @@ from sqlalchemy.orm import Session
 from .models import Project
 from .services.standard_package_service import load_standard_package, publish_standard_package
 
-
 DEFAULT_PROJECT_CODE = "bdmap_xdxx_tech_review_2026"
 DEFAULT_PROJECT_NAME = "百度地图小度想想科技媒体测评"
 DEFAULT_CONTENT_TYPE = "TECH_MEDIA_REVIEW"
+DEFAULT_PACKAGE_VERSION = "0.9"
 
 
 def seed_default_project(session: Session) -> Project:
     project = session.scalar(select(Project).where(Project.code == DEFAULT_PROJECT_CODE))
-    if project is not None:
-        return project
-
-    project = Project(
-        name=DEFAULT_PROJECT_NAME,
-        code=DEFAULT_PROJECT_CODE,
-        content_type=DEFAULT_CONTENT_TYPE,
-        description="百度地图小度想想科技媒体亲测、实测和产品评测审核项目。",
-    )
-    session.add(project)
-    session.flush()
     root = Path(__file__).resolve().parents[1] / "data" / "standards"
-    package = load_standard_package(root, DEFAULT_PROJECT_CODE)
+    package = load_standard_package(root, DEFAULT_PROJECT_CODE, DEFAULT_PACKAGE_VERSION)
+    if project is None:
+        project = Project(
+            name=DEFAULT_PROJECT_NAME,
+            code=DEFAULT_PROJECT_CODE,
+            content_type=DEFAULT_CONTENT_TYPE,
+            description="百度地图小度想想科技媒体亲测、实测和产品评测审核项目。",
+        )
+        session.add(project)
+        session.flush()
+    elif project.content_type != DEFAULT_CONTENT_TYPE:
+        raise ValueError("default project has incompatible content_type")
     publish_standard_package(session, project.id, package)
     return project

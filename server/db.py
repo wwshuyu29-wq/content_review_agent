@@ -51,6 +51,21 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_projects_code_unique ON projects (code)"
             )
+        if "rule_versions" in table_names:
+            rule_columns = {column["name"] for column in database_inspector.get_columns("rule_versions")}
+            for column, sql_type in (
+                ("business_domain", "VARCHAR(200)"),
+                ("document_type", "VARCHAR(100)"),
+                ("project_code", "VARCHAR(200)"),
+                ("content_type", "VARCHAR(100)"),
+                ("package_version", "VARCHAR(50)"),
+            ):
+                if column not in rule_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE rule_versions ADD COLUMN {column} {sql_type}")
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_rule_versions_project_package_version "
+                "ON rule_versions (project_id, package_version)"
+            )
         if "batches" not in table_names:
             return
 

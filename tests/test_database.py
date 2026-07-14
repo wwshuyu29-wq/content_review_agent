@@ -275,7 +275,9 @@ def test_seed_default_project_is_idempotent_and_uses_tech_review_package(tmp_pat
         assert len(first.rule_versions) == 1
         rules = first.current_rule_version
         assert rules is not None
-        assert rules.version == 9
+        assert rules.version == 1
+        assert rules.package_version == "0.9"
+        assert rules.project_code == "bdmap_xdxx_tech_review_2026"
         assert rules.dimension_standards["metadata"]["content_type"] == "TECH_MEDIA_REVIEW"
         serialized = str({"facts": rules.project_facts, "rules": rules.structured_rules})
         assert "范丞丞" not in serialized
