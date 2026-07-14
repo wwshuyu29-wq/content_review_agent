@@ -160,6 +160,7 @@ class ContentVersion(TimestampMixin, Base):
 
 class AuditRun(TimestampMixin, Base):
     __tablename__ = "audit_runs"
+    __table_args__ = (UniqueConstraint("content_version_id", "rule_version_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
@@ -182,7 +183,10 @@ class AuditRun(TimestampMixin, Base):
 
 class AgentResult(TimestampMixin, Base):
     __tablename__ = "agent_results"
-    __table_args__ = (UniqueConstraint("audit_run_id", "agent_name"),)
+    __table_args__ = (
+        UniqueConstraint("audit_run_id", "agent_name"),
+        UniqueConstraint("audit_run_id", "agent_id", "agent_version"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     audit_run_id: Mapped[int] = mapped_column(ForeignKey("audit_runs.id"), nullable=False)

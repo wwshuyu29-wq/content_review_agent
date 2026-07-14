@@ -219,6 +219,23 @@ def test_schema_upgrade_adds_import_token_to_legacy_batches_and_confirm_import_w
         assert session.scalar(select(Batch).where(Batch.import_token == preview.token)) is batch
 
 
+def test_schema_upgrade_adds_audit_and_agent_idempotency_indexes(tmp_path: Path) -> None:
+    import server.db as db_module
+
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    db_module.ensure_schema_upgrades(engine)
+    inspector = inspect(engine)
+
+    indexes = {
+        (table_name, tuple(index["column_names"]), bool(index.get("unique")))
+        for table_name in ("audit_runs", "agent_results")
+        for index in inspector.get_indexes(table_name)
+    }
+    assert ("audit_runs", ("content_version_id", "rule_version_id"), True) in indexes
+    assert ("agent_results", ("audit_run_id", "agent_id", "agent_version"), True) in indexes
+
+
 def test_metadata_compiles_for_postgresql() -> None:
     dialect = postgresql.dialect()
 
@@ -496,7 +513,11 @@ def test_workflow_identity_constraints_are_unique(tmp_path: Path) -> None:
         "batches": {("import_token",)},
         "content_items": {("batch_id", "external_id")},
         "content_versions": {("content_item_id", "version")},
-        "agent_results": {("audit_run_id", "agent_name")},
+        "audit_runs": {("content_version_id", "rule_version_id")},
+        "agent_results": {
+            ("audit_run_id", "agent_name"),
+            ("audit_run_id", "agent_id", "agent_version"),
+        },
         "review_tasks": {("issue_id",)},
     }
 

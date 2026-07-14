@@ -34,8 +34,8 @@ Each issue must contain only the fields defined by the issue schema, including a
 """
 
 _AGENT_INSTRUCTIONS = {
-    "COMPLIANCE": "Check legal/safety/compliance wording and unsupported claims; do not assess celebrity or artist rules.",
-    "BRAND": "Check supplied product and brand naming, positioning, and tone against relevant supplied facts; do not assess celebrity or artist rules.",
+    "COMPLIANCE": "Check legal/safety/compliance wording and unsupported claims; ignore unrelated external identity or endorsement policy.",
+    "BRAND": "Check supplied product and brand naming, positioning, and tone against relevant supplied facts; ignore unrelated external identity or endorsement policy.",
     "PRODUCT_ACCURACY": "Check product features and capabilities only against supplied official product facts; missing support requires HUMAN_REVIEW.",
     "TEST_CREDIBILITY": "Check whether test methodology, observed results, and evidence assets support every test claim. Use the full test/evidence context.",
     "CONTENT_QUALITY": "Check clarity, structure, completeness, and readable expression without inventing factual or semantic findings.",
@@ -68,7 +68,7 @@ class TechMediaReviewer:
 
     def build_prompts(self, context: ReviewContext, profile: ReviewProfile) -> dict[str, str]:
         common = {
-            "project_facts": {
+            "identity": {
                 "business_domain": profile.business_domain,
                 "project_code": profile.project_code,
                 "content_type": profile.content_type,
@@ -78,13 +78,44 @@ class TechMediaReviewer:
             "content": {"title": context.title, "body": context.body},
             "platform_requirements": dict(profile.platform_requirements),
         }
+        claims = {
+            "approved_claims": list(profile.approved_claims),
+            "pending_claims": list(profile.pending_claims),
+        }
+        prompt_slices = {
+            "COMPLIANCE": {
+                "standard": profile.global_standards.get("compliance", ""),
+                **claims,
+            },
+            "BRAND": {
+                "standard": profile.global_standards.get("brand_consistency", ""),
+                "project_facts": dict(profile.project_facts),
+            },
+            "PRODUCT_ACCURACY": {
+                "standard": profile.global_standards.get("content_accuracy", ""),
+                "project_facts": dict(profile.project_facts),
+                **claims,
+            },
+            "TEST_CREDIBILITY": {
+                "standard": profile.global_standards.get("test_credibility", ""),
+                "evidence_requirements": list(profile.evidence_requirements),
+                "test_cases": list(context.test_cases),
+                "evidence_manifest": list(context.evidence) + list(context.evidence_assets),
+            },
+            "CONTENT_QUALITY": {
+                "standard": profile.global_standards.get("content_quality", ""),
+            },
+            "CAMPAIGN_EFFECTIVENESS": {
+                "standard": profile.global_standards.get("campaign_effectiveness", ""),
+                "platform_requirements": dict(profile.platform_requirements),
+                "project_facts": dict(profile.project_facts),
+            },
+        }
         prompts = {}
         for agent_id in AGENT_ORDER:
             payload = dict(common)
-            payload["relevant_standard_slice"] = self._relevant_rules(agent_id, profile)
-            if agent_id == "TEST_CREDIBILITY":
-                payload["test_cases"] = list(context.test_cases)
-                payload["evidence_manifest"] = list(context.evidence) + list(context.evidence_assets)
+            payload["standard_slice"] = prompt_slices[agent_id]
+            payload["relevant_structured_rules"] = self._relevant_rules(agent_id, profile)
             prompts[agent_id] = (
                 _SHARED_RULES
                 + "\nSpecialist: " + agent_id + "\n"
@@ -96,14 +127,9 @@ class TechMediaReviewer:
 
     @staticmethod
     def _heuristic(agent_id: str) -> AgentReviewResult:
-        return AgentReviewResult(
-            agent_id=agent_id,
-            agent_version=AGENT_VERSION,
-            decision="PASS",
-            summary="Heuristic mode performed no semantic finding; LLM review is not enabled.",
-            score=100,
-            confidence=0.0,
-            issues=[],
+        return TechMediaReviewer._unavailable(
+            agent_id,
+            "semantic review was not performed because LLM is disabled",
         )
 
     @staticmethod
@@ -131,17 +157,41 @@ class TechMediaReviewer:
             issues=[issue],
         )
 
-    def _llm_result(self, agent_id: str, prompt: str) -> AgentReviewResult:
+    @staticmethod
+    def _validate_coherence(result: AgentReviewResult, agent_id: str, profile: ReviewProfile) -> None:
+        if result.agent_id != agent_id:
+            raise ValueError(f"agent_id must be {agent_id}")
+        if result.agent_version != AGENT_VERSION:
+            raise ValueError(f"agent_version must be {AGENT_VERSION}")
+        known = set(profile.known_source_references)
+        for issue in result.issues:
+            if issue.rule_id.startswith("SYSTEM-"):
+                if not all(reference.startswith("SYSTEM:") for reference in issue.source_reference):
+                    raise ValueError("system issue references must use SYSTEM: prefix")
+            elif not issue.source_reference or not set(issue.source_reference) <= known:
+                raise ValueError("issue source_reference is missing or unknown")
+        if result.decision == "PASS" and result.issues:
+            raise ValueError("PASS cannot contain issues")
+        if result.decision in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}:
+            if not any(issue.human_required or issue.severity in {"HIGH", "CRITICAL"} for issue in result.issues):
+                raise ValueError("blocking decision requires a blocking issue")
+        if result.decision == "PASS_WITH_SUGGESTIONS":
+            if any(issue.human_required or issue.severity != "LOW" for issue in result.issues):
+                raise ValueError("suggestions must be non-human LOW issues")
+
+    def _llm_result(self, agent_id: str, prompt: str, profile: ReviewProfile) -> AgentReviewResult:
         last_error = "no response"
         for _attempt in range(3):
             try:
-                raw = self.llm.chat(prompt)
+                if callable(getattr(self.llm, "chat_json", None)):
+                    raw = self.llm.chat_json(prompt, AgentReviewResult)
+                else:
+                    raw = self.llm.chat(prompt)
                 data = json.loads((raw or "").strip())
                 result = AgentReviewResult.model_validate(data)
-                if result.agent_id != agent_id:
-                    raise ValueError(f"agent_id must be {agent_id}")
+                self._validate_coherence(result, agent_id, profile)
                 return result
-            except Exception as exc:  # transport, JSON, and schema failures all require retry/human review
+            except Exception as exc:  # transport, JSON, and protocol failures all require retry/human review
                 last_error = str(exc)
         return self._unavailable(agent_id, last_error)
 
@@ -149,4 +199,8 @@ class TechMediaReviewer:
         prompts = self.build_prompts(context, profile)
         if self.llm is None:
             return [self._heuristic(agent_id) for agent_id in AGENT_ORDER]
-        return [self._llm_result(agent_id, prompts[agent_id]) for agent_id in AGENT_ORDER]
+        return [self._llm_result(agent_id, prompts[agent_id], profile) for agent_id in AGENT_ORDER]
+
+    def rewrite(self, row: dict, standards) -> tuple[str, str]:
+        """Keep compatibility with the legacy workflow without inventing an edit."""
+        return str(row.get("title", "")), str(row.get("body", ""))

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from server import main
 from server.db import create_db_engine
+from scripts.text_review.reviewers.tech_media import TechMediaReviewer
 from server.models import ContentItem, Project, ReviewStatus
 
 
@@ -177,6 +178,32 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     assert report.json()["status_counts"] == {"APPROVED": 1}
 
 
+def test_default_heuristic_audit_routes_to_human_review(api) -> None:
+    client, _, _ = api
+    main.app.dependency_overrides[main.get_audit_reviewer] = main.get_audit_reviewer
+    project_id = client.get("/api/projects").json()[0]["id"]
+    uploaded = client.post(
+        "/api/batches",
+        data={
+            "project_id": str(project_id),
+            "supplier_id": "heuristic-safety",
+            "name": "heuristic safety",
+            "contents": json.dumps([{"external_id": "heuristic", "title": "标题", "body": "正文", "payload": {}}]),
+        },
+        files=[("files", ("heuristic.png", b"image", "image/png"))],
+    ).json()
+    content_id = uploaded["contents"][0]["id"]
+
+    response = client.post(f"/api/contents/{content_id}/audit")
+
+    assert response.status_code == 200
+    assert response.json()["agent_results"][0]["decision"] == "HUMAN_REVIEW"
+    detail = client.get(f"/api/contents/{content_id}").json()
+    assert detail["review_status"] == "MANUAL_REQUIRED"
+    assert detail["publish_status"] == "NOT_READY"
+    assert len(detail["open_tasks"]) == 6
+
+
 def test_batch_audit_endpoint_audits_all_eligible_contents(api) -> None:
     client, _, _ = api
     project_id = client.get("/api/projects").json()[0]["id"]
@@ -281,26 +308,36 @@ def test_reviewer_dependency_applies_non_secret_config(
     )
     captured = {}
 
-    def fake_factory(backend):
+    class FakeLLM:
+        name = "oneapi-test"
+
+    def fake_llm_factory(backend):
         captured.update(
             backend=backend,
             model=os.environ.get("ONEAPI_MODEL"),
             base_url=os.environ.get("ONEAPI_BASE_URL"),
             key=os.environ.get("ONEAPI_KEY"),
         )
-        return FakeReviewer()
+        return FakeLLM()
 
-    monkeypatch.setattr(main, "get_reviewer", fake_factory)
+    monkeypatch.setattr(main, "get_llm", fake_llm_factory)
 
     reviewer = main.get_audit_reviewer()
 
-    assert isinstance(reviewer, FakeReviewer)
+    assert isinstance(reviewer, TechMediaReviewer)
+    assert isinstance(reviewer.llm, FakeLLM)
     assert captured == {
         "backend": "oneapi",
         "model": "configured-model",
         "base_url": "https://trusted.example.test/v1",
         "key": "test-secret-key",
     }
+
+
+def test_heuristic_dependency_injects_tech_media_reviewer_without_llm(api) -> None:
+    reviewer = main.get_audit_reviewer()
+    assert isinstance(reviewer, TechMediaReviewer)
+    assert reviewer.llm is None
 
 
 def test_config_never_exposes_or_accepts_oneapi_key(api) -> None:

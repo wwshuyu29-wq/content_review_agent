@@ -79,6 +79,35 @@ def agent_result(name="quality", issues=None, status="COMPLETED"):
     }
 
 
+class ProtocolReviewer:
+    name = "protocol-test"
+
+    def __init__(self, *, decisions=None, ids=None, version="tech-media-v1"):
+        self.decisions = decisions or ["PASS"] * 6
+        self.ids = ids
+        self.version = version
+
+    def review_structured(self, row, standards):
+        ids = self.ids or [
+            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+        ]
+        return [
+            {
+                "agent_name": agent_id,
+                "agent_id": agent_id,
+                "agent_version": self.version,
+                "decision": decision,
+                "summary": "protocol result",
+                "score": 90,
+                "status": decision,
+                "issues": [],
+                "raw_result": {},
+            }
+            for agent_id, decision in zip(ids, self.decisions)
+        ]
+
+
 def make_session(tmp_path: Path) -> Session:
     engine = create_db_engine(f"sqlite:///{tmp_path / 'workflow.db'}")
     Base.metadata.create_all(engine)
@@ -174,8 +203,63 @@ def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Pa
             "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
             "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
         ]
-        assert all(result.decision == "PASS" for result in audit.agent_results)
+        assert all(result.decision == "HUMAN_REVIEW" for result in audit.agent_results)
         assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
+        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert len(audit.issues) == 6
+        assert all(issue.human_required for issue in audit.issues)
+
+
+@pytest.mark.parametrize("decision", ["HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"])
+def test_blocking_agent_decision_with_zero_issues_never_approves(tmp_path: Path, decision: str) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        audit = run_audit(session, item.id, reviewer=ProtocolReviewer(decisions=[decision] + ["PASS"] * 5))
+        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert any(issue.rule_id == "SYSTEM-AGENT-DECISION" for issue in audit.issues)
+
+
+@pytest.mark.parametrize(
+    "reviewer",
+    [
+        ProtocolReviewer(ids=["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY"]),
+        ProtocolReviewer(ids=["COMPLIANCE", "BRAND", "BRAND", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]),
+        ProtocolReviewer(version="wrong-version"),
+    ],
+)
+def test_invalid_agent_protocol_never_approves(tmp_path: Path, reviewer: ProtocolReviewer) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        audit = run_audit(session, item.id, reviewer=reviewer)
+        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert any(issue.rule_id == "SYSTEM-AGENT-PROTOCOL" for issue in audit.issues)
+
+
+def test_all_pass_and_pass_with_suggestions_are_eligible_for_clear_approval(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, pass_item = submit_valid_content(session)
+        run_audit(session, pass_item.id, reviewer=ProtocolReviewer())
+        assert pass_item.review_status is ReviewStatus.APPROVED
+        assert pass_item.publish_status is PublishStatus.READY
+
+        project = pass_item.project
+        second = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="suggestions",
+            name="suggestions",
+            contents=[{"external_id": "suggestions", "title": "标题", "body": "完整正文", "payload": {}}],
+        ).content_items[0]
+        run_audit(
+            session,
+            second.id,
+            reviewer=ProtocolReviewer(decisions=["PASS_WITH_SUGGESTIONS"] * 6),
+        )
+        assert second.review_status is ReviewStatus.APPROVED
+        assert second.publish_status is PublishStatus.READY
 
 
 def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_path: Path) -> None:

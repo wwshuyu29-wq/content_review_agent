@@ -18,6 +18,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from scripts.text_review.reviewer import get_reviewer
+from scripts.text_review.reviewers.llm import get_llm
+from scripts.text_review.reviewers.tech_media import TechMediaReviewer
 from server.db import Base, ensure_schema_upgrades, get_db_engine, get_session
 from server.models import (
     AgentResult,
@@ -106,8 +108,11 @@ def _save_config(config: Dict[str, str]) -> None:
 def get_audit_reviewer() -> Any:
     config = _validated_config(_load_config())
     if config["model"]:
-        os.environ["ONEAPI_MODEL"] = config["model"]
-    return get_reviewer(config["reviewer"])
+        if config["reviewer"] == "oneapi":
+            os.environ["ONEAPI_MODEL"] = config["model"]
+        elif config["reviewer"] == "ernie":
+            os.environ["ERNIE_MODEL"] = config["model"]
+    return TechMediaReviewer(llm=get_llm(config["reviewer"]))
 
 
 @asynccontextmanager
@@ -225,7 +230,7 @@ def _service_error(error: ValueError) -> HTTPException:
     message = str(error)
     if "does not exist" in message or "does not belong" in message:
         status = 404
-    elif "open review tasks" in message or "terminal" in message:
+    elif "open review tasks" in message or "terminal" in message or "already been audited" in message:
         status = 409
     else:
         status = 422

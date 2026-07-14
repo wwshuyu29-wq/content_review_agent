@@ -78,6 +78,32 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             ):
                 if column not in agent_columns:
                     connection.exec_driver_sql(f"ALTER TABLE agent_results ADD COLUMN {column} {sql_type}")
+            connection.exec_driver_sql(
+                "UPDATE agent_results SET agent_id = 'LEGACY-' || CAST(id AS VARCHAR) "
+                "WHERE agent_id IS NULL"
+            )
+            connection.exec_driver_sql(
+                "UPDATE agent_results SET agent_version = 'legacy-v1' WHERE agent_version IS NULL"
+            )
+            connection.exec_driver_sql(
+                "UPDATE agent_results SET decision = 'LEGACY' WHERE decision IS NULL"
+            )
+            connection.exec_driver_sql(
+                "UPDATE agent_results SET summary = 'Legacy result; excluded from tech arbitration' "
+                "WHERE summary IS NULL"
+            )
+            connection.exec_driver_sql(
+                "UPDATE agent_results SET score = 0 WHERE score IS NULL"
+            )
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_results_audit_agent_version "
+                "ON agent_results (audit_run_id, agent_id, agent_version)"
+            )
+        if "audit_runs" in table_names:
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_audit_runs_content_rule "
+                "ON audit_runs (content_version_id, rule_version_id)"
+            )
         if "issues" in table_names:
             issue_columns = {column["name"] for column in database_inspector.get_columns("issues")}
             if "source_reference" not in issue_columns:

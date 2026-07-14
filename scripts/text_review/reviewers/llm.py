@@ -11,6 +11,7 @@ dodo-happywork-v1-internal 等内网模型：若也走 OneAPI，直接用 "oneap
 from __future__ import annotations
 
 import os
+from typing import Any
 
 
 class OpenAICompatLLM:
@@ -32,20 +33,23 @@ class OpenAICompatLLM:
         self.api_key = os.environ.get("ONEAPI_KEY", "")
         self.model = os.environ.get("ONEAPI_MODEL", "")
 
-    def chat(self, prompt: str) -> str:
+    def _request(self, prompt: str, response_format: dict[str, Any] | None = None) -> str:
         if not self.api_key:
             raise EnvironmentError("缺少 ONEAPI_KEY 环境变量（在 OneAPI 控制台 /mine 领取）")
         if not self.model:
             raise EnvironmentError("缺少 ONEAPI_MODEL 环境变量（如 ernie-4.0-8k / gpt-4o）")
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+        }
+        if response_format is not None:
+            body["response_format"] = response_format
         r = self._requests.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}",
                      "Content-Type": "application/json"},
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-            },
+            json=body,
             timeout=60,
         )
         r.raise_for_status()
@@ -53,6 +57,23 @@ class OpenAICompatLLM:
         if "error" in data and data["error"]:
             raise RuntimeError(f"OneAPI 错误: {data['error']}")
         return data["choices"][0]["message"]["content"]
+
+    def chat(self, prompt: str) -> str:
+        return self._request(prompt)
+
+    def chat_json(self, prompt: str, schema: Any) -> str:
+        json_schema = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema
+        return self._request(
+            prompt,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "agent_review_result",
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            },
+        )
 
 
 class ErnieLLM:

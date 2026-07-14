@@ -3,11 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Mapping, Optional
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from scripts.text_review import schema
 from scripts.text_review.reviewer import get_reviewer
-from scripts.text_review.reviewers.tech_media import TechMediaReviewer
+from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer
 from scripts.text_review.standards import Standards
 from server.models import (
     AgentResult,
@@ -66,6 +67,69 @@ def _standards_from_rule_version(rule_version: RuleVersion) -> Standards:
         must_human_keywords=[],
         required_tags=[],
     )
+
+
+def _system_issue(*, rule_id: str, reason: str, suggestion: str) -> dict[str, Any]:
+    return {
+        "rule_id": rule_id,
+        "category": "system",
+        "severity": "HIGH",
+        "field": "review",
+        "evidence_quote": "",
+        "evidence_start": None,
+        "evidence_end": None,
+        "evidence_asset_id": None,
+        "evidence_timestamp": None,
+        "reason": reason,
+        "suggestion": suggestion,
+        "source_reference": [f"SYSTEM:{rule_id}"],
+        "auto_fixable": False,
+        "human_required": True,
+        "confidence": 0.99,
+    }
+
+
+def _validate_agent_protocol(results: list[dict], profile: Any) -> Optional[str]:
+    ids = [result.get("agent_id") for result in results]
+    if len(results) != len(AGENT_ORDER):
+        return f"expected exactly {len(AGENT_ORDER)} Agent results, got {len(results)}"
+    if ids != list(AGENT_ORDER):
+        return "Agent results do not match the required fixed order"
+    if len(set(ids)) != len(ids):
+        return "Agent results contain duplicate agent_id values"
+    for result in results:
+        if result.get("agent_version") != AGENT_VERSION:
+            return f"Agent {result.get('agent_id')} has an unexpected agent_version"
+        if any(result.get(key) in (None, "") for key in ("decision", "summary", "score")):
+            return f"Agent {result.get('agent_id')} is missing a stable protocol field"
+        if result.get("decision") not in {
+            "PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK",
+        }:
+            return f"Agent {result.get('agent_id')} has an invalid decision"
+        issues = result.get("issues", [])
+        for issue in issues:
+            references = issue.get("source_reference", [])
+            rule_id = issue.get("rule_id", "")
+            if rule_id.startswith("SYSTEM-"):
+                if not all(str(reference).startswith("SYSTEM:") for reference in references):
+                    return f"Agent {result.get('agent_id')} has invalid system issue references"
+            elif not references or not set(references) <= set(profile.known_source_references):
+                return f"Agent {result.get('agent_id')} has missing or unknown issue references"
+        if result.get("decision") == "PASS" and issues:
+            return f"Agent {result.get('agent_id')} returned PASS with issues"
+        if result.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}:
+            if not any(
+                issue.get("human_required") or issue.get("severity") in {"HIGH", "CRITICAL"}
+                for issue in issues
+            ):
+                return f"Agent {result.get('agent_id')} returned a blocking decision without a blocking issue"
+        if result.get("decision") == "PASS_WITH_SUGGESTIONS":
+            if any(
+                issue.get("human_required") or issue.get("severity") != "LOW"
+                for issue in issues
+            ):
+                return f"Agent {result.get('agent_id')} returned invalid suggestions"
+    return None
 
 
 def _latest_version(item: ContentItem) -> ContentVersion:
@@ -199,6 +263,14 @@ def run_audit(
         raise ValueError("Project has no current rule version")
     validate_rule_version_identity(item.project, rule_version)
     content_version = _latest_version(item)
+    existing_audit = session.scalar(
+        select(AuditRun).where(
+            AuditRun.content_version_id == content_version.id,
+            AuditRun.rule_version_id == rule_version.id,
+        )
+    )
+    if existing_audit is not None:
+        raise ValueError("Content version has already been audited with this rule version")
     standards = _standards_from_rule_version(rule_version)
     profile = get_review_profile(rule_version)
     reviewer = reviewer or TechMediaReviewer()
@@ -250,9 +322,19 @@ def run_audit(
         )
         session.add(persisted)
         persisted_issues.append(persisted)
-    for result_data in _normalize_agent_results(
+    agent_result_data = _normalize_agent_results(
         reviewer, row, standards, context=context, profile=profile
-    ):
+    )
+    strict_protocol = isinstance(reviewer, TechMediaReviewer) or any(
+        "agent_id" in result_data for result_data in agent_result_data
+    )
+    protocol_error = _validate_agent_protocol(agent_result_data, profile) if strict_protocol else None
+    persisted_agent_keys: set[tuple[Any, Any, Any]] = set()
+    for result_data in agent_result_data:
+        persistence_key = (result_data.get("agent_name"),)
+        if persistence_key in persisted_agent_keys:
+            continue
+        persisted_agent_keys.add(persistence_key)
         result = AgentResult(
             audit_run=audit,
             agent_name=result_data["agent_name"],
@@ -285,7 +367,52 @@ def run_audit(
             )
             session.add(persisted)
             persisted_issues.append(persisted)
+    if protocol_error:
+        issue_data = _system_issue(
+            rule_id=(
+                "SYSTEM-AGENT-DECISION"
+                if "blocking decision" in protocol_error or "PASS with issues" in protocol_error
+                else "SYSTEM-AGENT-PROTOCOL"
+            ),
+            reason=protocol_error,
+            suggestion="Route this audit to human review and regenerate the complete six-agent result set.",
+        )
+        persisted = Issue(audit_run=audit, **issue_data)
+        session.add(persisted)
+        persisted_issues.append(persisted)
+    elif strict_protocol:
+        for result_data in agent_result_data:
+            decision = result_data.get("decision")
+            if decision in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"} and not result_data.get("issues"):
+                issue_data = _system_issue(
+                    rule_id="SYSTEM-AGENT-DECISION",
+                    reason=f"Agent {result_data.get('agent_id')} returned {decision} without a blocking issue",
+                    suggestion="Route this audit to human review and correct the Agent result.",
+                )
+                persisted = Issue(audit_run=audit, **issue_data)
+                session.add(persisted)
+                persisted_issues.append(persisted)
     session.flush()
+
+    decision_requires_human = strict_protocol and any(
+        result_data.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}
+        for result_data in agent_result_data
+    )
+    if decision_requires_human and not any(
+        issue.human_required or issue.severity.upper() in {"HIGH", "CRITICAL"}
+        for issue in persisted_issues
+    ):
+        persisted = Issue(
+            audit_run=audit,
+            **_system_issue(
+                rule_id="SYSTEM-AGENT-DECISION",
+                reason="An Agent returned an explicit blocking decision.",
+                suggestion="Complete human review before approval.",
+            ),
+        )
+        session.add(persisted)
+        persisted_issues.append(persisted)
+        session.flush()
 
     manual_issues = [
         issue for issue in persisted_issues

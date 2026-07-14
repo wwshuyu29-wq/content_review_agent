@@ -29,7 +29,12 @@ class ReviewProfile(BaseModel):
     package_version: str
     package_digest: str
     rules: Tuple[RuleSpec, ...]
+    project_facts: Mapping[str, Any] = Field(default_factory=dict)
+    global_standards: Mapping[str, str] = Field(default_factory=dict)
+    approved_claims: Tuple[Mapping[str, Any], ...] = ()
+    pending_claims: Tuple[Mapping[str, Any], ...] = ()
     evidence_requirements: Tuple[Mapping[str, Any], ...] = ()
+    known_source_references: Tuple[str, ...] = ()
     platform_requirements: Mapping[str, Mapping[str, Any]] = Field(default_factory=dict)
     replacement_rules: Tuple[Mapping[str, Any], ...] = ()
     platform_aliases: Mapping[str, str] = Field(default_factory=dict)
@@ -99,6 +104,22 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         for replacement in replacements
     )
     platform_requirements = structured.get("platform_requirements", {})
+    approved_claims = tuple(structured.get("approved_claims", []))
+    pending_claims = tuple(structured.get("pending_claims", []))
+    global_standards = dict(rule_version.dimension_standards.get("standards", {}))
+    project_facts = dict(rule_version.project_facts or {})
+    known_references = {
+        "project.yaml", "approved_claims.yaml", "evidence_requirements.yaml",
+        "platform_requirements.yaml", "project_context.md",
+        "compliance.md", "brand_consistency.md", "content_accuracy.md",
+        "test_credibility.md", "content_quality.md", "campaign_effectiveness.md",
+    }
+    for claim in approved_claims + pending_claims:
+        known_references.update(claim.get("source_reference", []))
+    for requirement in evidence:
+        known_references.update(requirement.get("source_reference", []))
+    for rule in rules + replacement_specs:
+        known_references.update(rule.source_reference)
     aliases: dict[str, str] = {}
     for canonical, config in platform_requirements.items():
         for alias in config.get("aliases", [canonical]):
@@ -113,7 +134,12 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         package_version=expected["version"],
         package_digest=rule_version.package_digest,
         rules=rules + replacement_specs,
+        project_facts=project_facts,
+        global_standards=global_standards,
+        approved_claims=approved_claims,
+        pending_claims=pending_claims,
         evidence_requirements=tuple(evidence),
+        known_source_references=tuple(sorted(known_references)),
         platform_requirements=platform_requirements,
         replacement_rules=replacements,
         platform_aliases=aliases,
