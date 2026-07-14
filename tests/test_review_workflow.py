@@ -184,6 +184,30 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert audit.issues == []
 
 
+def test_deterministic_issue_is_persisted_in_audit_before_reviewer_results(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-deterministic",
+            name="确定性规则批次",
+            contents=[{
+                "external_id": "deterministic-1",
+                "title": "酒店能力测评",
+                "body": "小度想想可以自动筛选、比较酒店并判断最划算。",
+                "payload": {"platform": "xiaohongshu"},
+            }],
+        ).content_items[0]
+
+        audit = run_audit(session, item.id, reviewer=FakeReviewer([agent_result()]))
+
+        assert [saved.rule_id for saved in audit.issues] == ["CLAIM-PENDING-001"]
+        assert audit.issues[0].agent_result_id is None
+        assert audit.issues[0].human_required is True
+        assert item.review_status is ReviewStatus.MANUAL_REQUIRED
+
+
 def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         _, _, item = submit_valid_content(session)

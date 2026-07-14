@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 from jsonschema import ValidationError as JsonSchemaValidationError
@@ -113,6 +113,11 @@ class DeterministicRule(StrictModel):
     auto_fixable: bool = False
     source_reference: List[str] = Field(default_factory=list)
     phrases: List[str] = Field(default_factory=list)
+    title_pattern: Optional[str] = None
+    trigger_terms: List[str] = Field(default_factory=list)
+    required_fields: List[str] = Field(default_factory=list)
+    required_terms: List[str] = Field(default_factory=list)
+    replacement_map: Dict[str, str] = Field(default_factory=dict)
 
 
 class RulesFile(StrictModel):

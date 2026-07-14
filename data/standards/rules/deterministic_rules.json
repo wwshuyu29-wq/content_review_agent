@@ -1,9 +1,21 @@
 {
   "rules": [
     {
+      "rule_id": "TEST-COUNT-001",
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]},
+      "matcher": "count_consistency",
+      "title_pattern": "(\\d+)\\s*[个项]?测试",
+      "severity": "HIGH",
+      "action": "HUMAN_REVIEW",
+      "auto_fixable": false,
+      "source_reference": ["CLAIM-001"]
+    },
+    {
       "rule_id": "TEST-EVIDENCE-001",
       "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
       "matcher": "evidence_required",
+      "trigger_terms": ["亲测", "实测", "自用"],
+      "required_fields": ["test_cases", "evidence"],
       "severity": "HIGH",
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
@@ -18,6 +30,16 @@
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
       "source_reference": ["PENDING-002"]
+    },
+    {
+      "rule_id": "REPLACE-001",
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
+      "matcher": "replacement_map",
+      "replacement_map": {"最优解": "一种可行方案"},
+      "severity": "LOW",
+      "action": "SUGGEST_REPLACEMENT",
+      "auto_fixable": true,
+      "source_reference": ["CLAIM-001"]
     }
   ]
 }

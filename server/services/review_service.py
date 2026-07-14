@@ -22,6 +22,8 @@ from server.models import (
     RuleVersion,
 )
 from server.services.content_service import validate_content_format
+from server.services.deterministic_rule_service import ReviewContext, evaluate_rules
+from server.services.review_profile_service import get_review_profile
 
 MANUAL_SEVERITIES = {"mid", "high", "unknown"}
 ISSUE_FIELDS = (
@@ -158,6 +160,7 @@ def run_audit(
     content_version = _latest_version(item)
     reviewer = reviewer or get_reviewer("heuristic")
     standards = _standards_from_rule_version(rule_version)
+    profile = get_review_profile(rule_version)
     row = {
         schema.COL_ID: item.external_id,
         schema.COL_TITLE: content_version.title,
@@ -177,7 +180,34 @@ def run_audit(
     session.add(audit)
     session.flush()
 
+    context = ReviewContext(
+        title=content_version.title,
+        body=content_version.body,
+        platform=str(content_version.payload.get("platform", "")),
+        content_type=item.project.content_type or "",
+        project_id=str(item.project_id),
+        project_code=item.project.code or "",
+        test_cases=list(content_version.payload.get("test_cases", [])),
+        evidence=list(content_version.payload.get("evidence", [])),
+        evidence_assets=list(content_version.payload.get("evidence_assets", [])),
+    )
     persisted_issues: list[Issue] = []
+    for deterministic in evaluate_rules(profile, context):
+        persisted = Issue(
+            audit_run=audit,
+            rule_id=deterministic.rule_id,
+            category=deterministic.category,
+            severity=deterministic.severity,
+            field=deterministic.field,
+            evidence_quote=deterministic.evidence,
+            reason=deterministic.reason,
+            suggestion=deterministic.suggestion,
+            auto_fixable=deterministic.auto_fixable,
+            human_required=deterministic.human_required,
+            confidence=deterministic.confidence,
+        )
+        session.add(persisted)
+        persisted_issues.append(persisted)
     for result_data in _normalize_agent_results(reviewer, row, standards):
         result = AgentResult(
             audit_run=audit,
