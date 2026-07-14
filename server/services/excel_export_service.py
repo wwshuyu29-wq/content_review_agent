@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+from datetime import datetime
+from io import BytesIO
+from typing import Any, Iterable, Optional
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from server.models import AuditRun, Batch, ContentItem, ContentVersion, Issue, ReviewTask
+from server.services.excel_import_service import IMPORT_COLUMNS
+
+EXPORT_COLUMNS = (
+    "系统内容编号",
+    "批次编号",
+    "格式校验",
+    "审核状态",
+    "发布状态",
+    "问题数量",
+    "最高风险等级",
+    "问题分类",
+    "命中规则",
+    "问题原因",
+    "原文证据",
+    "修改建议",
+    "最终标题",
+    "最终正文",
+    "最终版本来源",
+    "是否需要人工",
+    "是否已人工确认",
+    "审核模型",
+    "规则版本",
+    "审核完成时间",
+)
+
+_SEVERITY_RANK = {
+    "none": 0,
+    "low": 1,
+    "mid": 2,
+    "medium": 2,
+    "unknown": 3,
+    "high": 4,
+}
+_MANUAL_SEVERITIES = {"mid", "medium", "high", "unknown"}
+_LONG_TEXT_COLUMNS = {
+    "正文",
+    "问题分类",
+    "命中规则",
+    "问题原因",
+    "原文证据",
+    "修改建议",
+    "最终标题",
+    "最终正文",
+}
+
+
+def export_batch(session: Session, batch_id: int) -> bytes:
+    batch = session.scalar(
+        select(Batch)
+        .where(Batch.id == batch_id)
+        .options(
+            selectinload(Batch.content_items).selectinload(ContentItem.versions),
+            selectinload(Batch.content_items)
+            .selectinload(ContentItem.audit_runs)
+            .selectinload(AuditRun.issues),
+            selectinload(Batch.content_items)
+            .selectinload(ContentItem.audit_runs)
+            .selectinload(AuditRun.rule_version),
+            selectinload(Batch.content_items)
+            .selectinload(ContentItem.review_tasks)
+            .selectinload(ReviewTask.human_decisions),
+        )
+    )
+    if batch is None:
+        raise ValueError(f"Batch {batch_id} does not exist")
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "批次导出"
+    headers = list(IMPORT_COLUMNS) + list(EXPORT_COLUMNS)
+    worksheet.append(headers)
+
+    for item in sorted(batch.content_items, key=lambda content: content.id):
+        worksheet.append(_row_for_item(batch, item))
+
+    _style_worksheet(worksheet, headers)
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
+    supplier_version = _supplier_version(item)
+    latest_version = _latest_version(item)
+    payload = dict(supplier_version.payload) if supplier_version is not None else {}
+    latest_audit = _latest_audit(item)
+    issues = _sorted_issues(latest_audit.issues) if latest_audit is not None else []
+    tasks = _tasks_for_audit(item, latest_audit)
+
+    return [
+        _payload_value(payload, "supplier_external_id", default=item.external_id),
+        _payload_value(payload, "campaign_theme"),
+        _payload_value(payload, "platform"),
+        _payload_value(payload, "title", default=supplier_version.title if supplier_version is not None else item.title),
+        _payload_value(payload, "body", default=supplier_version.body if supplier_version is not None else ""),
+        _payload_value(payload, "image_filename"),
+        _payload_value(payload, "publish_time"),
+        _payload_value(payload, "note"),
+        item.id,
+        batch.id,
+        _enum_value(item.format_status),
+        _enum_value(item.review_status),
+        _enum_value(item.publish_status),
+        len(issues),
+        _highest_severity(issues),
+        _join_issue_field(issues, "category"),
+        _join_issue_field(issues, "rule_id"),
+        _join_issue_field(issues, "reason"),
+        _join_issue_field(issues, "evidence_quote"),
+        _join_issue_field(issues, "suggestion"),
+        latest_version.title if latest_version is not None else "",
+        latest_version.body if latest_version is not None else "",
+        latest_version.source if latest_version is not None else "",
+        _yes_no(_needs_human(issues, tasks)),
+        _yes_no(_human_confirmed(tasks)),
+        latest_audit.model if latest_audit is not None else "",
+        latest_audit.rule_version.version if latest_audit is not None and latest_audit.rule_version is not None else "",
+        _excel_datetime(latest_audit.completed_at if latest_audit is not None else None),
+    ]
+
+
+def _supplier_version(item: ContentItem) -> Optional[ContentVersion]:
+    if not item.versions:
+        return None
+    return min(item.versions, key=lambda version: version.version)
+
+
+def _latest_version(item: ContentItem) -> Optional[ContentVersion]:
+    if not item.versions:
+        return None
+    return max(item.versions, key=lambda version: version.version)
+
+
+def _latest_audit(item: ContentItem) -> Optional[AuditRun]:
+    if not item.audit_runs:
+        return None
+    return max(item.audit_runs, key=lambda audit: audit.id or 0)
+
+
+def _tasks_for_audit(item: ContentItem, audit: Optional[AuditRun]) -> list[ReviewTask]:
+    if audit is None:
+        return []
+    return sorted(
+        [task for task in item.review_tasks if task.audit_run_id == audit.id],
+        key=lambda task: task.id or 0,
+    )
+
+
+def _sorted_issues(issues: Iterable[Issue]) -> list[Issue]:
+    return sorted(issues, key=lambda issue: issue.id or 0)
+
+
+def _payload_value(payload: dict[str, Any], key: str, default: Any = "") -> Any:
+    value = payload.get(key, default)
+    return default if value is None else value
+
+
+def _enum_value(value: Any) -> str:
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def _join_issue_field(issues: list[Issue], field: str) -> str:
+    return "\n".join(str(getattr(issue, field) or "") for issue in issues)
+
+
+def _highest_severity(issues: list[Issue]) -> str:
+    if not issues:
+        return ""
+    return max(issues, key=lambda issue: _SEVERITY_RANK.get(issue.severity.lower(), 0)).severity
+
+
+def _needs_human(issues: list[Issue], tasks: list[ReviewTask]) -> bool:
+    if tasks:
+        return True
+    return any(issue.human_required or issue.severity.lower() in _MANUAL_SEVERITIES for issue in issues)
+
+
+def _human_confirmed(tasks: list[ReviewTask]) -> bool:
+    if not tasks or any(task.status == "OPEN" for task in tasks):
+        return False
+    return any(task.human_decisions for task in tasks)
+
+
+def _yes_no(value: bool) -> str:
+    return "是" if value else "否"
+
+
+def _excel_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    if value is not None and value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _style_worksheet(worksheet, headers: list[str]) -> None:
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    header_font = Font(bold=True)
+    wrap_top = Alignment(wrap_text=True, vertical="top")
+    for cell in worksheet[1]:
+        cell.font = header_font
+        cell.alignment = wrap_top
+
+    for row in worksheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = wrap_top
+
+    for index, header in enumerate(headers, start=1):
+        letter = get_column_letter(index)
+        if header in {"正文", "最终正文"}:
+            width = 48
+        elif header in _LONG_TEXT_COLUMNS:
+            width = 32
+        else:
+            width = max(12, min(24, len(header) + 6))
+        worksheet.column_dimensions[letter].width = width

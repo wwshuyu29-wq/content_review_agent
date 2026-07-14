@@ -100,6 +100,7 @@ class Batch(TimestampMixin, Base):
     supplier_id: Mapped[str] = mapped_column(String(200), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="SUBMITTED", nullable=False)
+    import_token: Mapped[Optional[str]] = mapped_column(String(128), unique=True)
 
     project: Mapped[Project] = relationship(back_populates="batches")
     content_items: Mapped[List["ContentItem"]] = relationship(

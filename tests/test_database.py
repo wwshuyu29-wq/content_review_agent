@@ -315,6 +315,7 @@ def test_workflow_identity_constraints_are_unique(tmp_path: Path) -> None:
     expected_unique_constraints = {
         "projects": {("name",)},
         "rule_versions": {("project_id", "version")},
+        "batches": {("import_token",)},
         "content_items": {("batch_id", "external_id")},
         "content_versions": {("content_item_id", "version")},
         "agent_results": {("audit_run_id", "agent_name")},

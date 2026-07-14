@@ -48,6 +48,14 @@ def _text(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _coerce_format_status(value: Any) -> FormatStatus:
+    if isinstance(value, FormatStatus):
+        return value
+    if isinstance(value, str):
+        return FormatStatus(value)
+    raise ValueError("format_status must be a valid FormatStatus value")
+
+
 def submit_batch(
     session: Session,
     *,
@@ -55,16 +63,28 @@ def submit_batch(
     supplier_id: str,
     name: str,
     contents: Sequence[Mapping[str, Any]],
+    format_status: FormatStatus | str | None = None,
+    import_token: str | None = None,
+    commit: bool = True,
 ) -> Batch:
     project = session.get(Project, project_id)
     if project is None:
         raise ValueError(f"Project {project_id} does not exist")
     if not supplier_id.strip() or not name.strip():
         raise ValueError("supplier_id and name are required")
+    normalized_import_token = import_token.strip() if import_token is not None else None
+    if import_token is not None and not normalized_import_token:
+        raise ValueError("import_token cannot be blank")
 
-    batch = Batch(project=project, supplier_id=supplier_id.strip(), name=name.strip())
+    batch = Batch(
+        project=project,
+        supplier_id=supplier_id.strip(),
+        name=name.strip(),
+        import_token=normalized_import_token,
+    )
     for content in contents:
-        status = _format_status(content)
+        explicit_status = content.get("format_status", format_status)
+        status = _coerce_format_status(explicit_status) if explicit_status is not None else _format_status(content)
         item = ContentItem(
             project=project,
             batch=batch,
@@ -84,6 +104,9 @@ def submit_batch(
         )
 
     session.add(batch)
-    session.commit()
-    session.refresh(batch)
+    if commit:
+        session.commit()
+        session.refresh(batch)
+    else:
+        session.flush()
     return batch

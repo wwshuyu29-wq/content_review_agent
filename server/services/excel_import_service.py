@@ -12,11 +12,15 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from secrets import token_urlsafe
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from openpyxl import Workbook, load_workbook
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from server.services.content_service import MAX_BODY_LENGTH, MAX_TITLE_LENGTH
+from server.models import Batch, FormatStatus
+from server.services.content_service import MAX_BODY_LENGTH, MAX_TITLE_LENGTH, submit_batch
 
 
 IMPORT_COLUMNS = (
@@ -188,8 +192,152 @@ def consume_preview(token: str) -> ImportPreview:
         shutil.rmtree(consumed_dir, ignore_errors=True)
 
 
+def confirm_import(
+    session: Session,
+    token: str,
+    project_id: int,
+    supplier_id: str,
+    batch_name: str,
+) -> Batch:
+    if not isinstance(token, str) or not _TOKEN_PATTERN.fullmatch(token):
+        raise ValueError("无效的导入 token")
+
+    existing = session.scalar(select(Batch).where(Batch.import_token == token))
+    if existing is not None:
+        return existing
+
+    location = _resolve_preview_location(token)
+    try:
+        preview, _ = _load_preview_manifest(location, token)
+    except _ExpiredPreviewError as exc:
+        _remove_preview(token, location)
+        raise ValueError("导入预览已过期") from exc
+
+    saved_paths: List[Path] = []
+    try:
+        contents = _build_confirm_contents(preview, location, saved_paths)
+        batch = submit_batch(
+            session,
+            project_id=project_id,
+            supplier_id=supplier_id,
+            name=batch_name,
+            contents=contents,
+            import_token=token,
+            commit=False,
+        )
+        session.commit()
+        session.refresh(batch)
+    except Exception:
+        session.rollback()
+        for path in saved_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+    _remove_preview(token, location)
+    return batch
+
+
 class _ExpiredPreviewError(ValueError):
     pass
+
+
+def _data_dir() -> Path:
+    return Path(os.environ.get("CR_DATA_DIR", str(Path(__file__).resolve().parents[2] / "data"))).resolve()
+
+
+def _uploads_dir() -> Path:
+    return _data_dir() / "uploads"
+
+
+def _build_confirm_contents(
+    preview: ImportPreview,
+    location: _PreviewLocation,
+    saved_paths: List[Path],
+) -> List[Dict[str, Any]]:
+    contents: List[Dict[str, Any]] = []
+    for row in preview.rows:
+        normalized = row.normalized
+        payload = _payload_for_row(preview.token, row)
+        media = _copy_preview_image(location, normalized.get("image_filename"), saved_paths)
+        if media is not None:
+            payload["media"] = media
+        contents.append(
+            {
+                "external_id": _external_id_for_row(preview.token, row),
+                "title": normalized.get("title") or "",
+                "body": normalized.get("body") or "",
+                "payload": payload,
+                "format_status": _format_status_for_row(row),
+            }
+        )
+    return contents
+
+
+def _payload_for_row(token: str, row: ImportRowPreview) -> Dict[str, Any]:
+    normalized = row.normalized
+    return {
+        "supplier_external_id": normalized.get("external_id"),
+        "campaign_theme": normalized.get("campaign_theme"),
+        "platform": normalized.get("platform"),
+        "title": normalized.get("title"),
+        "body": normalized.get("body"),
+        "image_filename": normalized.get("image_filename"),
+        "publish_time": normalized.get("publish_time"),
+        "note": normalized.get("note"),
+        "row_number": row.row_number,
+        "preview_errors": list(row.errors),
+        "preview_warnings": list(row.warnings),
+        "import_token": token,
+    }
+
+
+def _external_id_for_row(token: str, row: ImportRowPreview) -> str:
+    external_id = row.normalized.get("external_id")
+    if row.valid and external_id:
+        return external_id
+    return f"import:{token[:16]}:row:{row.row_number}"
+
+
+def _format_status_for_row(row: ImportRowPreview) -> FormatStatus:
+    if row.valid:
+        return FormatStatus.PASSED
+    required_values = (
+        row.normalized.get("external_id"),
+        row.normalized.get("campaign_theme"),
+        row.normalized.get("platform"),
+        row.normalized.get("title"),
+        row.normalized.get("body"),
+    )
+    if any(not value for value in required_values):
+        return FormatStatus.INCOMPLETE
+    return FormatStatus.INVALID
+
+
+def _copy_preview_image(
+    location: _PreviewLocation,
+    image_filename: Any,
+    saved_paths: List[Path],
+) -> Optional[str]:
+    if not isinstance(image_filename, str) or not _is_safe_basename(image_filename):
+        return None
+
+    image_dir = location.preview_dir / "images"
+    source = image_dir / image_filename
+    try:
+        resolved_image_dir = image_dir.resolve(strict=True)
+        resolved_source = source.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        return None
+    if resolved_source.parent != resolved_image_dir or not resolved_source.is_file():
+        return None
+
+    suffix = Path(image_filename).suffix.lower()
+    destination = _uploads_dir() / f"{uuid4().hex}{suffix}"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_source.open("rb") as input_stream, destination.open("xb") as output_stream:
+        shutil.copyfileobj(input_stream, output_stream)
+    saved_paths.append(destination)
+    return destination.name
 
 
 def _resolve_preview_location(token: str) -> _PreviewLocation:
