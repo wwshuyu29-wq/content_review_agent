@@ -38,6 +38,21 @@ def create_db_engine(database_url: Optional[str] = None) -> Engine:
     return engine
 
 
+def _raise_duplicate_groups(connection, table: str, columns: tuple[str, ...]) -> None:
+    selected = ", ".join(columns)
+    where = " AND ".join(f"{column} IS NOT NULL" for column in columns)
+    rows = connection.exec_driver_sql(
+        f"SELECT {selected}, COUNT(*) AS duplicate_count FROM {table} "
+        f"WHERE {where} GROUP BY {selected} HAVING COUNT(*) > 1"
+    ).all()
+    if rows:
+        values = [dict(zip((*columns, "duplicate_count"), row)) for row in rows]
+        raise ValueError(
+            f"Cannot create unique index for {table}({', '.join(columns)}); "
+            f"duplicate non-null values exist: {values}. Resolve duplicates without deleting history."
+        )
+
+
 def ensure_schema_upgrades(engine: Engine) -> None:
     Base.metadata.create_all(engine)
     database_inspector = inspect(engine)
@@ -56,6 +71,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN code VARCHAR(200)")
             if "content_type" not in project_columns:
                 connection.exec_driver_sql("ALTER TABLE projects ADD COLUMN content_type VARCHAR(100)")
+            _raise_duplicate_groups(connection, "projects", ("code",))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_projects_code_unique ON projects (code)"
             )
@@ -71,6 +87,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             ):
                 if column not in rule_columns:
                     connection.exec_driver_sql(f"ALTER TABLE rule_versions ADD COLUMN {column} {sql_type}")
+            _raise_duplicate_groups(connection, "rule_versions", ("project_id", "package_version"))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_rule_versions_project_package_version "
                 "ON rule_versions (project_id, package_version)"
@@ -103,6 +120,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             connection.exec_driver_sql(
                 "UPDATE agent_results SET score = 0 WHERE score IS NULL"
             )
+            _raise_duplicate_groups(connection, "agent_results", ("audit_run_id", "agent_id", "agent_version"))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_results_audit_agent_version "
                 "ON agent_results (audit_run_id, agent_id, agent_version)"
@@ -116,6 +134,15 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_audit_runs_review_key "
                 "ON audit_runs (review_key)"
             )
+        if "review_tasks" in table_names:
+            task_columns = {column["name"] for column in database_inspector.get_columns("review_tasks")}
+            if "task_key" not in task_columns:
+                connection.exec_driver_sql("ALTER TABLE review_tasks ADD COLUMN task_key VARCHAR(300)")
+            _raise_duplicate_groups(connection, "review_tasks", ("task_key",))
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_review_tasks_task_key ON review_tasks (task_key)"
+            )
+
         if "issues" in table_names:
             issue_columns = {column["name"] for column in database_inspector.get_columns("issues")}
             if "source_reference" not in issue_columns:
@@ -139,6 +166,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
         if not has_import_token:
             connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN import_token VARCHAR(128)")
         if not has_unique_import_token:
+            _raise_duplicate_groups(connection, "batches", ("import_token",))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_batches_import_token_unique "
                 "ON batches (import_token)"

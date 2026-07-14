@@ -5,7 +5,7 @@ from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from server.db import Base, create_db_engine
-from server.models import Asset, ContentVersion, ReviewStatus, TestCase as EvidenceTestCase
+from server.models import Asset, AuditRun, ContentVersion, Issue, ReviewStatus, RuleVersion, TestCase as EvidenceTestCase
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
 from server.services.evidence_service import attach_evidence, create_asset, create_test_case, list_content_test_cases
@@ -100,11 +100,13 @@ def test_arbiter_routes_required_outcomes():
     assert arbitrate_review([], [issue("EVIDENCE", "HIGH", human_required=True)]).review_status == ReviewStatus.HUMAN_REVIEW_REQUIRED
     assert arbitrate_review([], [issue("CLAIM", "CRITICAL")]).review_status == ReviewStatus.BLOCKED
     assert arbitrate_review([], [issue("TEXT", "MEDIUM")]).review_status == ReviewStatus.SUPPLIER_REVISION_REQUIRED
-    low = issue("BRAND-REPLACE-001", "LOW", auto_fixable=True, category="brand")
-    result = arbitrate_review([], [low])
+    low = issue("BRAND-REPLACE-001", "LOW", auto_fixable=True, category="brand", agent_result_id=None)
+    result = arbitrate_review([], [low], safe_auto_fix_rule_ids={"BRAND-REPLACE-001"})
     assert result.review_status == ReviewStatus.AUTO_FIX_PENDING
     assert result.ai_proposal_allowed is True
-    assert arbitrate_review([], [], campaign_score=45, suggestions=["优化开头"]).review_status == ReviewStatus.PASSED_WITH_SUGGESTIONS
+    assert arbitrate_review([{"agent_id": agent_id, "decision": "PASS"} for agent_id in (
+        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+    )], [], campaign_score=45, suggestions=["优化开头"]).review_status == ReviewStatus.PASSED_WITH_SUGGESTIONS
     assert arbitrate_review([{"decision": "PASS"}], []).review_status == ReviewStatus.HUMAN_REVIEW_REQUIRED
     assert arbitrate_review([{"agent_id": agent_id, "decision": "PASS"} for agent_id in (
         "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
@@ -146,3 +148,95 @@ def test_numeric_or_claim_low_issue_never_allows_ai_proposal():
         result = arbitrate_review([], [candidate])
         assert result.review_status is not ReviewStatus.AUTO_FIX_PENDING
         assert result.ai_proposal_allowed is False
+
+
+def test_empty_tech_protocol_never_passes():
+    result = arbitrate_review([], [])
+    assert result.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+    assert result.publish_status.value == "NOT_READY"
+    assert result.task_specs[0].task_type == "HUMAN_REVIEW"
+
+
+def test_only_trusted_deterministic_replacement_can_auto_fix():
+    approved = issue("BRAND-REPLACE-001", "LOW", auto_fixable=True, agent_result_id=None)
+    agent_issue = issue("BRAND-REPLACE-001", "LOW", auto_fixable=True, agent_result_id=42)
+    assert arbitrate_review([], [approved], safe_auto_fix_rule_ids={"BRAND-REPLACE-001"}).review_status is ReviewStatus.AUTO_FIX_PENDING
+    assert arbitrate_review([], [agent_issue], safe_auto_fix_rule_ids={"BRAND-REPLACE-001"}).review_status is not ReviewStatus.AUTO_FIX_PENDING
+    assert arbitrate_review([], [approved], safe_auto_fix_rule_ids={"OTHER"}).review_status is not ReviewStatus.AUTO_FIX_PENDING
+
+
+def test_new_version_with_copied_payload_does_not_use_old_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from server.services import review_service
+
+    with make_session(tmp_path) as session:
+        item, version = make_content(session)
+        asset = create_asset(session, item.id, asset_id="old-asset", kind="SCREENSHOT", filename="old.png")
+        case = create_test_case(
+            session, item.id, version.id, external_test_case_id="OLD", claim="old claim",
+            command="old command", observed_result="old result",
+        )
+        attach_evidence(session, case.id, asset.id)
+        copied_payload = {"test_cases": [{"test_case_id": "OLD", "command": "payload", "observed_result": "payload"}], "evidence_assets": [{"asset_id": "old-asset"}]}
+        version = ContentVersion(
+            content_item=item, version=2, source="AI_PROPOSED", title="标题", body="正文",
+            payload=copied_payload,
+        )
+        session.add(version)
+        session.flush()
+        captured = {}
+        monkeypatch.setattr(review_service, "evaluate_rules", lambda profile, context: captured.setdefault("context", context) and [])
+        review_service.run_audit(session, item.id)
+        assert captured["context"].test_cases == []
+        assert captured["context"].evidence_assets == []
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+
+
+def test_task_key_reuses_task_and_links_all_issues(tmp_path: Path):
+    from server.services.review_service import _create_or_reuse_task
+    from server.models import ReviewTask
+
+    with make_session(tmp_path) as session:
+        item, version = make_content(session)
+        audit = AuditRun(
+            content_item=item, content_version=version, rule_version=item.project.current_rule_version,
+            model="test", prompt_version="test",
+        )
+        session.add(audit)
+        session.flush()
+        issues = [Issue(
+            audit_run=audit, rule_id=f"R-{index}", category="accuracy", severity="HIGH", field="body",
+            evidence_quote=f"quote-{index}", reason="reason", suggestion="suggestion",
+            human_required=True, auto_fixable=False, confidence=0.9,
+        ) for index in (1, 2)]
+        session.add_all(issues)
+        session.flush()
+        first = _create_or_reuse_task(
+            session, item=item, target=version, audit=audit, task_type="HUMAN_REVIEW", issues=issues,
+        )
+        second = _create_or_reuse_task(
+            session, item=item, target=version, audit=audit, task_type="HUMAN_REVIEW", issues=issues,
+        )
+        assert first.id == second.id
+        assert first.task_key
+        assert {issue.id for issue in first.issues} == {issue.id for issue in issues}
+        assert session.query(ReviewTask).count() == 1
+
+
+def test_trusted_proposal_ignores_tampered_issue_suggestion(tmp_path: Path):
+    from server.services.review_profile_service import get_review_profile
+    from server.services.review_service import _safe_proposal
+
+    with make_session(tmp_path) as session:
+        item, _ = make_content(session)
+        profile = get_review_profile(item.project.current_rule_version)
+        with pytest.raises(TypeError):
+            profile.safe_replacement_map["REPLACE-001"]["最优解"] = "tampered"
+        version = ContentVersion(content_item_id=item.id, version=2, source="TEST", title="标题", body="正文最优解")
+        finding = Issue(
+            rule_id="REPLACE-001", category="brand", severity="LOW", field="body",
+            evidence_quote="最优解", reason="replacement", suggestion="恶意改写",
+            auto_fixable=True, confidence=1.0,
+        )
+        assert _safe_proposal(version, [finding], profile.safe_replacement_map) == (
+            version.title, version.body.replace("最优解", "一种可行方案")
+        )

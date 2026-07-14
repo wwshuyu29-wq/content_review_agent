@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 from typing import Any, Mapping, Optional
 
 from sqlalchemy import select
@@ -20,6 +22,7 @@ from server.models import (
     PublishStatus,
     ReviewStatus,
     ReviewTask,
+    ReviewTaskIssue,
     RuleVersion,
 )
 from server.services.content_service import validate_content_format
@@ -147,6 +150,13 @@ def _latest_version(item: ContentItem) -> ContentVersion:
     return item.versions[-1]
 
 
+def sanitize_version_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    sanitized = dict(payload)
+    for key in ("test_cases", "evidence", "evidence_assets"):
+        sanitized.pop(key, None)
+    return sanitized
+
+
 def _new_version(item: ContentItem, *, source: str, title: str, body: str, payload: Mapping[str, Any]) -> ContentVersion:
     title, body = validate_content_format(title, body)
     version = ContentVersion(
@@ -155,7 +165,7 @@ def _new_version(item: ContentItem, *, source: str, title: str, body: str, paylo
         source=source,
         title=title,
         body=body,
-        payload=dict(payload),
+        payload=sanitize_version_payload(payload),
     )
     item.title = title
     return version
@@ -163,6 +173,54 @@ def _new_version(item: ContentItem, *, source: str, title: str, body: str, paylo
 
 def _open_tasks(item: ContentItem) -> list[ReviewTask]:
     return [task for task in item.review_tasks if task.status == "OPEN"]
+
+
+def _task_key(audit_run_id: int, target_content_version_id: int, task_type: str, issues: list[Issue]) -> str:
+    issue_ids = sorted(issue.id for issue in issues if issue.id is not None)
+    raw = json.dumps(
+        [audit_run_id, target_content_version_id, task_type, issue_ids],
+        separators=(",", ":"),
+    )
+    return "v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _create_or_reuse_task(
+    session: Session,
+    *,
+    item: ContentItem,
+    target: ContentVersion,
+    audit: AuditRun,
+    task_type: str,
+    issues: list[Issue],
+) -> ReviewTask:
+    session.flush()
+    task_key = _task_key(audit.id, target.id, task_type, issues)
+    task = session.scalar(select(ReviewTask).where(ReviewTask.task_key == task_key))
+    if task is None:
+        legacy_issue_id = None
+        for issue in issues:
+            if issue.id is None:
+                continue
+            if session.scalar(select(ReviewTask).where(ReviewTask.issue_id == issue.id)) is None:
+                legacy_issue_id = issue.id
+                break
+        task = ReviewTask(
+            content_item=item,
+            target_content_version=target,
+            audit_run=audit,
+            issue_id=legacy_issue_id,
+            task_key=task_key,
+            task_type=task_type,
+        )
+        session.add(task)
+        session.flush()
+    existing_issue_ids = {link.issue_id for link in task.issue_links}
+    for issue in issues:
+        if issue.id is None or issue.id in existing_issue_ids:
+            continue
+        session.add(ReviewTaskIssue(review_task=task, issue=issue))
+    session.flush()
+    return task
 
 
 def _derive_state(item: ContentItem, *, clear_status: Optional[ReviewStatus] = None) -> None:
@@ -194,16 +252,24 @@ def _derive_state(item: ContentItem, *, clear_status: Optional[ReviewStatus] = N
         item.publish_status = PublishStatus.NOT_READY
 
 
-def _safe_proposal(content_version: ContentVersion, issues: list[Issue]) -> Optional[tuple[str, str]]:
+def _safe_proposal(
+    content_version: ContentVersion,
+    issues: list[Issue],
+    safe_replacement_map: Mapping[str, Mapping[str, str]],
+) -> Optional[tuple[str, str]]:
     title, body = content_version.title, content_version.body
     changed = False
     for issue in issues:
-        if not issue.evidence_quote or not issue.suggestion or issue.field not in {"title", "body"}:
+        if issue.agent_result_id is not None or issue.field not in {"title", "body"}:
+            continue
+        replacements = safe_replacement_map.get(issue.rule_id, {})
+        replacement = replacements.get(issue.evidence_quote)
+        if replacement is None:
             continue
         source = title if issue.field == "title" else body
         if issue.evidence_quote not in source:
             continue
-        updated = source.replace(issue.evidence_quote, issue.suggestion)
+        updated = source.replace(issue.evidence_quote, replacement)
         if updated != source:
             changed = True
             if issue.field == "title":
@@ -340,7 +406,16 @@ def run_audit(
     database_test_cases = list_content_test_cases(
         session, item.id, content_version_id=content_version.id
     )
-    if database_test_cases:
+    if item.project.content_type == "TECH_MEDIA_REVIEW":
+        context_test_cases = database_test_cases
+        context_evidence_assets = [
+            asset for test_case in database_test_cases for asset in test_case["evidence_assets"]
+        ]
+        context_evidence = [
+            {"test_case_id": test_case["test_case_id"], "asset_id": asset["asset_id"]}
+            for test_case in database_test_cases for asset in test_case["evidence_assets"]
+        ]
+    elif database_test_cases:
         context_test_cases = database_test_cases
         context_evidence_assets = [
             asset for test_case in database_test_cases for asset in test_case["evidence_assets"]
@@ -466,10 +541,11 @@ def run_audit(
             issue.suggestion for issue in persisted_issues
             if issue.severity.upper() == "LOW" and issue.suggestion
         ],
+        safe_auto_fix_rule_ids=set(profile.safe_replacement_map),
     )
 
     if arbitration.ai_proposal_allowed:
-        proposed_text = _safe_proposal(content_version, persisted_issues)
+        proposed_text = _safe_proposal(content_version, persisted_issues, profile.safe_replacement_map)
         if proposed_text is None:
             arbitration = ArbitrationResult(
                 ReviewStatus.HUMAN_REVIEW_REQUIRED,
@@ -487,28 +563,25 @@ def run_audit(
             )
             session.add(proposed)
             session.flush()
-            session.add(ReviewTask(
-                content_item=item,
-                target_content_version=proposed,
-                audit_run=audit,
-                issue=next(iter(persisted_issues), None),
-                task_type="AUTO_FIX_PROPOSAL",
-            ))
+            _create_or_reuse_task(
+                session, item=item, target=proposed, audit=audit,
+                task_type="AUTO_FIX_PROPOSAL", issues=persisted_issues,
+            )
 
     if not arbitration.ai_proposal_allowed:
-        task_issue_by_rule = {issue.rule_id: issue for issue in persisted_issues}
+        task_issues: dict[str, list[Issue]] = {}
+        for issue in persisted_issues:
+            task_issues.setdefault(issue.rule_id, []).append(issue)
         for task_spec in arbitration.task_specs:
-            linked_issue = next(
-                (task_issue_by_rule[key] for key in task_spec.issue_keys if key in task_issue_by_rule),
-                next(iter(persisted_issues), None),
+            applicable = [
+                issue for key in task_spec.issue_keys for issue in task_issues.get(key, [])
+            ]
+            if not applicable and persisted_issues:
+                applicable = list(persisted_issues)
+            _create_or_reuse_task(
+                session, item=item, target=content_version, audit=audit,
+                task_type=task_spec.task_type, issues=applicable,
             )
-            session.add(ReviewTask(
-                content_item=item,
-                target_content_version=content_version,
-                audit_run=audit,
-                issue=linked_issue,
-                task_type=task_spec.task_type,
-            ))
     session.flush()
     item.review_status = arbitration.review_status
     item.publish_status = (
@@ -574,12 +647,10 @@ def resolve_task(
         ))
         clear_status = ReviewStatus.PASSED
     elif decision in {"REJECT_AUTO_FIX", "REJECT_SUGGESTION"}:
-        session.add(ReviewTask(
-            content_item=item,
-            target_content_version=task.audit_run.content_version,
-            audit_run=task.audit_run,
-            task_type="SUPPLIER_REVISION",
-        ))
+        _create_or_reuse_task(
+            session, item=item, target=task.audit_run.content_version,
+            audit=task.audit_run, task_type="SUPPLIER_REVISION", issues=list(task.issues),
+        )
     elif decision in {"HUMAN_APPROVE", "APPROVE_RISK"}:
         if "title" in payload or "body" in payload:
             title = payload.get("title", target.title)

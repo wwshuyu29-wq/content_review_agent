@@ -32,12 +32,7 @@ class FakeReviewer:
                 "summary": "api test",
                 "score": 90,
                 "status": "COMPLETED",
-                "issues": [{
-                    "rule_id": "QUALITY-API-001", "category": "quality", "severity": "low",
-                    "field": "body", "evidence_quote": "！！！", "reason": "重复标点",
-                    "suggestion": "！", "source_reference": ["content_quality.md"],
-                    "auto_fixable": True, "human_required": False, "confidence": 0.98,
-                }] if agent_id == "CONTENT_QUALITY" else [],
+                "issues": [],
                 "raw_result": {"source": "fake"},
             }
             for agent_id in agent_ids
@@ -114,7 +109,7 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
         {
             "external_id": "supplier-content-1",
             "title": "原始标题",
-            "body": "原始正文！！！",
+            "body": "原始正文最优解",
             "payload": {"platform": "小红书"},
         }
     ]
@@ -152,9 +147,10 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     assert content["review_status"] == "AUTO_FIX_PENDING"
     assert [version["source"] for version in content["versions"]] == ["SUPPLIER", "AI_PROPOSED"]
     assert content["latest_audit"]["agent_results"][0]["raw_result"] == {"source": "fake"}
-    assert content["latest_audit"]["issues"][0]["rule_id"] == "QUALITY-API-001"
+    assert content["latest_audit"]["issues"][0]["rule_id"] == "REPLACE-001"
     task = content["open_tasks"][0]
     assert task["task_type"] == "AUTO_FIX_PROPOSAL"
+    assert task["issue_ids"]
 
     tasks = client.get("/api/review-tasks", params={"status": "OPEN", "project_id": project["id"]})
     assert tasks.status_code == 200

@@ -308,6 +308,24 @@ class Issue(TimestampMixin, Base):
     audit_run: Mapped[AuditRun] = relationship(back_populates="issues")
     agent_result: Mapped[Optional[AgentResult]] = relationship(back_populates="issues")
     review_task: Mapped[Optional["ReviewTask"]] = relationship(back_populates="issue", uselist=False)
+    task_links: Mapped[List["ReviewTaskIssue"]] = relationship(
+        back_populates="issue", cascade="all, delete-orphan"
+    )
+    review_tasks: Mapped[List["ReviewTask"]] = relationship(
+        secondary="review_task_issues", back_populates="issues", viewonly=True
+    )
+
+
+class ReviewTaskIssue(TimestampMixin, Base):
+    __tablename__ = "review_task_issues"
+    __table_args__ = (UniqueConstraint("review_task_id", "issue_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_task_id: Mapped[int] = mapped_column(ForeignKey("review_tasks.id"), index=True, nullable=False)
+    issue_id: Mapped[int] = mapped_column(ForeignKey("issues.id"), index=True, nullable=False)
+
+    review_task: Mapped["ReviewTask"] = relationship(back_populates="issue_links")
+    issue: Mapped[Issue] = relationship(back_populates="task_links")
 
 
 class ReviewTask(TimestampMixin, Base):
@@ -320,6 +338,7 @@ class ReviewTask(TimestampMixin, Base):
     )
     audit_run_id: Mapped[int] = mapped_column(ForeignKey("audit_runs.id"), index=True, nullable=False)
     issue_id: Mapped[Optional[int]] = mapped_column(ForeignKey("issues.id"), unique=True)
+    task_key: Mapped[Optional[str]] = mapped_column(String(300), unique=True, index=True)
     task_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="OPEN", nullable=False)
     assigned_to: Mapped[Optional[str]] = mapped_column(String(200))
@@ -329,9 +348,22 @@ class ReviewTask(TimestampMixin, Base):
     target_content_version: Mapped[ContentVersion] = relationship(back_populates="review_tasks")
     audit_run: Mapped[AuditRun] = relationship(back_populates="review_tasks")
     issue: Mapped[Optional[Issue]] = relationship(back_populates="review_task")
+    issue_links: Mapped[List[ReviewTaskIssue]] = relationship(
+        back_populates="review_task", cascade="all, delete-orphan"
+    )
+    issues: Mapped[List[Issue]] = relationship(
+        secondary="review_task_issues", back_populates="review_tasks", viewonly=True
+    )
     human_decisions: Mapped[List["HumanDecision"]] = relationship(
         back_populates="review_task", cascade="all, delete-orphan"
     )
+
+    @property
+    def issue_ids(self) -> list[int]:
+        ids = {issue.id for issue in self.issues}
+        if self.issue_id is not None:
+            ids.add(self.issue_id)
+        return sorted(ids)
 
 
 class HumanDecision(TimestampMixin, Base):

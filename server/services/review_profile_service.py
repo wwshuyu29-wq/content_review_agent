@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any, Mapping, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,6 +38,7 @@ class ReviewProfile(BaseModel):
     known_source_references: Tuple[str, ...] = ()
     platform_requirements: Mapping[str, Mapping[str, Any]] = Field(default_factory=dict)
     replacement_rules: Tuple[Mapping[str, Any], ...] = ()
+    safe_replacement_map: Mapping[str, Mapping[str, str]] = Field(default_factory=dict)
     platform_aliases: Mapping[str, str] = Field(default_factory=dict)
 
 
@@ -103,6 +105,18 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         )
         for replacement in replacements
     )
+    safe_replacements: dict[str, dict[str, str]] = {}
+    for rule in rules:
+        if rule.matcher == "replacement_map" and rule.severity.upper() == "LOW" and rule.auto_fixable:
+            replacement_map = rule.model_extra.get("replacement_map", {})
+            if isinstance(replacement_map, dict) and all(
+                isinstance(source, str) and isinstance(target, str) for source, target in replacement_map.items()
+            ):
+                safe_replacements[rule.rule_id] = dict(replacement_map)
+    for replacement in replacements:
+        source, target = replacement.get("from"), replacement.get("to")
+        if isinstance(source, str) and isinstance(target, str):
+            safe_replacements[replacement["replacement_id"]] = {source: target}
     platform_requirements = structured.get("platform_requirements", {})
     approved_claims = tuple(structured.get("approved_claims", []))
     pending_claims = tuple(structured.get("pending_claims", []))
@@ -126,7 +140,7 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
             if alias in aliases and aliases[alias] != canonical:
                 raise ValueError(f"duplicate platform alias: {alias}")
             aliases[alias] = canonical
-    return ReviewProfile(
+    profile = ReviewProfile(
         business_domain=expected["business_domain"],
         document_type=expected["document_type"],
         project_code=expected["project_code"],
@@ -142,5 +156,15 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         known_source_references=tuple(sorted(known_references)),
         platform_requirements=platform_requirements,
         replacement_rules=replacements,
+        safe_replacement_map=safe_replacements,
         platform_aliases=aliases,
     )
+    object.__setattr__(
+        profile,
+        "safe_replacement_map",
+        MappingProxyType({
+            rule_id: MappingProxyType(dict(replacements_for_rule))
+            for rule_id, replacements_for_rule in safe_replacements.items()
+        }),
+    )
+    return profile

@@ -235,6 +235,8 @@ class ReviewTaskRead(OrmSchema):
     target_content_version_id: int
     audit_run_id: int
     issue_id: Optional[int]
+    issue_ids: List[int] = Field(default_factory=list)
+    task_key: Optional[str]
     task_type: str
     status: str
     assigned_to: Optional[str]

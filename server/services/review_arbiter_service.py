@@ -52,20 +52,16 @@ def _protocol_valid(agent_results: Sequence[Any]) -> bool:
     return True
 
 
-def _is_safe_auto_fix(issue: Any) -> bool:
-    if str(_value(issue, "severity", "")).upper() != "LOW" or not bool(_value(issue, "auto_fixable", False)):
-        return False
-    text = " ".join(str(_value(issue, key, "")) for key in ("rule_id", "category", "field", "reason")).upper()
-    forbidden = {"EVIDENCE", "TEST", "RESULT", "CLAIM", "FACT", "FUNCTION", "FEATURE", "NUMBER", "DIGIT", "COUNT"}
-    if any(token in text for token in forbidden):
-        return False
-    if any(character.isdigit() for character in str(_value(issue, "evidence_quote", "")) + str(_value(issue, "suggestion", ""))):
-        return False
-    allowed = {"BRAND", "REPLACE", "QUALITY", "TEXT", "TYPO", "PUNCT", "SPELL", "WORDING", "ABSOLUTE"}
-    return any(token in text for token in allowed)
+def _is_safe_auto_fix(issue: Any, safe_auto_fix_rule_ids: set[str]) -> bool:
+    return (
+        str(_value(issue, "severity", "")).upper() == "LOW"
+        and bool(_value(issue, "auto_fixable", False))
+        and _value(issue, "agent_result_id", object()) is None
+        and _issue_key(issue) in safe_auto_fix_rule_ids
+    )
 
 
-def _needs_human(issue: Any) -> bool:
+def _needs_human(issue: Any, safe_auto_fix_rule_ids: set[str]) -> bool:
     severity = str(_value(issue, "severity", "")).upper()
     text = " ".join(str(_value(issue, key, "")) for key in ("rule_id", "category", "reason")).upper()
     return (
@@ -75,7 +71,7 @@ def _needs_human(issue: Any) -> bool:
         or "UNAVAILABLE" in text
         or "PENDING" in text
         or (any(token in text for token in ("EVIDENCE", "CLAIM", "FACT", "FUNCTION", "FEATURE", "NUMBER", "TEST_RESULT"))
-            and not _is_safe_auto_fix(issue))
+            and not _is_safe_auto_fix(issue, safe_auto_fix_rule_ids))
     )
 
 
@@ -85,11 +81,19 @@ def arbitrate_review(
     *,
     campaign_score: Optional[int] = None,
     suggestions: Optional[Sequence[str]] = None,
+    safe_auto_fix_rule_ids: Optional[set[str]] = None,
 ) -> ArbitrationResult:
+    safe_auto_fix_rule_ids = set(safe_auto_fix_rule_ids or set())
     agent_results = list(agent_results or [])
     issues = list(deterministic_issues or [])
     for result in agent_results:
         issues.extend(list(_value(result, "issues", []) or []))
+
+    if not agent_results and not issues:
+        return ArbitrationResult(
+            ReviewStatus.HUMAN_REVIEW_REQUIRED, PublishStatus.NOT_READY,
+            (_task("HUMAN_REVIEW", issues),), reason="missing agent protocol",
+        )
 
     if not _protocol_valid(agent_results):
         return ArbitrationResult(
@@ -105,7 +109,7 @@ def arbitrate_review(
             (_task("BLOCK_REVIEW", critical or issues),), reason="critical issue or explicit BLOCK",
         )
 
-    human = [issue for issue in issues if _needs_human(issue)]
+    human = [issue for issue in issues if _needs_human(issue, safe_auto_fix_rule_ids)]
     if human or any(decision == "HUMAN_REVIEW" for decision in decisions):
         return ArbitrationResult(
             ReviewStatus.HUMAN_REVIEW_REQUIRED, PublishStatus.NOT_READY,
@@ -120,7 +124,7 @@ def arbitrate_review(
         )
 
     low = [issue for issue in issues if str(_value(issue, "severity", "")).upper() == "LOW"]
-    if low and all(_is_safe_auto_fix(issue) for issue in low):
+    if low and all(_is_safe_auto_fix(issue, safe_auto_fix_rule_ids) for issue in low):
         return ArbitrationResult(
             ReviewStatus.AUTO_FIX_PENDING, PublishStatus.NOT_READY,
             (_task("AUTO_FIX_PROPOSAL", low),), ai_proposal_allowed=True,

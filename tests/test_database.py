@@ -161,6 +161,7 @@ def test_create_all_defines_every_workflow_table(tmp_path: Path) -> None:
         "issues",
         "projects",
         "review_tasks",
+        "review_task_issues",
         "rule_versions",
         "test_cases",
         "test_evidence",
@@ -671,3 +672,56 @@ def test_schema_upgrade_maps_legacy_review_statuses_and_preserves_rejected(tmp_p
             "SELECT review_status FROM content_items ORDER BY external_id"
         ).scalars().all()
     assert values == ["HUMAN_REVIEW_REQUIRED", "AUTO_FIX_PENDING", "PASSED", "REJECTED"]
+
+
+def test_schema_upgrade_reports_duplicate_project_codes_before_unique_index(tmp_path: Path) -> None:
+    import server.db as db_module
+    engine = make_sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, name VARCHAR(200) NOT NULL, code VARCHAR(200), "
+            "content_type VARCHAR(100), description TEXT, current_rule_version_id INTEGER, "
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO projects (id,name,code,created_at,updated_at) VALUES "
+            "(1,'one','duplicate',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
+            "(2,'two','duplicate',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+        )
+    with pytest.raises(ValueError, match=r"projects.*code.*duplicate"):
+        db_module.ensure_schema_upgrades(engine)
+
+
+def test_schema_upgrade_reports_duplicate_rule_package_versions(tmp_path: Path) -> None:
+    import server.db as db_module
+    engine = make_sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE rule_versions (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, version INTEGER NOT NULL, "
+            "package_version VARCHAR(50), prompt_version VARCHAR(100) NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO rule_versions (id,project_id,version,package_version,prompt_version,created_at,updated_at) VALUES "
+            "(1,1,1,'0.9','p',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
+            "(2,1,2,'0.9','p',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+        )
+    with pytest.raises(ValueError, match=r"rule_versions.*project_id.*package_version"):
+        db_module.ensure_schema_upgrades(engine)
+
+
+def test_schema_upgrade_reports_duplicate_agent_identity(tmp_path: Path) -> None:
+    import server.db as db_module
+    engine = make_sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE agent_results (id INTEGER PRIMARY KEY, audit_run_id INTEGER NOT NULL, agent_name VARCHAR(100) NOT NULL, "
+            "agent_id VARCHAR(100), agent_version VARCHAR(100), status VARCHAR(50) NOT NULL, raw_result JSON NOT NULL, "
+            "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO agent_results (id,audit_run_id,agent_name,agent_id,agent_version,status,raw_result,created_at,updated_at) VALUES "
+            "(1,1,'a','A','v1','DONE','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),"
+            "(2,1,'b','A','v1','DONE','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+        )
+    with pytest.raises(ValueError, match=r"agent_results.*audit_run_id.*agent_id.*agent_version"):
+        db_module.ensure_schema_upgrades(engine)
