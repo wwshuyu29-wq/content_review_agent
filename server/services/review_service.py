@@ -132,6 +132,10 @@ def _validate_agent_protocol(results: list[dict], profile: Any) -> Optional[str]
     return None
 
 
+def _review_key(content_version_id: int, rule_version_id: int) -> str:
+    return f"v1:{content_version_id}:{rule_version_id}"
+
+
 def _latest_version(item: ContentItem) -> ContentVersion:
     if not item.versions:
         raise ValueError(f"Content item {item.id} has no versions")
@@ -263,12 +267,19 @@ def run_audit(
         raise ValueError("Project has no current rule version")
     validate_rule_version_identity(item.project, rule_version)
     content_version = _latest_version(item)
-    existing_audit = session.scalar(
-        select(AuditRun).where(
-            AuditRun.content_version_id == content_version.id,
-            AuditRun.rule_version_id == rule_version.id,
-        )
-    )
+    review_key = None
+    if item.project.content_type == "TECH_MEDIA_REVIEW":
+        review_key = _review_key(content_version.id, rule_version.id)
+    existing_audit = None
+    if review_key is not None:
+        existing_audit = session.scalar(select(AuditRun).where(AuditRun.review_key == review_key))
+        if existing_audit is None:
+            existing_audit = session.scalar(
+                select(AuditRun).where(
+                    AuditRun.content_version_id == content_version.id,
+                    AuditRun.rule_version_id == rule_version.id,
+                )
+            )
     if existing_audit is not None:
         raise ValueError("Content version has already been audited with this rule version")
     standards = _standards_from_rule_version(rule_version)
@@ -284,6 +295,7 @@ def run_audit(
         content_item=item,
         content_version=content_version,
         rule_version=rule_version,
+        review_key=review_key,
         model=model or getattr(reviewer, "name", reviewer.__class__.__name__),
         prompt_version=rule_version.prompt_version,
         status="RUNNING",

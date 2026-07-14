@@ -219,6 +219,53 @@ def test_schema_upgrade_adds_import_token_to_legacy_batches_and_confirm_import_w
         assert session.scalar(select(Batch).where(Batch.import_token == preview.token)) is batch
 
 
+def test_legacy_duplicate_audits_survive_review_key_upgrade(tmp_path: Path) -> None:
+    import server.db as db_module
+
+    engine = make_sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE audit_runs (
+                id INTEGER PRIMARY KEY,
+                content_item_id INTEGER NOT NULL,
+                content_version_id INTEGER NOT NULL,
+                rule_version_id INTEGER NOT NULL,
+                model VARCHAR(200) NOT NULL,
+                prompt_version VARCHAR(100) NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                completed_at DATETIME,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO audit_runs VALUES "
+            "(1, 10, 20, 30, 'legacy', 'v1', 'COMPLETED', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),"
+            "(2, 10, 20, 30, 'legacy', 'v1', 'COMPLETED', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+
+    db_module.ensure_schema_upgrades(engine)
+
+    with engine.begin() as connection:
+        rows = connection.exec_driver_sql(
+            "SELECT id, review_key FROM audit_runs ORDER BY id"
+        ).all()
+        assert rows == [(1, None), (2, None)]
+        connection.exec_driver_sql(
+            "INSERT INTO audit_runs "
+            "(id, content_item_id, content_version_id, rule_version_id, model, prompt_version, status, created_at, updated_at, review_key) "
+            "VALUES (3, 10, 21, 31, 'tech', 'v1', 'COMPLETED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'v1:21:31')"
+        )
+        with pytest.raises(Exception):
+            connection.exec_driver_sql(
+                "INSERT INTO audit_runs "
+                "(id, content_item_id, content_version_id, rule_version_id, model, prompt_version, status, created_at, updated_at, review_key) "
+                "VALUES (4, 10, 22, 32, 'tech', 'v1', 'COMPLETED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'v1:21:31')"
+            )
+
+
 def test_schema_upgrade_adds_audit_and_agent_idempotency_indexes(tmp_path: Path) -> None:
     import server.db as db_module
 
@@ -232,7 +279,7 @@ def test_schema_upgrade_adds_audit_and_agent_idempotency_indexes(tmp_path: Path)
         for table_name in ("audit_runs", "agent_results")
         for index in inspector.get_indexes(table_name)
     }
-    assert ("audit_runs", ("content_version_id", "rule_version_id"), True) in indexes
+    assert ("audit_runs", ("review_key",), True) in indexes
     assert ("agent_results", ("audit_run_id", "agent_id", "agent_version"), True) in indexes
 
 
@@ -513,7 +560,6 @@ def test_workflow_identity_constraints_are_unique(tmp_path: Path) -> None:
         "batches": {("import_token",)},
         "content_items": {("batch_id", "external_id")},
         "content_versions": {("content_item_id", "version")},
-        "audit_runs": {("content_version_id", "rule_version_id")},
         "agent_results": {
             ("audit_run_id", "agent_name"),
             ("audit_run_id", "agent_id", "agent_version"),

@@ -134,6 +134,7 @@ class AuditRunCreate(BaseModel):
     content_item_id: int
     content_version_id: int
     rule_version_id: int
+    review_key: Optional[str] = Field(default=None, max_length=200)
     model: str = Field(min_length=1, max_length=200)
     prompt_version: str = Field(min_length=1, max_length=100)
 
@@ -143,6 +144,7 @@ class AuditRunRead(OrmSchema):
     content_item_id: int
     content_version_id: int
     rule_version_id: int
+    review_key: Optional[str]
     model: str
     prompt_version: str
     status: str

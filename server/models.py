@@ -160,12 +160,12 @@ class ContentVersion(TimestampMixin, Base):
 
 class AuditRun(TimestampMixin, Base):
     __tablename__ = "audit_runs"
-    __table_args__ = (UniqueConstraint("content_version_id", "rule_version_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
     content_version_id: Mapped[int] = mapped_column(ForeignKey("content_versions.id"), index=True, nullable=False)
     rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), index=True, nullable=False)
+    review_key: Mapped[Optional[str]] = mapped_column(String(200), unique=True, index=True)
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="PENDING", nullable=False)
