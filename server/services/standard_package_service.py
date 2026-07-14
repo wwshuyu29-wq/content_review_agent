@@ -102,6 +102,7 @@ class PlatformRequirementsFile(StrictModel):
 class PlatformRequirement(StrictModel):
     status: str = Field(min_length=1)
     requirements: List[Any] = Field(default_factory=list)
+    aliases: List[str] = Field(default_factory=list)
 
 
 class DeterministicRule(StrictModel):
@@ -265,9 +266,13 @@ def load_standard_package(root: Path, project_code: str, package_version: str = 
         raise ValueError("project metadata does not match package metadata")
     claim_ids = [claim.claim_id for claim in package.approved_claims + package.pending_claims]
     _unique(claim_ids, "claim")
-    _unique([rule.rule_id for rule in package.deterministic_rules], "rule")
+    rule_ids = [rule.rule_id for rule in package.deterministic_rules]
+    replacement_ids = [entry.replacement_id for entry in package.replacement_rules.replacement_rules]
+    _unique(rule_ids, "rule")
     _unique([entry.term_id for entry in package.term_dictionary.terms], "term")
-    _unique([entry.replacement_id for entry in package.replacement_rules.replacement_rules], "replacement")
+    _unique(replacement_ids, "replacement")
+    if set(rule_ids) & set(replacement_ids):
+        raise ValueError("duplicate rule or replacement IDs")
     _unique(
         [requirement.requirement_id for requirement in package.evidence_requirements.evidence_requirements],
         "evidence requirement",

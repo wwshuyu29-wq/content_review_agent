@@ -23,7 +23,7 @@ def rule(rule_id, matcher, **kwargs):
     }
 
 
-def profile_with(*rules, platform_requirements=None):
+def profile_with(*rules, platform_requirements=None, replacement_rules=None, platform_aliases=None):
     version = SimpleNamespace(
         business_domain="baidu_maps_marketing_review",
         document_type="project_standard",
@@ -44,8 +44,11 @@ def profile_with(*rules, platform_requirements=None):
         structured_rules={
             "rules": list(rules),
             "evidence_requirements": {"evidence_requirements": []},
-            "platform_requirements": platform_requirements or {},
-            "replacement_rules": {"replacement_rules": []},
+            "platform_requirements": {
+                key: {**value, "aliases": (platform_aliases or {}).get(key, value.get("aliases", [key]))}
+                for key, value in (platform_requirements or {}).items()
+            },
+            "replacement_rules": {"replacement_rules": replacement_rules or []},
             "term_dictionary": {"terms": []},
         },
     )
@@ -80,7 +83,7 @@ def test_exact_phrase_reports_structured_metadata():
 
 
 def test_count_mismatch_uses_declared_count_and_numbered_sections():
-    profile = profile_with(rule("TEST-COUNT-001", "count_consistency", title_pattern=r"(\d+)个测试"))
+    profile = profile_with(rule("TEST-COUNT-001", "count_consistency", title_pattern=r"(\d+)个测试", scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]}))
     context = ReviewContext(title="亲测：5个测试", body="1. 场景一\n2. 场景二", test_cases=[])
     assert {issue.rule_id for issue in evaluate_rules(profile, context)} == {"TEST-COUNT-001"}
 
@@ -94,12 +97,19 @@ def test_evidence_trigger_without_evidence_routes_to_human():
 
 def test_evidence_present_does_not_fire():
     profile = profile_with(rule("TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases"]))
-    context = ReviewContext(title="亲测小度想想", body="亲测结果很好", test_cases=[{"test_case_id": "T1"}])
+    context = ReviewContext(
+        title="亲测小度想想",
+        body="亲测结果很好",
+        test_cases=[{"test_case_id": "T1", "command": "输入路线", "observed_result": "返回方案"}],
+    )
     assert evaluate_rules(profile, context) == []
 
 
 def test_scoped_platform_rule_only_matches_platform():
-    profile = profile_with(rule("PLATFORM-001", "required_term", required_terms=["#小度想想#"], scope={"content_type": "TECH_MEDIA_REVIEW", "platforms": ["xiaohongshu"], "field": "body"}))
+    profile = profile_with(
+        rule("PLATFORM-001", "required_term", required_terms=["#小度想想#"], scope={"content_type": "TECH_MEDIA_REVIEW", "platforms": ["xiaohongshu"], "field": "body"}),
+        platform_requirements={"xiaohongshu": {"status": "ACTIVE"}},
+    )
     assert evaluate_rules(profile, ReviewContext(body="正文", platform="douyin")) == []
     assert evaluate_rules(profile, ReviewContext(body="正文", platform="xiaohongshu"))[0].rule_id == "PLATFORM-001"
 
@@ -117,6 +127,51 @@ def test_pending_platform_config_does_nothing():
         platform_requirements={"xiaohongshu": {"status": "PENDING", "requirements": ["必须带标签"]}},
     )
     assert evaluate_rules(profile, ReviewContext(body="正文", platform="xiaohongshu")) == []
+
+
+def test_replacement_rules_snapshot_is_executable_without_deterministic_duplicate():
+    profile = profile_with(replacement_rules=[{"replacement_id": "REPLACE-ONLY", "from": "最优解", "to": "一种可行方案", "source_reference": ["CLAIM-001"]}])
+    issue = evaluate_rules(profile, ReviewContext(body="这是最优解"))[0]
+    assert issue.rule_id == "REPLACE-ONLY"
+    assert issue.suggestion == "一种可行方案"
+    assert [rule.rule_id for rule in profile.rules] == ["REPLACE-ONLY"]
+
+
+def test_platform_aliases_normalize_before_scope_and_pending_lookup():
+    profile = profile_with(
+        rule("PLATFORM-001", "required_term", required_terms=["#小度想想#"], scope={"content_type": "TECH_MEDIA_REVIEW", "platforms": ["xiaohongshu"], "field": "body"}),
+        platform_requirements={"xiaohongshu": {"status": "ACTIVE"}},
+        platform_aliases={"xiaohongshu": ["xiaohongshu", "小红书"]},
+    )
+    assert profile.platform_aliases["小红书"] == "xiaohongshu"
+    assert evaluate_rules(profile, ReviewContext(body="正文", platform="小红书"))[0].rule_id == "PLATFORM-001"
+    assert evaluate_rules(profile, ReviewContext(body="正文", platform="xiaohongshu"))[0].rule_id == "PLATFORM-001"
+    assert evaluate_rules(profile, ReviewContext(body="正文", platform="unknown")) == []
+    assert evaluate_rules(profile, ReviewContext(body="正文", platform="")) == []
+
+
+def test_invalid_test_and_evidence_records_remain_missing():
+    profile = profile_with(rule("TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases", "evidence"]))
+    context = ReviewContext(title="亲测", body="亲测结果", test_cases=[{}], evidence=[{"asset_id": "  "}])
+    issues = evaluate_rules(profile, context)
+    assert issues[0].human_required is True
+    assert "证据" in issues[0].reason
+    assert "造假" not in issues[0].reason
+
+
+def test_text_scope_is_applied_per_field_and_duplicate_issues_are_removed():
+    profile = profile_with(
+        rule("TITLE-001", "exact_phrase", phrases=["命中"], scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["title"]}),
+        rule("BODY-001", "exact_phrase", phrases=["命中"], scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["body"]}),
+        rule("DUP-001", "exact_phrase", phrases=["重复"], scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["body"]}),
+        rule("DUP-001", "exact_phrase", phrases=["重复"], scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["body"]}),
+    )
+    issues = evaluate_rules(profile, ReviewContext(title="命中", body="命中 重复"))
+    assert {(issue.rule_id, issue.field, issue.evidence) for issue in issues} == {
+        ("TITLE-001", "title", "命中"),
+        ("BODY-001", "body", "命中"),
+        ("DUP-001", "body", "重复"),
+    }
 
 
 def test_unknown_matcher_is_rejected():

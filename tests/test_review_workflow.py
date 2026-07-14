@@ -139,7 +139,7 @@ def test_run_audit_rejects_missing_project_identity(tmp_path: Path) -> None:
             run_audit(session, item.id, reviewer=FakeReviewer([]), model="model-v1")
 
 
-def test_tech_standards_reject_legacy_keys_even_when_empty() -> None:
+def test_database_compatibility_layer_never_forwards_legacy_rule_arrays() -> None:
     rule_version = RuleVersion(
         content_type="TECH_MEDIA_REVIEW",
         structured_rules={"deny_words": [], "must_human_keywords": [], "required_tags": [], "recommended": {}},
@@ -148,8 +148,11 @@ def test_tech_standards_reject_legacy_keys_even_when_empty() -> None:
         prompt_version="test",
     )
 
-    with pytest.raises(ValueError, match="legacy rule arrays"):
-        _standards_from_rule_version(rule_version)
+    standards = _standards_from_rule_version(rule_version)
+    assert standards.deny_words == []
+    assert standards.recommended == {}
+    assert standards.must_human_keywords == []
+    assert standards.required_tags == []
 
 
 def test_run_audit_rejects_configured_project_with_mismatched_snapshot_identity(tmp_path: Path) -> None:

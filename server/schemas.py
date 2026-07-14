@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -174,6 +174,7 @@ class IssueCreate(BaseModel):
     severity: str = Field(min_length=1, max_length=50)
     field: str = Field(min_length=1, max_length=100)
     evidence_quote: str
+    source_reference: List[str] = Field(default_factory=list)
     reason: str
     suggestion: str
     auto_fixable: bool
@@ -190,6 +191,7 @@ class IssueRead(OrmSchema):
     severity: str
     field: str
     evidence_quote: str
+    source_reference: List[str] = Field(default_factory=list)
     reason: str
     suggestion: str
     auto_fixable: bool

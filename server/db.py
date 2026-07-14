@@ -67,6 +67,12 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_rule_versions_project_package_version "
                 "ON rule_versions (project_id, package_version)"
             )
+        if "issues" in table_names:
+            issue_columns = {column["name"] for column in database_inspector.get_columns("issues")}
+            if "source_reference" not in issue_columns:
+                connection.exec_driver_sql("ALTER TABLE issues ADD COLUMN source_reference JSON")
+                connection.exec_driver_sql("UPDATE issues SET source_reference = '[]' WHERE source_reference IS NULL")
+
         if "batches" not in table_names:
             return
 

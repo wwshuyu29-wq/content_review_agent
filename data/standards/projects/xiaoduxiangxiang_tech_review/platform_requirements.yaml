@@ -1,10 +1,13 @@
 platform_requirements:
   xiaohongshu:
     status: PENDING
+    aliases: [xiaohongshu, 小红书]
     requirements: []
   douyin:
     status: PENDING
+    aliases: [douyin, 抖音]
     requirements: []
   weibo:
     status: PENDING
+    aliases: [weibo, 微博]
     requirements: []

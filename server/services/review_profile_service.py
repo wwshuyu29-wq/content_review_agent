@@ -32,6 +32,7 @@ class ReviewProfile(BaseModel):
     evidence_requirements: Tuple[Mapping[str, Any], ...] = ()
     platform_requirements: Mapping[str, Mapping[str, Any]] = Field(default_factory=dict)
     replacement_rules: Tuple[Mapping[str, Any], ...] = ()
+    platform_aliases: Mapping[str, str] = Field(default_factory=dict)
 
 
 def _snapshot_compiled(rule_version: Any) -> dict[str, Any]:
@@ -75,7 +76,35 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         if rule.matcher not in SUPPORTED_MATCHERS:
             raise ValueError(f"unsupported matcher: {rule.matcher}")
     evidence = structured.get("evidence_requirements", {}).get("evidence_requirements", [])
-    replacements = structured.get("replacement_rules", {}).get("replacement_rules", [])
+    replacements = tuple(structured.get("replacement_rules", {}).get("replacement_rules", []))
+    rule_ids = [rule.rule_id for rule in rules]
+    replacement_ids = [replacement.get("replacement_id") for replacement in replacements]
+    if (
+        any(not replacement_id for replacement_id in replacement_ids)
+        or len(replacement_ids) != len(set(replacement_ids))
+        or set(rule_ids) & set(replacement_ids)
+    ):
+        raise ValueError("duplicate rule or replacement IDs")
+    replacement_specs = tuple(
+        RuleSpec(
+            rule_id=replacement["replacement_id"],
+            scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]},
+            matcher="replacement_map",
+            severity="LOW",
+            action="SUGGEST_REPLACEMENT",
+            auto_fixable=True,
+            source_reference=tuple(replacement.get("source_reference", [])),
+            replacement_map={replacement["from"]: replacement["to"]},
+        )
+        for replacement in replacements
+    )
+    platform_requirements = structured.get("platform_requirements", {})
+    aliases: dict[str, str] = {}
+    for canonical, config in platform_requirements.items():
+        for alias in config.get("aliases", [canonical]):
+            if alias in aliases and aliases[alias] != canonical:
+                raise ValueError(f"duplicate platform alias: {alias}")
+            aliases[alias] = canonical
     return ReviewProfile(
         business_domain=expected["business_domain"],
         document_type=expected["document_type"],
@@ -83,8 +112,9 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         content_type=expected["content_type"],
         package_version=expected["version"],
         package_digest=rule_version.package_digest,
-        rules=rules,
+        rules=rules + replacement_specs,
         evidence_requirements=tuple(evidence),
-        platform_requirements=structured.get("platform_requirements", {}),
-        replacement_rules=tuple(replacements),
+        platform_requirements=platform_requirements,
+        replacement_rules=replacements,
+        platform_aliases=aliases,
     )

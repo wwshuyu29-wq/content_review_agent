@@ -30,16 +30,6 @@
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
       "source_reference": ["PENDING-002"]
-    },
-    {
-      "rule_id": "REPLACE-001",
-      "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
-      "matcher": "replacement_map",
-      "replacement_map": {"最优解": "一种可行方案"},
-      "severity": "LOW",
-      "action": "SUGGEST_REPLACEMENT",
-      "auto_fixable": true,
-      "source_reference": ["CLAIM-001"]
     }
   ]
 }

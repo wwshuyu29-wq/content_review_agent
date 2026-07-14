@@ -205,6 +205,7 @@ class Issue(TimestampMixin, Base):
     severity: Mapped[str] = mapped_column(String(50), nullable=False)
     field: Mapped[str] = mapped_column(String(100), nullable=False)
     evidence_quote: Mapped[str] = mapped_column(Text, nullable=False)
+    source_reference: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     suggestion: Mapped[str] = mapped_column(Text, nullable=False)
     auto_fixable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

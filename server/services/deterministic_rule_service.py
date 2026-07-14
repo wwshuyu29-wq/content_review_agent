@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -55,6 +55,13 @@ def _values(value: Any) -> list[str]:
     return [str(item) for item in value] if isinstance(value, (list, tuple, set)) else [str(value)]
 
 
+def _configured_fields(rule: RuleSpec, default: str = "body") -> list[str]:
+    fields = rule.scope.get("fields", rule.scope.get("field", default))
+    if fields in (None, "ALL", []):
+        return ["title", "body"]
+    return _values(fields)
+
+
 def _scoped(rule: RuleSpec, context: ReviewContext, field: str) -> bool:
     scope = rule.scope
     def matches(key: str, actual: str) -> bool:
@@ -89,10 +96,7 @@ def _issue(rule: RuleSpec, *, field: str, evidence: str, reason: str, suggestion
 
 
 def _text_fields(rule: RuleSpec, context: ReviewContext) -> list[tuple[str, str]]:
-    fields = rule.scope.get("fields", rule.scope.get("field", "body"))
-    if fields in (None, "ALL"):
-        fields = ["title", "body"]
-    return [(field, context.field_value(field)) for field in _values(fields) if context.field_value(field)]
+    return [(field, context.field_value(field)) for field in _configured_fields(rule) if context.field_value(field)]
 
 
 def _match_text(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
@@ -102,6 +106,8 @@ def _match_text(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]
         phrases = list(replacement_map)
     issues = []
     for field, text in _text_fields(rule, context):
+        if not _scoped(rule, context, field):
+            continue
         for phrase in phrases:
             if phrase in text:
                 replacement = replacement_map.get(phrase, "")
@@ -109,14 +115,33 @@ def _match_text(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]
     return issues
 
 
+def _valid_test_cases(context: ReviewContext) -> list[Mapping[str, Any]]:
+    return [
+        record for record in context.test_cases
+        if any(str(record.get(key, "")).strip() for key in ("test_case_id", "id"))
+        and str(record.get("command", "")).strip()
+        and str(record.get("observed_result", record.get("result", ""))).strip()
+    ]
+
+
+def _valid_evidence(context: ReviewContext) -> list[Mapping[str, Any]]:
+    records = list(context.evidence) + list(context.evidence_assets)
+    return [
+        record for record in records
+        if any(str(record.get(key, "")).strip() for key in ("asset_id", "id", "filename", "path"))
+        or any(str(identifier).strip() for identifier in record.get("evidence_asset_ids", []) or [])
+    ]
+
+
 def _count_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
+    fields = _configured_fields(rule)
     title_pattern = rule.model_extra.get("title_pattern", r"(\d+)\s*[个项]?测试")
-    match = re.search(title_pattern, context.title)
+    match = re.search(title_pattern, context.title) if "title" in fields else None
     if not match:
         return []
     declared = int(match.group(1))
-    actual = len(context.test_cases)
-    if not actual:
+    actual = len(_valid_test_cases(context))
+    if not actual and "body" in fields:
         actual = len(re.findall(r"(?m)^\s*\d+[\.、)]\s+", context.body))
     if actual == declared:
         return []
@@ -125,14 +150,20 @@ def _count_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue
 
 def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
     terms = _values(rule.model_extra.get("trigger_terms", []))
-    text = f"{context.title}\n{context.body}"
+    fields = _configured_fields(rule)
+    text = "\n".join(context.field_value(field) for field in fields)
     trigger = next((term for term in terms if term in text), None)
     if not trigger:
         return []
     required = _values(rule.model_extra.get("required_fields", []))
     missing = []
     for field in required:
-        value = getattr(context, field, None)
+        if field == "test_cases":
+            value = _valid_test_cases(context)
+        elif field in {"evidence", "evidence_assets"}:
+            value = _valid_evidence(context)
+        else:
+            value = getattr(context, field, None)
         if not value:
             missing.append(field)
     if not missing:
@@ -141,7 +172,9 @@ def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIs
 
 
 def _required_term_issue(rule: RuleSpec, context: ReviewContext, profile: ReviewProfile) -> list[StructuredIssue]:
-    if context.platform and context.platform in profile.platform_requirements:
+    if not context.platform:
+        return []
+    if context.platform in profile.platform_requirements:
         config = profile.platform_requirements[context.platform]
         if str(config.get("status", "")).upper() in {"PENDING", "", "INACTIVE"}:
             return []
@@ -153,20 +186,43 @@ def _required_term_issue(rule: RuleSpec, context: ReviewContext, profile: Review
     return []
 
 
+def _normalized(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _normalize_platform(profile: ReviewProfile, platform: str) -> str:
+    value = platform.strip()
+    if not value:
+        return ""
+    canonical = profile.platform_aliases.get(value)
+    if canonical:
+        return canonical
+    if value in profile.platform_requirements:
+        return value
+    return ""
+
+
 def evaluate_rules(profile: ReviewProfile, context: ReviewContext) -> list[StructuredIssue]:
+    context = context.model_copy(update={"platform": _normalize_platform(profile, context.platform)})
     issues: list[StructuredIssue] = []
     for rule in profile.rules:
         if rule.matcher not in {"exact_phrase", "phrase_list", "replacement_map", "count_consistency", "evidence_required", "required_term"}:
             raise ValueError(f"unsupported matcher: {rule.matcher}")
-        field = "body" if rule.matcher not in {"count_consistency", "required_term"} else rule.scope.get("field", "body")
-        if not _scoped(rule, context, field if isinstance(field, str) else "body"):
-            continue
         if rule.matcher in {"exact_phrase", "phrase_list", "replacement_map"}:
             issues.extend(_match_text(rule, context))
+        elif not _scoped(rule, context, "title" if "title" in _configured_fields(rule) else "body"):
+            continue
         elif rule.matcher == "count_consistency":
             issues.extend(_count_issue(rule, context))
         elif rule.matcher == "evidence_required":
             issues.extend(_evidence_issue(rule, context))
         else:
             issues.extend(_required_term_issue(rule, context, profile))
-    return issues
+    unique: list[StructuredIssue] = []
+    seen: set[tuple[str, str, str]] = set()
+    for issue in issues:
+        key = (issue.rule_id, issue.field, _normalized(issue.evidence))
+        if key not in seen:
+            seen.add(key)
+            unique.append(issue)
+    return unique

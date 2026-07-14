@@ -28,7 +28,7 @@ from server.services.review_profile_service import get_review_profile
 MANUAL_SEVERITIES = {"mid", "high", "unknown"}
 ISSUE_FIELDS = (
     "rule_id", "category", "severity", "field", "evidence_quote", "reason",
-    "suggestion", "auto_fixable", "human_required", "confidence",
+    "suggestion", "source_reference", "auto_fixable", "human_required", "confidence",
 )
 
 
@@ -53,20 +53,16 @@ def validate_rule_version_identity(project, rule_version: RuleVersion) -> None:
 def _standards_from_rule_version(rule_version: RuleVersion) -> Standards:
     rules = rule_version.structured_rules
     facts_text = "\n".join(f"{key}: {value}" for key, value in rule_version.project_facts.items())
-    is_tech = rule_version.content_type == "TECH_MEDIA_REVIEW"
-    legacy_fields = {"deny_words", "must_human_keywords", "required_tags", "recommended"} & set(rules)
-    if is_tech and legacy_fields:
-        raise ValueError("TECH_MEDIA_REVIEW snapshots cannot contain legacy rule arrays")
     dimensions = rule_version.dimension_standards
     dimension_docs = dimensions.get("standards", dimensions) if isinstance(dimensions, dict) else {}
     return Standards(
         global_text="\n\n".join(str(value) for value in dimension_docs.values()),
         project_text=facts_text,
         dimension_docs=dict(dimension_docs),
-        deny_words=[] if is_tech else list(rules.get("deny_words", [])),
-        recommended={} if is_tech else dict(rules.get("recommended", {})),
-        must_human_keywords=[] if is_tech else list(rules.get("must_human_keywords", [])),
-        required_tags=[] if is_tech else list(rules.get("required_tags", [])),
+        deny_words=[],
+        recommended={},
+        must_human_keywords=[],
+        required_tags=[],
     )
 
 
@@ -200,6 +196,7 @@ def run_audit(
             severity=deterministic.severity,
             field=deterministic.field,
             evidence_quote=deterministic.evidence,
+            source_reference=deterministic.source_reference,
             reason=deterministic.reason,
             suggestion=deterministic.suggestion,
             auto_fixable=deterministic.auto_fixable,
@@ -218,6 +215,7 @@ def run_audit(
         session.add(result)
         session.flush()
         for issue_data in result_data.get("issues", []):
+            issue_data = {"source_reference": [], **issue_data}
             missing = [field for field in ISSUE_FIELDS if field not in issue_data]
             if missing:
                 raise ValueError(f"Structured issue missing fields: {', '.join(missing)}")

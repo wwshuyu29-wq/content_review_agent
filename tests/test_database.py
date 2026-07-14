@@ -58,6 +58,49 @@ def create_legacy_schema_without_import_token(engine: Engine) -> None:
         connection.exec_driver_sql("CREATE INDEX ix_batches_project_id ON batches (project_id)")
 
 
+def test_issue_source_reference_round_trips_and_schema_serializes(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(name="source-ref-project", code="source-ref", content_type="TECH_MEDIA_REVIEW")
+        batch = Batch(project=project, supplier_id="supplier", name="batch")
+        item = ContentItem(project=project, batch=batch, external_id="content", title="标题")
+        version = ContentVersion(content_item=item, version=1, source="SUPPLIER", title="标题", body="正文")
+        rule_version = RuleVersion(project=project, version=1, package_version="0.9", prompt_version="test")
+        audit = AuditRun(content_item=item, content_version=version, rule_version=rule_version, model="test", prompt_version="test")
+        issue = Issue(
+            audit_run=audit,
+            rule_id="RULE-1",
+            category="deterministic",
+            severity="HIGH",
+            field="body",
+            evidence_quote="证据",
+            source_reference=["CLAIM-001"],
+            reason="原因",
+            suggestion="建议",
+            confidence=1.0,
+        )
+        session.add(issue)
+        session.commit()
+        session.expire_all()
+        saved = session.get(Issue, issue.id)
+        assert saved.source_reference == ["CLAIM-001"]
+        assert IssueCreate(
+            audit_run_id=saved.audit_run_id,
+            rule_id=saved.rule_id,
+            category=saved.category,
+            severity=saved.severity,
+            field=saved.field,
+            evidence_quote=saved.evidence_quote,
+            reason=saved.reason,
+            suggestion=saved.suggestion,
+            auto_fixable=saved.auto_fixable,
+            human_required=saved.human_required,
+            confidence=saved.confidence,
+            source_reference=saved.source_reference,
+        ).source_reference == ["CLAIM-001"]
+
+
 def test_database_url_builds_sqlite_engine_with_foreign_keys(tmp_path: Path) -> None:
     engine = make_sqlite_engine(tmp_path)
 
