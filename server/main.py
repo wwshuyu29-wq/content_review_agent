@@ -7,7 +7,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from scripts.text_review.reviewer import get_reviewer
-from server.db import Base, create_db_engine
+from server.db import Base, get_db_engine, get_session
 from server.models import (
     AgentResult,
     AuditRun,
@@ -51,8 +51,15 @@ from server.services.review_service import resolve_task, run_audit
 
 
 REPO_DIR = Path(__file__).resolve().parents[1]
-ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-DEFAULT_CONFIG = {"reviewer": "offline", "model": "", "base_url": ""}
+ALLOWED_IMAGE_TYPES = {
+    ".jpg": {"image/jpeg"},
+    ".jpeg": {"image/jpeg"},
+    ".png": {"image/png"},
+    ".webp": {"image/webp"},
+}
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+DEFAULT_CONFIG = {"reviewer": "offline", "model": ""}
 
 
 def _data_dir() -> Path:
@@ -83,18 +90,10 @@ def _save_config(config: Dict[str, str]) -> None:
         json.dump(config, stream, ensure_ascii=False, indent=2)
 
 
-def get_session() -> Generator[Session, None, None]:
-    engine = create_db_engine()
-    with Session(engine, expire_on_commit=False) as session:
-        yield session
-
-
 def get_audit_reviewer() -> Any:
     config = _load_config()
     if config["model"]:
         os.environ["ONEAPI_MODEL"] = config["model"]
-    if config["base_url"]:
-        os.environ["ONEAPI_BASE_URL"] = config["base_url"]
     return get_reviewer(config["reviewer"])
 
 
@@ -104,12 +103,11 @@ async def lifespan(_app: FastAPI):
     _uploads_dir().mkdir(parents=True, exist_ok=True)
     if not _config_path().exists():
         _save_config(dict(DEFAULT_CONFIG))
-    engine = create_db_engine()
+    engine = get_db_engine()
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         seed_default_project(session)
         session.commit()
-    engine.dispose()
     yield
 
 
@@ -167,20 +165,26 @@ class TaskResolveInput(BaseModel):
 class ConfigInput(BaseModel):
     reviewer: Optional[str] = None
     model: Optional[str] = None
-    base_url: Optional[str] = None
 
 
 class ConfigResponse(BaseModel):
     reviewer: str
     model: str
-    base_url: str
     key_set: bool
+
+
+class BatchAuditItemResult(BaseModel):
+    content_id: int
+    status: str
+    audit_run_id: Optional[int] = None
+    error: Optional[str] = None
 
 
 class BatchAuditResponse(BaseModel):
     batch_id: int
     audited: int
     audit_run_ids: List[int]
+    results: List[BatchAuditItemResult]
 
 
 def _not_found(entity: str, entity_id: int) -> HTTPException:
@@ -189,7 +193,12 @@ def _not_found(entity: str, entity_id: int) -> HTTPException:
 
 def _service_error(error: ValueError) -> HTTPException:
     message = str(error)
-    status = 404 if "does not exist" in message or "does not belong" in message else 422
+    if "does not exist" in message or "does not belong" in message:
+        status = 404
+    elif "open review tasks" in message:
+        status = 409
+    else:
+        status = 422
     return HTTPException(status_code=status, detail=message)
 
 
@@ -313,27 +322,43 @@ async def _parse_contents(contents: str) -> List[Dict[str, Any]]:
 
 
 async def _save_uploads(rows: List[Dict[str, Any]], files: Optional[List[UploadFile]]) -> List[Path]:
+    uploads = files or []
+    if len(uploads) != len(rows):
+        raise HTTPException(status_code=422, detail="Provide exactly one file per content row, in row order")
+
     saved_paths: List[Path] = []
-    for index, upload in enumerate(files or []):
-        if not upload.filename:
-            continue
-        suffix = Path(upload.filename).suffix.lower()
-        if suffix not in ALLOWED_IMAGE_SUFFIXES:
-            raise HTTPException(status_code=422, detail=f"Unsupported image format: {suffix}")
-        filename = f"{uuid.uuid4().hex}{suffix}"
-        path = _uploads_dir() / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(await upload.read())
-        saved_paths.append(path)
-        target_index = min(index, len(rows) - 1)
-        payload = rows[target_index].setdefault("payload", {})
-        if not isinstance(payload, dict):
-            raise HTTPException(status_code=422, detail="content payload must be an object")
-        if "media" not in payload:
+    try:
+        for index, upload in enumerate(uploads):
+            if not upload.filename:
+                raise HTTPException(status_code=422, detail="Each content row requires a named file")
+            suffix = Path(upload.filename).suffix.lower()
+            if suffix not in ALLOWED_IMAGE_TYPES:
+                raise HTTPException(status_code=422, detail=f"Unsupported image format: {suffix}")
+            if upload.content_type not in ALLOWED_IMAGE_TYPES[suffix]:
+                raise HTTPException(status_code=422, detail=f"Unsupported image MIME type: {upload.content_type}")
+            payload = rows[index].setdefault("payload", {})
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=422, detail="content payload must be an object")
+
+            filename = f"{uuid.uuid4().hex}{suffix}"
+            path = _uploads_dir() / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            saved_paths.append(path)
+            size = 0
+            with path.open("wb") as stream:
+                while True:
+                    chunk = await upload.read(UPLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(status_code=413, detail="Image exceeds 20MB limit")
+                    stream.write(chunk)
             payload["media"] = filename
-        else:
-            media = payload["media"]
-            payload["media"] = media + [filename] if isinstance(media, list) else [media, filename]
+    except Exception:
+        for path in saved_paths:
+            path.unlink(missing_ok=True)
+        raise
     return saved_paths
 
 
@@ -377,6 +402,11 @@ async def create_batch(
         for path in saved_paths:
             path.unlink(missing_ok=True)
         raise _service_error(error) from error
+    except Exception:
+        session.rollback()
+        for path in saved_paths:
+            path.unlink(missing_ok=True)
+        raise
     return BatchDetail(
         **BatchRead.model_validate(batch).model_dump(),
         content_count=len(batch.content_items),
@@ -437,14 +467,25 @@ def audit_batch(
         raise _not_found("Batch", batch_id)
     config = _load_config()
     audit_ids = []
+    results = []
     for item in batch.content_items:
         try:
             audit = run_audit(session, item.id, reviewer=reviewer, model=config["model"] or None)
         except ValueError as error:
             session.rollback()
-            raise _service_error(error) from error
-        audit_ids.append(audit.id)
-    return BatchAuditResponse(batch_id=batch_id, audited=len(audit_ids), audit_run_ids=audit_ids)
+            results.append(BatchAuditItemResult(content_id=item.id, status="error", error=str(error)))
+        except Exception as error:
+            session.rollback()
+            results.append(BatchAuditItemResult(content_id=item.id, status="error", error="Audit failed"))
+        else:
+            audit_ids.append(audit.id)
+            results.append(BatchAuditItemResult(content_id=item.id, status="success", audit_run_id=audit.id))
+    return BatchAuditResponse(
+        batch_id=batch_id,
+        audited=len(audit_ids),
+        audit_run_ids=audit_ids,
+        results=results,
+    )
 
 
 @app.get("/api/audit-runs", response_model=List[AuditRunRead])
@@ -516,9 +557,15 @@ def get_config():
 
 
 @app.put("/api/config", response_model=ConfigResponse)
-def put_config(payload: ConfigInput):
+def put_config(payload: Dict[str, Any]):
+    if set(payload) - set(DEFAULT_CONFIG):
+        raise HTTPException(status_code=422, detail="Unsupported configuration field")
+    try:
+        validated = ConfigInput.model_validate(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="Invalid configuration") from error
     config = _load_config()
-    for key, value in payload.model_dump(exclude_none=True).items():
+    for key, value in validated.model_dump(exclude_none=True).items():
         config[key] = value
     _save_config(config)
     return ConfigResponse(**config, key_set=bool(os.environ.get("ONEAPI_KEY")))

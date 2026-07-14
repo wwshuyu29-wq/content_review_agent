@@ -4,7 +4,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, event, inspect
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -142,6 +143,7 @@ class ContentVersion(TimestampMixin, Base):
 
     content_item: Mapped[ContentItem] = relationship(back_populates="versions")
     audit_runs: Mapped[List["AuditRun"]] = relationship(back_populates="content_version")
+    review_tasks: Mapped[List["ReviewTask"]] = relationship(back_populates="target_content_version")
 
 
 class AuditRun(TimestampMixin, Base):
@@ -163,6 +165,7 @@ class AuditRun(TimestampMixin, Base):
         back_populates="audit_run", cascade="all, delete-orphan"
     )
     issues: Mapped[List["Issue"]] = relationship(back_populates="audit_run", cascade="all, delete-orphan")
+    review_tasks: Mapped[List["ReviewTask"]] = relationship(back_populates="audit_run")
 
 
 class AgentResult(TimestampMixin, Base):
@@ -206,6 +209,10 @@ class ReviewTask(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
+    target_content_version_id: Mapped[int] = mapped_column(
+        ForeignKey("content_versions.id"), index=True, nullable=False
+    )
+    audit_run_id: Mapped[int] = mapped_column(ForeignKey("audit_runs.id"), index=True, nullable=False)
     issue_id: Mapped[Optional[int]] = mapped_column(ForeignKey("issues.id"), unique=True)
     task_type: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="OPEN", nullable=False)
@@ -213,6 +220,8 @@ class ReviewTask(TimestampMixin, Base):
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     content_item: Mapped[ContentItem] = relationship(back_populates="review_tasks")
+    target_content_version: Mapped[ContentVersion] = relationship(back_populates="review_tasks")
+    audit_run: Mapped[AuditRun] = relationship(back_populates="review_tasks")
     issue: Mapped[Optional[Issue]] = relationship(back_populates="review_task")
     human_decisions: Mapped[List["HumanDecision"]] = relationship(
         back_populates="review_task", cascade="all, delete-orphan"
@@ -230,3 +239,18 @@ class HumanDecision(TimestampMixin, Base):
     payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     review_task: Mapped[ReviewTask] = relationship(back_populates="human_decisions")
+
+
+def _reject_version_update(mapper, _connection, target) -> None:
+    state = inspect(target)
+    if any(state.attrs[column.key].history.has_changes() for column in mapper.columns):
+        raise InvalidRequestError(f"{target.__class__.__name__} records are immutable")
+
+
+def _reject_version_delete(_mapper, _connection, target) -> None:
+    raise InvalidRequestError(f"{target.__class__.__name__} records are immutable")
+
+
+for immutable_model in (RuleVersion, ContentVersion):
+    event.listen(immutable_model, "before_update", _reject_version_update)
+    event.listen(immutable_model, "before_delete", _reject_version_delete)

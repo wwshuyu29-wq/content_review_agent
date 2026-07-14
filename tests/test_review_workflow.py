@@ -174,6 +174,22 @@ def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path:
         assert [(task.task_type, task.status) for task in item.review_tasks] == [
             ("REVIEW_FIX_PROPOSAL", "OPEN")
         ]
+        task = item.review_tasks[0]
+        assert task.target_content_version_id == item.versions[-1].id
+        assert task.audit_run_id == audit.id
+
+
+def test_reaudit_is_rejected_while_blocking_task_is_open(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        run_audit(session, item.id, reviewer=FakeReviewer([agent_result(issues=[issue()])]))
+
+        try:
+            run_audit(session, item.id, reviewer=FakeReviewer([agent_result()]))
+        except ValueError as error:
+            assert "open review tasks" in str(error)
+        else:
+            raise AssertionError("re-audit must reject an active workflow")
 
 
 def test_manual_priority_prevents_rewrite_and_creates_tasks(tmp_path: Path) -> None:
@@ -345,6 +361,49 @@ def test_risk_approval_waits_for_all_open_risk_tasks(tmp_path: Path) -> None:
         assert item.publish_status is PublishStatus.READY
 
 
+def test_rejecting_risk_closes_sibling_tasks_and_is_terminal(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        risks = [
+            issue("high", rule_id="RISK-A", auto_fixable=False, human_required=True),
+            issue("high", rule_id="RISK-B", auto_fixable=False, human_required=True),
+        ]
+        run_audit(session, item.id, reviewer=FakeReviewer([agent_result("external", risks)]))
+        first, second = item.review_tasks
+
+        resolve_task(session, first.id, decision="REJECT_RISK", reviewer="legal@example.com")
+
+        assert item.review_status is ReviewStatus.REJECTED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert second.status == "SUPERSEDED"
+        try:
+            resolve_task(session, second.id, decision="APPROVE_RISK", reviewer="legal@example.com")
+        except ValueError as error:
+            assert "closed" in str(error)
+        else:
+            raise AssertionError("superseded task must not be resolvable")
+
+
+def test_approvals_validate_trimmed_content_and_format_limits(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        run_audit(session, item.id, reviewer=FakeReviewer([agent_result(issues=[issue()])]))
+        task = item.review_tasks[0]
+
+        invalid_payloads = (
+            {"title": " ", "body": "valid"},
+            {"title": "valid", "body": " "},
+            {"title": "x" * 501, "body": "valid"},
+        )
+        for payload in invalid_payloads:
+            try:
+                resolve_task(session, task.id, decision="ACCEPT_EDITED", reviewer="editor", payload=payload)
+            except ValueError as error:
+                assert "format" in str(error).lower()
+            else:
+                raise AssertionError("invalid edited content must be rejected")
+
+
 def test_build_report_returns_project_batch_status_category_rule_and_manual_metrics(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project, batch, approved_item = submit_valid_content(session)
@@ -376,6 +435,19 @@ def test_build_report_returns_project_batch_status_category_rule_and_manual_metr
         assert report["manual_metrics"] == {"contents": 1, "tasks": 1, "rate": 0.5}
         assert batch_report["batch"] == {"id": batch.id, "name": batch.name}
         assert batch_report["totals"]["contents"] == 1
+
+
+def test_report_counts_only_latest_audit_issues_and_open_tasks(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project, _, item = submit_valid_content(session)
+        run_audit(session, item.id, reviewer=FakeReviewer([agent_result(issues=[issue()])]))
+        resolve_task(session, item.review_tasks[0].id, decision="ACCEPT_SUGGESTION", reviewer="owner")
+        run_audit(session, item.id, reviewer=FakeReviewer([agent_result()]))
+
+        report = build_report(session, project_id=project.id)
+
+        assert report["totals"] == {"contents": 1, "issues": 0, "tasks": 0}
+        assert report["historical_totals"] == {"issues": 1, "tasks": 1}
 
 
 def test_multi_agent_reviewer_normalizes_legacy_dimension_issues() -> None:

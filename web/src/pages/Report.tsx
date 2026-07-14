@@ -40,9 +40,9 @@ export default function Report() {
       {report && !loading && <>
         <div className="report-title"><h3>{report.project.name}</h3><span>{report.batch ? `批次：${report.batch.name}` : "全部批次"}</span></div>
         <div className="stats-grid">
-          <div className="stat"><b>{report.totals.contents}</b><span>内容总数</span></div><div className="stat"><b>{report.totals.issues}</b><span>问题总数</span></div><div className="stat"><b>{report.totals.tasks}</b><span>人工任务</span></div><div className="stat accent"><b>{Math.round(report.manual_metrics.rate * 100)}%</b><span>人工介入率</span></div>
+          <div className="stat"><b>{report.totals.contents}</b><span>内容总数</span></div><div className="stat"><b>{report.totals.issues}</b><span>当前问题</span></div><div className="stat"><b>{report.totals.tasks}</b><span>开放任务</span></div><div className="stat accent"><b>{Math.round(report.manual_metrics.rate * 100)}%</b><span>当前人工介入率</span></div>
         </div>
-        <div className="report-grid"><Distribution title="审核状态" values={report.status_counts} /><Distribution title="问题类别" values={report.category_counts} /><Distribution title="规则命中" values={report.rule_counts} /><section className="card"><h3>人工审核</h3><dl className="detail-list"><div><dt>涉及内容</dt><dd>{report.manual_metrics.contents}</dd></div><div><dt>风险任务</dt><dd>{report.manual_metrics.tasks}</dd></div><div><dt>介入占比</dt><dd>{(report.manual_metrics.rate * 100).toFixed(1)}%</dd></div></dl></section></div>
+        <div className="report-grid"><Distribution title="审核状态" values={report.status_counts} /><Distribution title="问题类别" values={report.category_counts} /><Distribution title="规则命中" values={report.rule_counts} /><section className="card"><h3>人工审核</h3><dl className="detail-list"><div><dt>涉及内容</dt><dd>{report.manual_metrics.contents}</dd></div><div><dt>风险任务</dt><dd>{report.manual_metrics.tasks}</dd></div><div><dt>介入占比</dt><dd>{(report.manual_metrics.rate * 100).toFixed(1)}%</dd></div><div><dt>历史问题</dt><dd>{report.historical_totals.issues}</dd></div><div><dt>历史任务</dt><dd>{report.historical_totals.tasks}</dd></div></dl></section></div>
       </>}
     </div>
   );

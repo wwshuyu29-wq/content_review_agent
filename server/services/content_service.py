@@ -16,15 +16,32 @@ from server.models import (
 )
 
 
+MAX_TITLE_LENGTH = 500
+MAX_BODY_LENGTH = 100_000
+
+
 def _format_status(content: Mapping[str, Any]) -> FormatStatus:
     required = ("external_id", "title", "body")
-    if any(key not in content or content[key] is None or content[key] == "" for key in required):
+    if any(key not in content or content[key] is None for key in required):
         return FormatStatus.INCOMPLETE
     if not all(isinstance(content[key], str) for key in required):
+        return FormatStatus.INVALID
+    if any(not content[key].strip() for key in required):
+        return FormatStatus.INCOMPLETE
+    if len(content["external_id"]) > 200 or len(content["title"]) > MAX_TITLE_LENGTH:
+        return FormatStatus.INVALID
+    if len(content["body"]) > MAX_BODY_LENGTH:
         return FormatStatus.INVALID
     if "payload" in content and not isinstance(content["payload"], Mapping):
         return FormatStatus.INVALID
     return FormatStatus.PASSED
+
+
+def validate_content_format(title: Any, body: Any) -> tuple[str, str]:
+    candidate = {"external_id": "validated", "title": title, "body": body, "payload": {}}
+    if _format_status(candidate) is not FormatStatus.PASSED:
+        raise ValueError("Content format requires trimmed non-empty title/body within length limits")
+    return title.strip(), body.strip()
 
 
 def _text(value: Any) -> str:

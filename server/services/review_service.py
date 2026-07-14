@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Mapping, Optional
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from scripts.text_review import schema
@@ -22,26 +21,18 @@ from server.models import (
     ReviewTask,
     RuleVersion,
 )
+from server.services.content_service import validate_content_format
 
 MANUAL_SEVERITIES = {"mid", "high", "unknown"}
 ISSUE_FIELDS = (
-    "rule_id",
-    "category",
-    "severity",
-    "field",
-    "evidence_quote",
-    "reason",
-    "suggestion",
-    "auto_fixable",
-    "human_required",
-    "confidence",
+    "rule_id", "category", "severity", "field", "evidence_quote", "reason",
+    "suggestion", "auto_fixable", "human_required", "confidence",
 )
 
 
 def _standards_from_rule_version(rule_version: RuleVersion) -> Standards:
     rules = rule_version.structured_rules
-    facts = rule_version.project_facts
-    facts_text = "\n".join(f"{key}: {value}" for key, value in facts.items())
+    facts_text = "\n".join(f"{key}: {value}" for key, value in rule_version.project_facts.items())
     return Standards(
         global_text="\n\n".join(str(value) for value in rule_version.dimension_standards.values()),
         project_text=facts_text,
@@ -60,6 +51,7 @@ def _latest_version(item: ContentItem) -> ContentVersion:
 
 
 def _new_version(item: ContentItem, *, source: str, title: str, body: str, payload: Mapping[str, Any]) -> ContentVersion:
+    title, body = validate_content_format(title, body)
     version = ContentVersion(
         content_item=item,
         version=_latest_version(item).version + 1,
@@ -72,26 +64,49 @@ def _new_version(item: ContentItem, *, source: str, title: str, body: str, paylo
     return version
 
 
+def _open_tasks(item: ContentItem) -> list[ReviewTask]:
+    return [task for task in item.review_tasks if task.status == "OPEN"]
+
+
+def _derive_state(item: ContentItem, *, approved_when_clear: bool = False) -> None:
+    if item.review_status is ReviewStatus.REJECTED:
+        item.publish_status = PublishStatus.NOT_READY
+        return
+    open_tasks = _open_tasks(item)
+    if open_tasks:
+        item.publish_status = PublishStatus.NOT_READY
+        item.review_status = (
+            ReviewStatus.FIX_PROPOSED
+            if all(task.task_type == "REVIEW_FIX_PROPOSAL" for task in open_tasks)
+            else ReviewStatus.MANUAL_REQUIRED
+        )
+        return
+    if approved_when_clear:
+        item.review_status = ReviewStatus.APPROVED
+        item.publish_status = PublishStatus.READY
+    else:
+        item.review_status = ReviewStatus.MANUAL_REQUIRED
+        item.publish_status = PublishStatus.NOT_READY
+
+
 def _normalize_agent_results(reviewer: Any, row: dict, standards: Standards) -> list[dict]:
     if hasattr(reviewer, "review_structured"):
         return list(reviewer.review_structured(row, standards))
     verdict = reviewer.review(row, standards)
     issues = []
     for index, reason in enumerate(verdict.issues):
-        issues.append(
-            {
-                "rule_id": f"LEGACY-{index + 1}",
-                "category": verdict.categories[index] if index < len(verdict.categories) else "unknown",
-                "severity": verdict.risk_level,
-                "field": "body",
-                "evidence_quote": "",
-                "reason": reason,
-                "suggestion": verdict.suggestion,
-                "auto_fixable": verdict.risk_level == schema.RISK_LOW,
-                "human_required": verdict.risk_level in MANUAL_SEVERITIES,
-                "confidence": verdict.confidence,
-            }
-        )
+        issues.append({
+            "rule_id": f"LEGACY-{index + 1}",
+            "category": verdict.categories[index] if index < len(verdict.categories) else "unknown",
+            "severity": verdict.risk_level,
+            "field": "body",
+            "evidence_quote": "",
+            "reason": reason,
+            "suggestion": verdict.suggestion,
+            "auto_fixable": verdict.risk_level == schema.RISK_LOW,
+            "human_required": verdict.risk_level in MANUAL_SEVERITIES,
+            "confidence": verdict.confidence,
+        })
     return [{"agent_name": "legacy", "status": "COMPLETED", "issues": issues, "raw_result": {}}]
 
 
@@ -107,6 +122,8 @@ def run_audit(
         raise ValueError(f"Content item {content_item_id} does not exist")
     if item.format_status is not FormatStatus.PASSED:
         raise ValueError("Only content with PASSED format status can be audited")
+    if _open_tasks(item):
+        raise ValueError("Content has open review tasks; resolve them before re-audit")
 
     rule_version = item.project.current_rule_version
     if rule_version is None:
@@ -129,12 +146,12 @@ def run_audit(
         status="RUNNING",
     )
     item.review_status = ReviewStatus.AI_REVIEWING
+    item.publish_status = PublishStatus.NOT_READY
     session.add(audit)
     session.flush()
 
-    structured_results = _normalize_agent_results(reviewer, row, standards)
     persisted_issues: list[Issue] = []
-    for result_data in structured_results:
+    for result_data in _normalize_agent_results(reviewer, row, standards):
         result = AgentResult(
             audit_run=audit,
             agent_name=result_data["agent_name"],
@@ -147,24 +164,33 @@ def run_audit(
             missing = [field for field in ISSUE_FIELDS if field not in issue_data]
             if missing:
                 raise ValueError(f"Structured issue missing fields: {', '.join(missing)}")
-            persisted = Issue(audit_run=audit, agent_result=result, **{field: issue_data[field] for field in ISSUE_FIELDS})
+            persisted = Issue(
+                audit_run=audit,
+                agent_result=result,
+                **{field: issue_data[field] for field in ISSUE_FIELDS},
+            )
             session.add(persisted)
             persisted_issues.append(persisted)
     session.flush()
 
     manual_issues = [
-        issue for issue in persisted_issues if issue.human_required or issue.severity.lower() in MANUAL_SEVERITIES
+        issue for issue in persisted_issues
+        if issue.human_required or issue.severity.lower() in MANUAL_SEVERITIES
     ]
     purely_safe_low_risk = bool(persisted_issues) and not manual_issues and all(
         issue.severity.lower() == "low" and issue.auto_fixable for issue in persisted_issues
     )
-
     if manual_issues or (persisted_issues and not purely_safe_low_risk):
-        item.review_status = ReviewStatus.MANUAL_REQUIRED
-        item.publish_status = PublishStatus.NOT_READY
-        task_issues = manual_issues or persisted_issues
-        for issue in task_issues:
-            session.add(ReviewTask(content_item=item, issue=issue, task_type="RISK_REVIEW"))
+        for issue in manual_issues or persisted_issues:
+            session.add(ReviewTask(
+                content_item=item,
+                target_content_version=content_version,
+                audit_run=audit,
+                issue=issue,
+                task_type="RISK_REVIEW",
+            ))
+        session.flush()
+        _derive_state(item)
     elif purely_safe_low_risk:
         proposed_title, proposed_body = reviewer.rewrite(row, standards)
         proposed = _new_version(
@@ -175,12 +201,17 @@ def run_audit(
             payload=content_version.payload,
         )
         session.add(proposed)
-        session.add(ReviewTask(content_item=item, task_type="REVIEW_FIX_PROPOSAL"))
-        item.review_status = ReviewStatus.FIX_PROPOSED
-        item.publish_status = PublishStatus.NOT_READY
+        session.flush()
+        session.add(ReviewTask(
+            content_item=item,
+            target_content_version=proposed,
+            audit_run=audit,
+            task_type="REVIEW_FIX_PROPOSAL",
+        ))
+        session.flush()
+        _derive_state(item)
     else:
-        item.review_status = ReviewStatus.APPROVED
-        item.publish_status = PublishStatus.READY
+        _derive_state(item, approved_when_clear=True)
 
     audit.status = "COMPLETED"
     audit.completed_at = datetime.utcnow()
@@ -205,10 +236,12 @@ def resolve_task(
         raise ValueError("Review task is already closed")
     if not reviewer.strip():
         raise ValueError("reviewer is required")
+    item = task.content_item
+    if item.review_status is ReviewStatus.REJECTED:
+        raise ValueError("Rejected content is terminal")
 
     payload = dict(payload or {})
-    item = task.content_item
-    latest = _latest_version(item)
+    target = task.target_content_version
     allowed = {
         "REVIEW_FIX_PROPOSAL": {"ACCEPT_SUGGESTION", "ACCEPT_EDITED", "REJECT_SUGGESTION"},
         "RISK_REVIEW": {"APPROVE_RISK", "REJECT_RISK"},
@@ -216,40 +249,41 @@ def resolve_task(
     if decision not in allowed.get(task.task_type, set()):
         raise ValueError(f"Decision {decision} is invalid for {task.task_type}")
 
+    approved_when_clear = False
     if decision == "ACCEPT_SUGGESTION":
-        if latest.source != "AI_PROPOSED":
-            raise ValueError("No AI proposed version is available")
-        session.add(_new_version(item, source="HUMAN_CONFIRMED", title=latest.title, body=latest.body, payload=latest.payload))
-        item.review_status = ReviewStatus.APPROVED
-        item.publish_status = PublishStatus.READY
+        if target.source != "AI_PROPOSED":
+            raise ValueError("Task target is not an AI proposed version")
+        session.add(_new_version(
+            item, source="HUMAN_CONFIRMED", title=target.title, body=target.body, payload=target.payload
+        ))
+        approved_when_clear = True
     elif decision == "ACCEPT_EDITED":
-        title, body = payload.get("title"), payload.get("body")
-        if not isinstance(title, str) or not isinstance(body, str):
-            raise ValueError("ACCEPT_EDITED requires title and body")
-        session.add(_new_version(item, source="HUMAN_EDITED", title=title, body=body, payload=latest.payload))
-        item.review_status = ReviewStatus.APPROVED
-        item.publish_status = PublishStatus.READY
+        title, body = validate_content_format(payload.get("title"), payload.get("body"))
+        session.add(_new_version(
+            item, source="HUMAN_EDITED", title=title, body=body, payload=target.payload
+        ))
+        approved_when_clear = True
     elif decision == "REJECT_SUGGESTION":
-        item.review_status = ReviewStatus.MANUAL_REQUIRED
-        item.publish_status = PublishStatus.NOT_READY
-        session.add(ReviewTask(content_item=item, task_type="RISK_REVIEW"))
+        session.add(ReviewTask(
+            content_item=item,
+            target_content_version=target,
+            audit_run=task.audit_run,
+            task_type="RISK_REVIEW",
+        ))
     elif decision == "APPROVE_RISK":
-        title = payload.get("title", latest.title)
-        body = payload.get("body", latest.body)
-        if not isinstance(title, str) or not isinstance(body, str):
-            raise ValueError("APPROVE_RISK title and body must be strings")
-        session.add(_new_version(item, source="HUMAN_APPROVED", title=title, body=body, payload=latest.payload))
-        other_open_risk_tasks = any(
-            candidate.id != task.id and candidate.task_type == "RISK_REVIEW" and candidate.status == "OPEN"
-            for candidate in item.review_tasks
-        )
-        item.review_status = (
-            ReviewStatus.MANUAL_REQUIRED if other_open_risk_tasks else ReviewStatus.APPROVED
-        )
-        item.publish_status = PublishStatus.NOT_READY if other_open_risk_tasks else PublishStatus.READY
+        title = payload.get("title", target.title)
+        body = payload.get("body", target.body)
+        title, body = validate_content_format(title, body)
+        session.add(_new_version(
+            item, source="HUMAN_APPROVED", title=title, body=body, payload=target.payload
+        ))
+        approved_when_clear = True
     elif decision == "REJECT_RISK":
         item.review_status = ReviewStatus.REJECTED
-        item.publish_status = PublishStatus.NOT_READY
+        for candidate in _open_tasks(item):
+            if candidate.id != task.id:
+                candidate.status = "SUPERSEDED"
+                candidate.closed_at = datetime.utcnow()
 
     task.status = "CLOSED"
     task.closed_at = datetime.utcnow()
@@ -261,6 +295,8 @@ def resolve_task(
         payload=payload,
     )
     session.add(human_decision)
+    session.flush()
+    _derive_state(item, approved_when_clear=approved_when_clear)
     session.commit()
     session.refresh(human_decision)
     return human_decision

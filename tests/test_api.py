@@ -166,7 +166,8 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
 
     report = client.get("/api/reports", params={"project_id": project["id"], "batch_id": batch["id"]})
     assert report.status_code == 200
-    assert report.json()["totals"] == {"contents": 1, "issues": 1, "tasks": 1}
+    assert report.json()["totals"] == {"contents": 1, "issues": 1, "tasks": 0}
+    assert report.json()["historical_totals"] == {"issues": 1, "tasks": 1}
     assert report.json()["status_counts"] == {"APPROVED": 1}
 
 
@@ -186,6 +187,10 @@ def test_batch_audit_endpoint_audits_all_eligible_contents(api) -> None:
                 ]
             ),
         },
+        files=[
+            ("files", ("one.png", b"one", "image/png")),
+            ("files", ("two.png", b"two", "image/png")),
+        ],
     )
     batch_id = uploaded.json()["id"]
 
@@ -193,6 +198,7 @@ def test_batch_audit_endpoint_audits_all_eligible_contents(api) -> None:
 
     assert response.status_code == 200
     assert response.json()["audited"] == 2
+    assert [result["status"] for result in response.json()["results"]] == ["success", "success"]
     assert len(client.get("/api/audit-runs", params={"batch_id": batch_id}).json()) == 2
 
 
@@ -200,12 +206,12 @@ def test_reviewer_dependency_applies_non_secret_config(
     api, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client, _, _ = api
+    monkeypatch.setenv("ONEAPI_BASE_URL", "https://trusted.example.test/v1")
     client.put(
         "/api/config",
         json={
             "reviewer": "oneapi",
             "model": "configured-model",
-            "base_url": "https://configured.example.test/v1",
         },
     )
     captured = {}
@@ -227,7 +233,7 @@ def test_reviewer_dependency_applies_non_secret_config(
     assert captured == {
         "backend": "oneapi",
         "model": "configured-model",
-        "base_url": "https://configured.example.test/v1",
+        "base_url": "https://trusted.example.test/v1",
         "key": "test-secret-key",
     }
 
@@ -250,14 +256,71 @@ def test_config_never_exposes_or_accepts_oneapi_key(api) -> None:
             "oneapi_key": "must-not-be-stored",
         },
     )
-    assert updated.status_code == 200
+    assert updated.status_code == 422
     assert "must-not-be-stored" not in updated.text
-    assert updated.json() == {
-        "reviewer": "multi-agent",
-        "model": "review-model",
-        "base_url": "https://oneapi.example.test",
-        "key_set": True,
+    assert "base_url" not in initial.json()
+
+
+def test_audit_conflict_and_batch_partial_results_are_explicit(api) -> None:
+    client, _, _ = api
+    project_id = client.get("/api/projects").json()[0]["id"]
+    uploaded = client.post(
+        "/api/batches",
+        data={
+            "project_id": str(project_id),
+            "supplier_id": "partial",
+            "name": "partial",
+            "contents": json.dumps([
+                {"external_id": "ok", "title": "title", "body": "body", "payload": {}},
+                {"external_id": "bad", "title": "", "body": "body", "payload": {}},
+            ]),
+        },
+        files=[
+            ("files", ("ok.png", b"ok", "image/png")),
+            ("files", ("bad.png", b"bad", "image/png")),
+        ],
+    ).json()
+    first_id = next(item["id"] for item in uploaded["contents"] if item["external_id"] == "ok")
+    assert client.post(f"/api/contents/{first_id}/audit").status_code == 200
+    assert client.post(f"/api/contents/{first_id}/audit").status_code == 409
+
+    response = client.post(f"/api/batches/{uploaded['id']}/audit")
+    assert response.status_code == 200
+    assert {entry["status"] for entry in response.json()["results"]} == {"error"}
+    assert all(entry.get("error") for entry in response.json()["results"])
+
+
+def test_upload_requires_one_valid_file_per_row_and_enforces_size(api) -> None:
+    client, _, tmp_path = api
+    project_id = client.get("/api/projects").json()[0]["id"]
+    data = {
+        "project_id": str(project_id),
+        "supplier_id": "upload",
+        "name": "upload",
+        "contents": json.dumps([
+            {"external_id": "a", "title": "a", "body": "a", "payload": {}},
+            {"external_id": "b", "title": "b", "body": "b", "payload": {}},
+        ]),
     }
+    assert client.post("/api/batches", data=data).status_code == 422
+    mismatch = client.post(
+        "/api/batches", data=data, files=[("files", ("a.png", b"png", "image/png"))]
+    )
+    assert mismatch.status_code == 422
+    one = {
+        **data,
+        "contents": json.dumps([{"external_id": "c", "title": "c", "body": "c", "payload": {}}]),
+    }
+    assert client.post(
+        "/api/batches", data=one, files=[("files", ("c.png", b"png", "text/plain"))]
+    ).status_code == 422
+    response = client.post(
+        "/api/batches",
+        data=one,
+        files=[("files", ("c.png", b"x" * (20 * 1024 * 1024 + 1), "image/png"))],
+    )
+    assert response.status_code == 413
+    assert list((tmp_path / "data" / "uploads").iterdir()) == []
 
 
 def test_not_found_validation_and_failed_batch_transaction(api) -> None:
@@ -292,6 +355,10 @@ def test_not_found_validation_and_failed_batch_transaction(api) -> None:
                 ]
             ),
         },
+        files=[
+            ("files", ("duplicate-1.png", b"one", "image/png")),
+            ("files", ("duplicate-2.png", b"two", "image/png")),
+        ],
     )
     assert duplicate_batch.status_code == 409
 

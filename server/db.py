@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from threading import Lock
 from typing import Generator, Optional
 
 from sqlalchemy import Engine, create_engine, event
@@ -37,8 +38,37 @@ def create_db_engine(database_url: Optional[str] = None) -> Engine:
     return engine
 
 
+_engine: Optional[Engine] = None
+_session_factory: Optional[sessionmaker] = None
+_database_url: Optional[str] = None
+_resource_lock = Lock()
+
+
+def get_db_engine() -> Engine:
+    global _engine, _session_factory, _database_url
+    configured_url = os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+    with _resource_lock:
+        if _engine is None or _database_url != configured_url:
+            if _engine is not None:
+                _engine.dispose()
+            _engine = create_db_engine(configured_url)
+            _session_factory = sessionmaker(bind=_engine, expire_on_commit=False)
+            _database_url = configured_url
+        return _engine
+
+
+def reset_db_resources() -> None:
+    global _engine, _session_factory, _database_url
+    with _resource_lock:
+        if _engine is not None:
+            _engine.dispose()
+        _engine = None
+        _session_factory = None
+        _database_url = None
+
+
 def get_session() -> Generator[Session, None, None]:
-    engine = create_db_engine()
-    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
-    with session_factory() as session:
+    get_db_engine()
+    assert _session_factory is not None
+    with _session_factory() as session:
         yield session

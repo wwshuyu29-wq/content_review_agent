@@ -113,6 +113,8 @@ export interface AuditDetail extends AuditRun {
 export interface ReviewTask {
   id: number;
   content_item_id: number;
+  target_content_version_id: number;
+  audit_run_id: number;
   issue_id: number | null;
   task_type: "REVIEW_FIX_PROPOSAL" | "RISK_REVIEW" | string;
   status: string;
@@ -140,6 +142,7 @@ export interface ReportData {
   project: { id: number; name: string };
   batch: { id: number; name: string } | null;
   totals: { contents: number; issues: number; tasks: number };
+  historical_totals: { issues: number; tasks: number };
   status_counts: Record<string, number>;
   category_counts: Record<string, number>;
   rule_counts: Record<string, number>;
@@ -149,8 +152,14 @@ export interface ReportData {
 export interface Config {
   reviewer: string;
   model: string;
-  base_url: string;
   key_set: boolean;
+}
+
+export interface BatchAuditResult {
+  content_id: number;
+  status: "success" | "error";
+  audit_run_id: number | null;
+  error: string | null;
 }
 
 export interface RuleVersionInput {
@@ -216,7 +225,7 @@ export const api = {
   content: (id: number): Promise<ContentDetail> => request(`/api/contents/${id}`),
   auditContent: (id: number): Promise<AuditDetail> =>
     request(`/api/contents/${id}/audit`, { method: "POST" }),
-  auditBatch: (id: number): Promise<{ batch_id: number; audited: number; audit_run_ids: number[] }> =>
+  auditBatch: (id: number): Promise<{ batch_id: number; audited: number; audit_run_ids: number[]; results: BatchAuditResult[] }> =>
     request(`/api/batches/${id}/audit`, { method: "POST" }),
   reviewTasks: (filters: { status?: string; project_id?: number; batch_id?: number }): Promise<ReviewTask[]> =>
     request(`/api/review-tasks${query(filters)}`),
@@ -227,5 +236,6 @@ export const api = {
   report: (projectId: number, batchId?: number): Promise<ReportData> =>
     request(`/api/reports${query({ project_id: projectId, batch_id: batchId })}`),
   config: (): Promise<Config> => request("/api/config"),
-  saveConfig: (body: Partial<Config>): Promise<Config> => request("/api/config", jsonRequest("PUT", body)),
+  saveConfig: (body: Partial<Pick<Config, "reviewer" | "model">>): Promise<Config> =>
+    request("/api/config", jsonRequest("PUT", body)),
 };

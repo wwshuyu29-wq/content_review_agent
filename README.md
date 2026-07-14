@@ -53,7 +53,7 @@ export DATABASE_URL="sqlite:////tmp/content-review.db"
 export DATABASE_URL="postgresql+psycopg://review_user:password@db.example.com:5432/content_review"
 ```
 
-应用启动时通过 SQLAlchemy 创建缺失表并幂等写入默认项目。当前没有 Alembic 迁移；已有生产数据库发生模型变更时，需要在部署前补充受控迁移。
+应用启动时通过 SQLAlchemy 创建缺失表并幂等写入默认项目。当前没有 Alembic 迁移。本次模型为 `review_tasks` 增加必填版本与审核外键，fresh SQLite 会自动创建完整结构；已有本地演示库必须先停止服务并删除 `data/review.db` 后重启以重建。生产或需保留数据的数据库不得直接删除，部署前必须补充受控迁移。
 
 ### OneAPI
 
@@ -67,12 +67,12 @@ export ONEAPI_MODEL="实际可用的模型名"
 export ONEAPI_BASE_URL="https://oneapi-comate.baidu-int.com/v1"
 ```
 
-`ONEAPI_BASE_URL` 默认是 `https://oneapi-comate.baidu-int.com/v1`。`ONEAPI_MODEL` 和 base URL 也可在审核台保存为非敏感运行配置；审核台的非空保存值优先于对应环境变量。`ONEAPI_KEY` 不在 API、网页配置或数据库中接收、返回或持久化。不要将密钥写入仓库文件或命令历史。
+`ONEAPI_BASE_URL` 默认是 `https://oneapi-comate.baidu-int.com/v1`，只能由受信任的进程环境提供，API 和审核台均不能读取或修改它。`ONEAPI_MODEL` 可在审核台保存为非敏感运行配置，非空保存值优先于环境变量。`ONEAPI_KEY` 不在 API、网页配置或数据库中接收、返回或持久化。不要将密钥写入仓库文件或命令历史。
 
 ## 使用流程
 
 1. 在“标准管理”选择默认项目或创建项目，发布规则版本。
-2. 在“供应商上传”创建 multipart 批次并上传文案与可选图片。
+2. 在“供应商上传”创建 multipart 批次；每条内容必须按行顺序提供一张图片。
 3. 在“审核台”按内容或批次触发审核。
 4. 处理风险人工任务，或接受、编辑接受、拒绝 AI 建议稿。
 5. 在“报告”查看状态、问题类别、规则命中和人工占比。

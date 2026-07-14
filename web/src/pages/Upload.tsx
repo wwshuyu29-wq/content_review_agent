@@ -33,8 +33,8 @@ export default function Upload() {
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!projectId || !form.supplier_id.trim() || !form.batch_name.trim() || !form.external_id.trim() || !form.title.trim() || !form.body.trim()) {
-      setMessage({ type: "err", text: "项目、批次、供应商、内容编号、标题和正文均为必填项" });
+    if (!projectId || !form.supplier_id.trim() || !form.batch_name.trim() || !form.external_id.trim() || !form.title.trim() || !form.body.trim() || !file) {
+      setMessage({ type: "err", text: "项目、批次、供应商、内容编号、标题、正文和图片均为必填项" });
       return;
     }
     setBusy(true);
@@ -85,7 +85,7 @@ export default function Upload() {
           <div className="field span-2"><label htmlFor="publish-time">计划发布时间</label><input id="publish-time" type="text" value={form.publish_time} onChange={setField("publish_time")} placeholder="2026-07-14 18:00" /></div>
           <div className="field span-2"><label htmlFor="title">标题 *</label><input id="title" type="text" value={form.title} onChange={setField("title")} /></div>
           <div className="field span-2"><label htmlFor="body">正文 / 脚本 *</label><textarea id="body" rows={7} value={form.body} onChange={setField("body")} /></div>
-          <div className="field span-2"><label htmlFor="media">图片（JPG / PNG / WEBP）</label><input id="media" type="file" accept=".jpg,.jpeg,.png,.webp" onChange={(event) => setFile(event.target.files?.[0] || null)} /></div>
+          <div className="field span-2"><label htmlFor="media">图片（JPG / PNG / WEBP）*</label><input id="media" type="file" accept=".jpg,.jpeg,.png,.webp" required onChange={(event) => setFile(event.target.files?.[0] || null)} /></div>
         </div>
         {message && <div className={`msg ${message.type}`}>{message.text}</div>}
         <button className="btn btn-primary" type="submit" disabled={busy || projects.length === 0}>{busy ? "提交中..." : "创建批次"}</button>

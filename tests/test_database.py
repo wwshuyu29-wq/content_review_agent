@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import inspect, select
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateTable
@@ -141,6 +142,8 @@ def test_workflow_entities_persist_with_separate_content_statuses(tmp_path: Path
         task = ReviewTask(
             content_item=item,
             issue=issue,
+            target_content_version=version,
+            audit_run=audit,
             task_type="RISK_REVIEW",
             status="OPEN",
         )
@@ -232,6 +235,46 @@ def test_get_session_uses_configured_database_url(monkeypatch: pytest.MonkeyPatc
         session_iterator.close()
 
 
+def test_get_session_reuses_process_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import server.db as db
+
+    database_url = f"sqlite:///{tmp_path / 'shared.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    db.reset_db_resources()
+    first_iterator = db.get_session()
+    second_iterator = db.get_session()
+    first = next(first_iterator)
+    second = next(second_iterator)
+    try:
+        assert first.bind is second.bind
+        assert str(first.bind.url) == database_url
+    finally:
+        first_iterator.close()
+        second_iterator.close()
+        db.reset_db_resources()
+
+
+def test_rule_and_content_versions_are_immutable(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = seed_default_project(session)
+        batch = Batch(project=project, supplier_id="immutable", name="immutable")
+        item = ContentItem(project=project, batch=batch, external_id="immutable", title="title")
+        version = ContentVersion(content_item=item, version=1, source="SUPPLIER", title="title", body="body")
+        session.add(batch)
+        session.commit()
+
+        version.body = "changed"
+        with pytest.raises(InvalidRequestError, match="immutable"):
+            session.commit()
+        session.rollback()
+
+        session.delete(project.current_rule_version)
+        with pytest.raises(InvalidRequestError, match="immutable"):
+            session.commit()
+
+
 def test_foreign_keys_used_by_workflow_queries_are_indexed(tmp_path: Path) -> None:
     engine = make_sqlite_engine(tmp_path)
     Base.metadata.create_all(engine)
@@ -246,7 +289,7 @@ def test_foreign_keys_used_by_workflow_queries_are_indexed(tmp_path: Path) -> No
         "audit_runs": {"content_item_id", "content_version_id", "rule_version_id"},
         "agent_results": {"audit_run_id"},
         "issues": {"audit_run_id", "agent_result_id"},
-        "review_tasks": {"content_item_id", "issue_id"},
+        "review_tasks": {"content_item_id", "target_content_version_id", "audit_run_id", "issue_id"},
         "human_decisions": {"review_task_id"},
     }
 

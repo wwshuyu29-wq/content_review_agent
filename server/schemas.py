@@ -174,6 +174,8 @@ class IssueRead(OrmSchema):
 
 class ReviewTaskCreate(BaseModel):
     content_item_id: int
+    target_content_version_id: int
+    audit_run_id: int
     issue_id: Optional[int] = None
     task_type: str = Field(min_length=1, max_length=100)
     assigned_to: Optional[str] = None
@@ -182,6 +184,8 @@ class ReviewTaskCreate(BaseModel):
 class ReviewTaskRead(OrmSchema):
     id: int
     content_item_id: int
+    target_content_version_id: int
+    audit_run_id: int
     issue_id: Optional[int]
     task_type: str
     status: str
