@@ -332,3 +332,23 @@ class TestCaseRead(OrmSchema):
 class TestEvidenceCreate(BaseModel):
     test_case_id: int
     asset_id: int
+
+
+class ImportConfirm(BaseModel):
+    project_id: int
+    supplier_id: str = Field(min_length=1, max_length=200)
+    batch_name: str = Field(min_length=1, max_length=200)
+
+
+class ImportPreviewRead(BaseModel):
+    token: str
+    rows: List[Dict[str, Any]]
+    tests: List[Dict[str, Any]] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    total_count: int
+    valid_count: int
+    error_count: int
+    test_count: int
+    project_id: int
+    supplier_id: str
+    batch_name: str

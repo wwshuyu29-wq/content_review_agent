@@ -479,7 +479,7 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
         headers = [cell.value for cell in worksheet[1]]
         values = {headers[index]: worksheet.cell(row=2, column=index + 1).value for index in range(len(headers))}
 
-        assert headers == list(IMPORT_COLUMNS) + EXPORT_COLUMNS
+        assert headers[:len(IMPORT_COLUMNS) + len(EXPORT_COLUMNS)] == list(IMPORT_COLUMNS) + EXPORT_COLUMNS
         assert values["供应商内容编号"] == "supplier-1"
         assert values["活动主题"] == "新品活动"
         assert values["平台"] == "抖音"

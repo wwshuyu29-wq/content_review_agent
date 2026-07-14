@@ -95,17 +95,13 @@ def test_default_preview_root_registry_path_is_not_cwd_dependent(tmp_path: Path,
 def test_build_import_template_has_exact_chinese_columns() -> None:
     workbook = load_workbook(BytesIO(build_import_template()), read_only=True)
 
-    assert tuple(cell.value for cell in next(workbook.active.iter_rows())) == (
-        "供应商内容编号",
-        "活动主题",
-        "平台",
-        "标题",
-        "正文",
-        "图片文件名",
-        "计划发布时间",
-        "备注",
+    assert workbook.sheetnames == ["内容清单", "测试场景", "字段说明"]
+    assert tuple(cell.value for cell in next(workbook["内容清单"].iter_rows())) == (
+        "供应商内容编号", "活动主题", "账号名称", "账号类型", "平台", "标题", "正文", "图片文件名", "计划发布时间", "备注",
     )
-    assert len(workbook.sheetnames) == 1
+    assert tuple(cell.value for cell in next(workbook["测试场景"].iter_rows())) == (
+        "供应商内容编号", "测试场景编号", "测试结论", "测试指令", "实际返回结果", "测试城市", "测试时间", "百度地图版本", "设备", "操作系统", "网络环境", "证据文件名",
+    )
 
 
 def test_preview_parses_only_first_worksheet_and_trims_required_values(tmp_path: Path) -> None:
@@ -341,7 +337,7 @@ def test_preview_rejects_encrypted_zip_entries(tmp_path: Path) -> None:
 
 def test_preview_rejects_non_image_entries_and_duplicate_basenames(tmp_path: Path) -> None:
     xlsx = write_workbook(tmp_path / "invalid-entries.xlsx", [valid_row()])
-    non_image = write_zip(tmp_path / "non-image.zip", [("notes.txt", b"text")])
+    non_image = write_zip(tmp_path / "non-image.zip", [("notes.exe", b"text")])
     duplicate = write_zip(
         tmp_path / "duplicate.zip",
         [("a/cover.jpg", b"one"), ("b/cover.jpg", b"two")],

@@ -10,7 +10,7 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from server.models import AuditRun, Batch, ContentItem, ContentVersion, Issue, ReviewTask
+from server.models import AuditRun, Batch, ContentItem, ContentVersion, Issue, ReviewTask, TestCase, TestEvidence
 from server.services.excel_import_service import IMPORT_COLUMNS
 
 EXPORT_COLUMNS = (
@@ -34,6 +34,13 @@ EXPORT_COLUMNS = (
     "审核模型",
     "规则版本",
     "审核完成时间",
+    "测试数量", "证据数量", "证据状态", "测试摘要",
+    "合规 Agent 决策", "合规 Agent 分数", "合规 Agent 摘要",
+    "品牌 Agent 决策", "品牌 Agent 分数", "品牌 Agent 摘要",
+    "产品准确 Agent 决策", "产品准确 Agent 分数", "产品准确 Agent 摘要",
+    "测试可信 Agent 决策", "测试可信 Agent 分数", "测试可信 Agent 摘要",
+    "内容质量 Agent 决策", "内容质量 Agent 分数", "内容质量 Agent 摘要",
+    "传播效果 Agent 决策", "传播效果 Agent 分数", "传播效果 Agent 摘要",
 )
 
 _SEVERITY_RANK = {
@@ -70,6 +77,7 @@ def export_batch(session: Session, batch_id: int) -> bytes:
             selectinload(Batch.content_items)
             .selectinload(ContentItem.audit_runs)
             .selectinload(AuditRun.rule_version),
+            selectinload(Batch.content_items).selectinload(ContentItem.test_cases).selectinload(TestCase.evidence).selectinload(TestEvidence.asset),
             selectinload(Batch.content_items)
             .selectinload(ContentItem.review_tasks)
             .selectinload(ReviewTask.human_decisions),
@@ -136,7 +144,23 @@ def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
         latest_audit.model if latest_audit is not None else "",
         latest_audit.rule_version.version if latest_audit is not None and latest_audit.rule_version is not None else "",
         _excel_datetime(latest_audit.completed_at if latest_audit is not None else None),
+        len(item.test_cases), sum(len(test.evidence) for test in item.test_cases),
+        "PRESENT" if item.test_cases and all(test.evidence for test in item.test_cases) else ("MISSING" if item.test_cases else "NONE"),
+        "\n".join(f"{test.external_test_case_id}: {test.observed_result}" for test in item.test_cases),
+        *sum(([result.decision or "", result.score, result.summary or ""] for result in _agent_results(latest_audit)), []),
     ]
+
+
+def _agent_results(audit: Optional[AuditRun]) -> list[Any]:
+    wanted = ["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]
+    values = {result.agent_id or result.agent_name: result for result in (audit.agent_results if audit else [])}
+    return [values.get(name, _EmptyAgent()) for name in wanted]
+
+
+class _EmptyAgent:
+    decision = ""
+    score = None
+    summary = ""
 
 
 def _supplier_version(item: ContentItem) -> Optional[ContentVersion]:
