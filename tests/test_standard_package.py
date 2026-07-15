@@ -95,6 +95,23 @@ def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
 
 
+def test_loads_registered_compositional_matchers(standards_root: Path) -> None:
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+    matchers = {rule.rule_id: rule.matcher for rule in package.deterministic_rules}
+    assert matchers["CLAIM-UNSUPPORTED-ABSOLUTE-001"] == "guarded_claim"
+    assert matchers["CLAIM-PENDING-001"] == "hotel_capability"
+
+
+def test_rejects_unknown_matcher_in_package(standards_root: Path) -> None:
+    rules_file = standards_root / "rules" / "deterministic_rules.json"
+    rules = json.loads(rules_file.read_text(encoding="utf-8"))
+    rules["rules"][0]["matcher"] = "unknown_composition"
+    rules_file.write_text(json.dumps(rules, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported matcher"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
 def test_rejects_legacy_rule_arrays(standards_root: Path) -> None:
     rules_file = standards_root / "rules" / "deterministic_rules.json"
     rules = json.loads(rules_file.read_text(encoding="utf-8"))

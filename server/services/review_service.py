@@ -9,7 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from scripts.text_review import schema
-from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer
+from scripts.text_review.reviewers.tech_media import (
+    AGENT_ORDER, TechMediaReviewer, role_boundary_error, validate_agent_result,
+)
 from scripts.text_review.standards import Standards
 from server.models import (
     AgentResult,
@@ -101,42 +103,11 @@ def _validate_agent_protocol(results: list[dict], profile: Any) -> Optional[str]
         return "Agent results do not match the required fixed order"
     if len(set(ids)) != len(ids):
         return "Agent results contain duplicate agent_id values"
-    for result in results:
-        if result.get("agent_version") != AGENT_VERSION:
-            return f"Agent {result.get('agent_id')} has an unexpected agent_version"
-        if any(result.get(key) in (None, "") for key in ("decision", "summary", "score")):
-            return f"Agent {result.get('agent_id')} is missing a stable protocol field"
-        if result.get("decision") not in {
-            "PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK",
-        }:
-            return f"Agent {result.get('agent_id')} has an invalid decision"
-        issues = result.get("issues", [])
-        for issue in issues:
-            references = issue.get("source_reference", [])
-            rule_id = issue.get("rule_id", "")
-            if rule_id.startswith("SYSTEM-"):
-                if not all(str(reference).startswith("SYSTEM:") for reference in references):
-                    return f"Agent {result.get('agent_id')} has invalid system issue references"
-            elif not references or not set(references) <= set(profile.known_source_references):
-                return f"Agent {result.get('agent_id')} has missing or unknown issue references"
-        if result.get("decision") == "PASS" and issues:
-            return f"Agent {result.get('agent_id')} returned PASS with issues"
-        if result.get("decision") in {"HUMAN_REVIEW", "BLOCK"}:
-            if not any(
-                issue.get("human_required") or str(issue.get("severity", "")).upper() in {"HIGH", "CRITICAL"}
-                for issue in issues
-            ):
-                return f"Agent {result.get('agent_id')} returned a blocking decision without a blocking issue"
-        if result.get("decision") == "NEED_TEXT_FIX" and not any(
-            str(issue.get("severity", "")).upper() in {"MEDIUM", "MID"} for issue in issues
-        ):
-            return f"Agent {result.get('agent_id')} returned NEED_TEXT_FIX without a medium issue"
-        if result.get("decision") == "PASS_WITH_SUGGESTIONS":
-            if any(
-                issue.get("human_required") or str(issue.get("severity", "")).upper() != "LOW"
-                for issue in issues
-            ):
-                return f"Agent {result.get('agent_id')} returned invalid suggestions"
+    known_references = set(profile.known_source_references)
+    for expected_agent_id, result in zip(AGENT_ORDER, results):
+        error = validate_agent_result(result, expected_agent_id, known_references)
+        if error:
+            return error
     return None
 
 
@@ -462,6 +433,9 @@ def run_audit(
     )
     strict_protocol = item.project.content_type == "TECH_MEDIA_REVIEW"
     protocol_error = _validate_agent_protocol(agent_result_data, profile) if strict_protocol else None
+    role_boundary_agents = {
+        result.get("agent_id") for result in agent_result_data if role_boundary_error(result)
+    } if strict_protocol else set()
     persisted_agent_keys: set[tuple[Any, Any, Any]] = set()
     for result_data in agent_result_data:
         persistence_key = (result_data.get("agent_name"),)
@@ -481,6 +455,8 @@ def run_audit(
         )
         session.add(result)
         session.flush()
+        if result_data.get("agent_id") in role_boundary_agents:
+            continue
         for issue_data in result_data.get("issues", []):
             issue_data = {
                 "source_reference": [],
@@ -532,7 +508,15 @@ def run_audit(
     )
     arbitration = arbitrate_review(
         [
-            {"agent_id": result.get("agent_id"), "agent_name": result.get("agent_name"), "decision": result.get("decision")}
+            {
+                "agent_id": result.get("agent_id"),
+                "agent_name": result.get("agent_name"),
+                "decision": (
+                    "PASS_WITH_SUGGESTIONS"
+                    if result.get("agent_id") in role_boundary_agents
+                    else result.get("decision")
+                ),
+            }
             for result in agent_result_data
         ],
         persisted_issues,

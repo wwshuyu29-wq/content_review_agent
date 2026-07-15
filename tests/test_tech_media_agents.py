@@ -180,11 +180,70 @@ def test_representative_valid_protocol_preserves_revision_and_human_review(repre
     assert {task.task_type for task in arbitration.task_specs} == {"HUMAN_REVIEW", "SUPPLIER_REVISION"}
 
 
-def test_heuristic_mode_returns_six_human_review_results_without_semantic_findings():
+def test_adversarial_role_decisions_are_rejected_without_losing_legitimate_specialist_escalation():
+    calls = {agent_id: 0 for agent_id in AGENT_ORDER}
+
+    def finding(agent_id, category):
+        return AgentIssue(
+            rule_id=f"{agent_id}-001", category=category, severity="HIGH", field="body",
+            evidence=EvidenceSpan(quote=agent_id), reason="adversarial result", suggestion="review",
+            source_reference=["project.yaml"], auto_fixable=False, human_required=True, confidence=0.9,
+        )
+
+    outputs = {
+        "COMPLIANCE": ("BLOCK", [finding("COMPLIANCE", "compliance")]),
+        "BRAND": ("HUMAN_REVIEW", [finding("BRAND", "brand_tone")]),
+        "PRODUCT_ACCURACY": ("HUMAN_REVIEW", [finding("PRODUCT_ACCURACY", "product_fact")]),
+        "TEST_CREDIBILITY": ("HUMAN_REVIEW", [finding("TEST_CREDIBILITY", "test_evidence")]),
+        "CONTENT_QUALITY": ("PASS", []),
+        "CAMPAIGN_EFFECTIVENESS": ("BLOCK", [finding("CAMPAIGN_EFFECTIVENESS", "campaign")]),
+    }
+
+    class LLM:
+        def chat_json(self, prompt, schema):
+            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
+            calls[agent_id] += 1
+            decision, issues = outputs[agent_id]
+            return AgentReviewResult(
+                agent_id=agent_id, agent_version=AGENT_VERSION, decision=decision,
+                summary="adversarial", score=50, confidence=0.9, issues=issues,
+            ).model_dump_json()
+
+    results = TechMediaReviewer(llm=LLM()).review_structured(CONTEXT, PROFILE)
+    by_agent = {result.agent_id: result for result in results}
+
+    assert by_agent["COMPLIANCE"].decision == "BLOCK"
+    assert by_agent["PRODUCT_ACCURACY"].decision == "HUMAN_REVIEW"
+    assert by_agent["TEST_CREDIBILITY"].decision == "HUMAN_REVIEW"
+    assert by_agent["BRAND"].decision == "PASS_WITH_SUGGESTIONS"
+    assert by_agent["CAMPAIGN_EFFECTIVENESS"].decision == "PASS_WITH_SUGGESTIONS"
+    assert calls["BRAND"] == 3
+    assert calls["CAMPAIGN_EFFECTIVENESS"] == 3
+
+
+def test_brand_fact_conflict_can_legitimately_escalate():
+    issue = AgentIssue(
+        rule_id="BRAND-FACT-001", category="brand_fact", severity="HIGH", field="body",
+        evidence=EvidenceSpan(quote="错误产品名"), reason="与品牌事实冲突", suggestion="更正产品名",
+        source_reference=["project.yaml"], auto_fixable=False, human_required=True, confidence=0.9,
+    )
+
+    TechMediaReviewer._validate_coherence(
+        AgentReviewResult(
+            agent_id="BRAND", agent_version=AGENT_VERSION, decision="HUMAN_REVIEW",
+            summary="brand fact conflict", score=20, confidence=0.9, issues=[issue],
+        ),
+        "BRAND",
+        PROFILE,
+    )
+
+
+def test_heuristic_mode_returns_nonblocking_campaign_fallback_and_human_review_for_required_roles():
     results = TechMediaReviewer().review_structured(CONTEXT, PROFILE)
     assert len(results) == 6
-    assert all(result.decision == "HUMAN_REVIEW" for result in results)
-    assert all(result.issues and result.issues[0].human_required for result in results)
+    assert all(result.decision == "HUMAN_REVIEW" for result in results[:-1])
+    assert results[-1].decision == "PASS_WITH_SUGGESTIONS"
+    assert all(result.issues for result in results)
     assert all(result.issues[0].rule_id == "SYSTEM-LLM-UNAVAILABLE" for result in results)
     assert all(result.confidence > 0.9 for result in results)
 

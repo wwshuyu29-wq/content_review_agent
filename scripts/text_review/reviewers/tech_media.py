@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from .base import AgentIssue, AgentReviewResult, EvidenceSpan
 
@@ -63,6 +63,65 @@ _AGENT_INSTRUCTIONS = {
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _value(record: Any, name: str, default: Any = None) -> Any:
+    return record.get(name, default) if isinstance(record, dict) else getattr(record, name, default)
+
+
+def role_boundary_error(result: Any) -> Optional[str]:
+    agent_id = str(_value(result, "agent_id", _value(result, "agent_name", "")))
+    decision = str(_value(result, "decision", "")).upper()
+    issues = list(_value(result, "issues", []) or [])
+    if agent_id == "CAMPAIGN_EFFECTIVENESS" and decision not in {"PASS", "PASS_WITH_SUGGESTIONS"}:
+        return "role boundary: CAMPAIGN_EFFECTIVENESS is suggestions-only"
+    if agent_id == "BRAND" and decision in {"NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"}:
+        fact_categories = {"BRAND_FACT", "BRAND_IDENTITY", "BRAND_NAME", "BRAND_POSITIONING_FACT"}
+        if not any(str(_value(issue, "category", "")).upper() in fact_categories for issue in issues):
+            return "role boundary: BRAND escalation requires an explicit brand fact or identity conflict"
+    return None
+
+
+def validate_agent_result(result: Any, expected_agent_id: str, known_references: set[str]) -> Optional[str]:
+    if _value(result, "agent_id", _value(result, "agent_name")) != expected_agent_id:
+        return f"agent_id must be {expected_agent_id}"
+    if _value(result, "agent_version") != AGENT_VERSION:
+        return f"Agent {expected_agent_id} has an unexpected agent_version"
+    if any(_value(result, key) in (None, "") for key in ("decision", "summary", "score")):
+        return f"Agent {expected_agent_id} is missing a stable protocol field"
+    decision = str(_value(result, "decision", "")).upper()
+    if decision not in {"PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"}:
+        return f"Agent {expected_agent_id} has an invalid decision"
+    issues = list(_value(result, "issues", []) or [])
+    for issue in issues:
+        references = list(_value(issue, "source_reference", []) or [])
+        rule_id = str(_value(issue, "rule_id", ""))
+        if rule_id.startswith("SYSTEM-"):
+            if not all(str(reference).startswith("SYSTEM:") for reference in references):
+                return f"Agent {expected_agent_id} has invalid system issue references"
+        elif not references or not set(references) <= known_references:
+            return f"Agent {expected_agent_id} has missing or unknown issue references"
+    if decision == "PASS" and issues:
+        return f"Agent {expected_agent_id} returned PASS with issues"
+    if decision in {"HUMAN_REVIEW", "BLOCK"} and not any(
+        bool(_value(issue, "human_required", False))
+        or str(_value(issue, "severity", "")).upper() in {"HIGH", "CRITICAL"}
+        for issue in issues
+    ):
+        return f"Agent {expected_agent_id} returned a blocking decision without a blocking issue"
+    if decision == "NEED_TEXT_FIX" and not any(
+        str(_value(issue, "severity", "")).upper() in {"MEDIUM", "MID"}
+        and not bool(_value(issue, "human_required", False))
+        for issue in issues
+    ):
+        return f"Agent {expected_agent_id} returned NEED_TEXT_FIX without a non-human medium issue"
+    if decision == "PASS_WITH_SUGGESTIONS" and any(
+        bool(_value(issue, "human_required", False))
+        or str(_value(issue, "severity", "")).upper() != "LOW"
+        for issue in issues
+    ):
+        return f"Agent {expected_agent_id} returned invalid suggestions"
+    return role_boundary_error(result)
 
 
 class TechMediaReviewer:
@@ -152,6 +211,31 @@ class TechMediaReviewer:
 
     @staticmethod
     def _unavailable(agent_id: str, reason: str) -> AgentReviewResult:
+        if agent_id == "CAMPAIGN_EFFECTIVENESS" or (
+            agent_id == "BRAND" and reason.startswith("role boundary:")
+        ):
+            issue = AgentIssue(
+                rule_id="SYSTEM-LLM-UNAVAILABLE",
+                category="system_suggestion",
+                severity="LOW",
+                field="review",
+                evidence=EvidenceSpan(quote=""),
+                reason=f"nonblocking unavailable review: {reason}",
+                suggestion="Retry this specialist review before using its optional suggestions.",
+                source_reference=["SYSTEM:LLM_UNAVAILABLE"],
+                auto_fixable=False,
+                human_required=False,
+                confidence=0.99,
+            )
+            return AgentReviewResult(
+                agent_id=agent_id,
+                agent_version=AGENT_VERSION,
+                decision="PASS_WITH_SUGGESTIONS",
+                summary="Suggestions-only specialist output was unavailable or outside its role boundary.",
+                score=0,
+                confidence=0.99,
+                issues=[issue],
+            )
         issue = AgentIssue(
             rule_id="SYSTEM-LLM-UNAVAILABLE",
             category="system",
@@ -177,28 +261,9 @@ class TechMediaReviewer:
 
     @staticmethod
     def _validate_coherence(result: AgentReviewResult, agent_id: str, profile: ReviewProfile) -> None:
-        if result.agent_id != agent_id:
-            raise ValueError(f"agent_id must be {agent_id}")
-        if result.agent_version != AGENT_VERSION:
-            raise ValueError(f"agent_version must be {AGENT_VERSION}")
-        known = set(profile.known_source_references)
-        for issue in result.issues:
-            if issue.rule_id.startswith("SYSTEM-"):
-                if not all(reference.startswith("SYSTEM:") for reference in issue.source_reference):
-                    raise ValueError("system issue references must use SYSTEM: prefix")
-            elif not issue.source_reference or not set(issue.source_reference) <= known:
-                raise ValueError("issue source_reference is missing or unknown")
-        if result.decision == "PASS" and result.issues:
-            raise ValueError("PASS cannot contain issues")
-        if result.decision in {"HUMAN_REVIEW", "BLOCK"}:
-            if not any(issue.human_required or issue.severity in {"HIGH", "CRITICAL"} for issue in result.issues):
-                raise ValueError("blocking decision requires a blocking issue")
-        if result.decision == "NEED_TEXT_FIX":
-            if not any(issue.severity == "MEDIUM" and not issue.human_required for issue in result.issues):
-                raise ValueError("NEED_TEXT_FIX requires a non-human MEDIUM issue")
-        if result.decision == "PASS_WITH_SUGGESTIONS":
-            if any(issue.human_required or issue.severity != "LOW" for issue in result.issues):
-                raise ValueError("suggestions must be non-human LOW issues")
+        error = validate_agent_result(result, agent_id, set(profile.known_source_references))
+        if error:
+            raise ValueError(error)
 
     def _llm_result(self, agent_id: str, prompt: str, profile: ReviewProfile) -> AgentReviewResult:
         last_error = "no response"

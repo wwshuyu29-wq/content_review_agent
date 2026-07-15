@@ -114,6 +114,26 @@ def test_arbiter_routes_required_outcomes():
     )], []).review_status == ReviewStatus.PASSED
 
 
+def test_text_only_claim_issue_requires_supplier_revision_not_human_review():
+    agent_results = [
+        {"agent_id": agent_id, "decision": "PASS"}
+        for agent_id in (
+            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+        )
+    ]
+    finding = issue(
+        "CLAIM-UNSUPPORTED-ABSOLUTE-001", "MEDIUM",
+        action="REQUIRE_TEXT_FIX", human_required=False,
+    )
+
+    result = arbitrate_review(agent_results, [finding])
+
+    assert result.review_status is ReviewStatus.SUPPLIER_REVISION_REQUIRED
+    assert result.publish_status.value == "NOT_READY"
+    assert [task.task_type for task in result.task_specs] == ["SUPPLIER_REVISION"]
+
+
 def test_arbiter_preserves_supplier_revision_task_under_human_review_precedence():
     agent_results = [
         {"agent_id": agent_id, "decision": decision}

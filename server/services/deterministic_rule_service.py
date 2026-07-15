@@ -115,13 +115,134 @@ def _match_text(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]
     return issues
 
 
+def _segments(text: str) -> list[str]:
+    return [segment.strip() for segment in re.split(r"[。！？!?；;\n]+", text) if segment.strip()]
+
+
+def _contains_any(text: str, terms: list[str]) -> bool:
+    return any(term and term in text for term in terms)
+
+
+def _is_guarded_context(segment: str, rule: RuleSpec) -> bool:
+    return _contains_any(segment, _values(rule.model_extra.get("negation_terms", []))) or _contains_any(
+        segment, _values(rule.model_extra.get("criticism_terms", []))
+    )
+
+
+def _is_bound_observation(context: ReviewContext, segment: str) -> bool:
+    for record in _valid_test_cases(context):
+        observed = str(record.get("observed_result", record.get("result", ""))).strip()
+        if observed and (observed in segment or segment in observed):
+            return True
+    return False
+
+
+def _guarded_claim_issues(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
+    phrases = _values(rule.model_extra.get("phrases", []))
+    subjects = _values(rule.model_extra.get("subject_terms", []))
+    quantifiers = _values(rule.model_extra.get("quantifier_terms", []))
+    capabilities = _values(rule.model_extra.get("capability_terms", []))
+    percentage_contexts = _values(rule.model_extra.get("percentage_context_terms", []))
+    issues = []
+    for field, text in _text_fields(rule, context):
+        if not _scoped(rule, context, field):
+            continue
+        for segment in _segments(text):
+            if _is_guarded_context(segment, rule) or _is_bound_observation(context, segment):
+                continue
+            direct = next((phrase for phrase in phrases if phrase in segment), "")
+            composition = (
+                _contains_any(segment, subjects)
+                and _contains_any(segment, quantifiers)
+                and _contains_any(segment, capabilities)
+            )
+            percentage = bool(re.search(r"(?<!\d)100\s*%", segment)) and _contains_any(segment, percentage_contexts)
+            if direct or composition or percentage:
+                evidence = direct or segment
+                issues.append(_issue(
+                    rule, field=field, evidence=evidence,
+                    reason="命中缺少所提供依据的绝对、保证或能力比较表述",
+                    suggestion="改为有边界的观察或补充可追溯依据",
+                ))
+    return issues
+
+
+def _hotel_capability_issues(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
+    hotel_terms = _values(rule.model_extra.get("hotel_terms", []))
+    capability_terms = _values(rule.model_extra.get("capability_terms", []))
+    issues = []
+    for field, text in _text_fields(rule, context):
+        if not _scoped(rule, context, field):
+            continue
+        for segment in _segments(text):
+            if _is_guarded_context(segment, rule):
+                continue
+            if _contains_any(segment, hotel_terms) and _contains_any(segment, capability_terms):
+                issues.append(_issue(
+                    rule, field=field, evidence=segment,
+                    reason="命中待确认的酒店预订、自动筛选、比较或价值排序能力",
+                    suggestion="保留为待确认产品能力并转人工核验",
+                ))
+    return issues
+
+
+def _record_identifier(record: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, int):
+            return str(value)
+    return ""
+
+
+def _test_case_id(record: Mapping[str, Any]) -> str:
+    return _record_identifier(record, ("test_case_id", "external_test_case_id", "id"))
+
+
+def _evidence_asset_id(record: Mapping[str, Any]) -> str:
+    return _record_identifier(record, ("asset_id", "external_id", "id"))
+
+
+def _evidence_manifest_ids(context: ReviewContext) -> set[str]:
+    return {
+        asset_id for record in list(context.evidence) + list(context.evidence_assets)
+        if (asset_id := _evidence_asset_id(record))
+    }
+
+
+def _evidence_bindings(context: ReviewContext) -> set[tuple[str, str]]:
+    return {
+        (_test_case_id(record), _evidence_asset_id(record))
+        for record in context.evidence
+        if _test_case_id(record) and _evidence_asset_id(record)
+    }
+
+
 def _valid_test_cases(context: ReviewContext) -> list[Mapping[str, Any]]:
-    return [
-        record for record in context.test_cases
-        if any(str(record.get(key, "")).strip() for key in ("test_case_id", "id"))
-        and str(record.get("command", "")).strip()
-        and str(record.get("observed_result", record.get("result", ""))).strip()
-    ]
+    manifest_ids = _evidence_manifest_ids(context)
+    bindings = _evidence_bindings(context)
+    valid = []
+    for record in context.test_cases:
+        test_case_id = _test_case_id(record)
+        claim_value = record.get("claim", "")
+        command_value = record.get("command", "")
+        observed_value = record.get("observed_result", record.get("result", ""))
+        claim = claim_value.strip() if isinstance(claim_value, str) else ""
+        command = command_value.strip() if isinstance(command_value, str) else ""
+        observed = observed_value.strip() if isinstance(observed_value, str) else ""
+        references = {
+            str(identifier).strip()
+            for identifier in record.get("evidence_asset_ids", []) or []
+            if str(identifier).strip()
+        }
+        if (
+            test_case_id and claim and command and observed and references
+            and references <= manifest_ids
+            and all((test_case_id, asset_id) in bindings for asset_id in references)
+        ):
+            valid.append(record)
+    return valid
 
 
 def _valid_evidence(context: ReviewContext) -> list[Mapping[str, Any]]:
@@ -169,7 +290,12 @@ def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIs
             missing.append(field)
     required_test_case_fields = _values(rule.model_extra.get("required_test_case_fields", []))
     for field in required_test_case_fields:
-        if valid_test_cases and any(not str(record.get(field, "")).strip() for record in valid_test_cases):
+        if context.test_cases and any(
+            not isinstance(record.get(field), (str, list, tuple, set))
+            or not record.get(field)
+            or (isinstance(record.get(field), str) and not record.get(field).strip())
+            for record in context.test_cases
+        ):
             missing.append(f"test_cases.{field}")
     if not missing:
         return []
@@ -216,11 +342,19 @@ def _normalize_platform(profile: ReviewProfile, platform: str) -> str:
 def evaluate_rules(profile: ReviewProfile, context: ReviewContext) -> list[StructuredIssue]:
     context = context.model_copy(update={"platform": _normalize_platform(profile, context.platform)})
     issues: list[StructuredIssue] = []
+    supported = {
+        "exact_phrase", "phrase_list", "replacement_map", "count_consistency",
+        "evidence_required", "required_term", "guarded_claim", "hotel_capability",
+    }
     for rule in profile.rules:
-        if rule.matcher not in {"exact_phrase", "phrase_list", "replacement_map", "count_consistency", "evidence_required", "required_term"}:
+        if rule.matcher not in supported:
             raise ValueError(f"unsupported matcher: {rule.matcher}")
         if rule.matcher in {"exact_phrase", "phrase_list", "replacement_map"}:
             issues.extend(_match_text(rule, context))
+        elif rule.matcher == "guarded_claim":
+            issues.extend(_guarded_claim_issues(rule, context))
+        elif rule.matcher == "hotel_capability":
+            issues.extend(_hotel_capability_issues(rule, context))
         elif not _scoped(rule, context, "title" if "title" in _configured_fields(rule) else "body"):
             continue
         elif rule.matcher == "count_consistency":

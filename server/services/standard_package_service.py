@@ -22,6 +22,8 @@ SUPPORTED_MATCHERS = {
     "count_consistency",
     "evidence_required",
     "required_term",
+    "guarded_claim",
+    "hotel_capability",
 }
 _SEMANTIC_VERSION = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
 
@@ -114,6 +116,13 @@ class DeterministicRule(StrictModel):
     auto_fixable: bool = False
     source_reference: List[str] = Field(default_factory=list)
     phrases: List[str] = Field(default_factory=list)
+    subject_terms: List[str] = Field(default_factory=list)
+    quantifier_terms: List[str] = Field(default_factory=list)
+    capability_terms: List[str] = Field(default_factory=list)
+    percentage_context_terms: List[str] = Field(default_factory=list)
+    hotel_terms: List[str] = Field(default_factory=list)
+    negation_terms: List[str] = Field(default_factory=list)
+    criticism_terms: List[str] = Field(default_factory=list)
     title_pattern: Optional[str] = None
     trigger_terms: List[str] = Field(default_factory=list)
     required_fields: List[str] = Field(default_factory=list)

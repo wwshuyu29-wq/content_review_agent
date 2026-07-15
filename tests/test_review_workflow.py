@@ -229,12 +229,13 @@ def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Pa
             "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
             "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
         ]
-        assert all(result.decision == "HUMAN_REVIEW" for result in audit.agent_results)
+        assert [result.decision for result in audit.agent_results[:-1]] == ["HUMAN_REVIEW"] * 5
+        assert audit.agent_results[-1].decision == "PASS_WITH_SUGGESTIONS"
         assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert len(audit.issues) == 7
-        assert sum(issue.human_required for issue in audit.issues) == 6
+        assert sum(issue.human_required for issue in audit.issues) == 5
 
 
 @pytest.mark.parametrize("decision", ["HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"])
@@ -263,6 +264,74 @@ def test_invalid_agent_protocol_never_approves(tmp_path: Path, reviewer: Protoco
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert any(issue.rule_id == "SYSTEM-AGENT-PROTOCOL" for issue in audit.issues)
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "decision", "category"),
+    [
+        ("CAMPAIGN_EFFECTIVENESS", "BLOCK", "campaign"),
+        ("BRAND", "HUMAN_REVIEW", "brand_tone"),
+    ],
+)
+def test_role_boundary_violations_fail_closed_without_becoming_explicit_blocks(
+    tmp_path: Path, agent_id: str, decision: str, category: str,
+) -> None:
+    ids = [
+        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+    ]
+    results = []
+    for current in ids:
+        findings = []
+        current_decision = "PASS"
+        if current == agent_id:
+            current_decision = decision
+            findings = [issue(
+                "high", rule_id=f"{current}-ADVERSARIAL", category=category,
+                auto_fixable=False, human_required=True,
+            )]
+        results.append({
+            "agent_name": current, "agent_id": current, "agent_version": "tech-media-v1",
+            "decision": current_decision, "summary": "adversarial", "score": 50,
+            "status": "COMPLETED", "issues": findings, "raw_result": {},
+        })
+
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        audit = run_audit(session, item.id, reviewer=FakeReviewer(results))
+
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert not any(task.task_type == "BLOCK_REVIEW" for task in item.review_tasks)
+        assert any(finding.rule_id == "SYSTEM-AGENT-PROTOCOL" for finding in audit.issues)
+
+
+def test_brand_fact_conflict_remains_a_valid_human_review_decision(tmp_path: Path) -> None:
+    ids = [
+        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+    ]
+    results = []
+    for current in ids:
+        findings = []
+        decision = "PASS"
+        if current == "BRAND":
+            decision = "HUMAN_REVIEW"
+            findings = [issue(
+                "high", rule_id="BRAND-FACT-001", category="brand_fact",
+                auto_fixable=False, human_required=True,
+            )]
+        results.append({
+            "agent_name": current, "agent_id": current, "agent_version": "tech-media-v1",
+            "decision": decision, "summary": "brand fact", "score": 50,
+            "status": "COMPLETED", "issues": findings, "raw_result": {},
+        })
+
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        audit = run_audit(session, item.id, reviewer=FakeReviewer(results))
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+        assert not any(finding.rule_id == "SYSTEM-AGENT-PROTOCOL" for finding in audit.issues)
 
 
 def test_all_pass_and_pass_with_suggestions_are_eligible_for_clear_approval(tmp_path: Path) -> None:

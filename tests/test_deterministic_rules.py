@@ -108,15 +108,120 @@ def test_representative_v09_draft_stably_routes_text_fixes_and_verification(repr
         "全赢", "天花板", "越复杂的需求，它越能扛",
     }
     assert any(issue.evidence == "最优解" and issue.suggestion == "一种可行方案" for issue in issues)
-    assert {issue.evidence for issue in by_rule["CLAIM-PENDING-001"]} >= {
-        "AI订酒店", "自动比出哪家更划算",
-    }
+    hotel_evidence = "\n".join(issue.evidence for issue in by_rule["CLAIM-PENDING-001"])
+    assert "AI订酒店" in hotel_evidence
+    assert "自动比出哪家更划算" in hotel_evidence
     assert by_rule["TEST-COUNT-001"][0].human_required is True
     assert "4 个" in by_rule["TEST-COUNT-001"][0].reason
     assert by_rule["TEST-EVIDENCE-001"][0].human_required is True
     assert all(issue.action == "REQUIRE_TEXT_FIX" for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"])
     assert all(issue.human_required is False for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"])
     assert all(issue.human_required for issue in by_rule["CLAIM-PENDING-001"])
+
+
+@pytest.mark.parametrize(
+    ("body", "should_match"),
+    [
+        ("再复杂的路线需求它都能轻松搞定", True),
+        ("任何多约束行程都可以处理", True),
+        ("路线规划准确率100%", True),
+        ("所有场景都能稳定支持", True),
+        ("本次样本覆盖率100%", False),
+        ("电量从80%降到60%", False),
+        ("“绝对领先”这种说法缺少依据", False),
+        ("它并非所有复杂需求都能处理", False),
+    ],
+)
+def test_unsupported_claim_composition_matches_reusable_claims_and_guards_context(v09_profile, body, should_match):
+    matched = any(
+        issue.rule_id == "CLAIM-UNSUPPORTED-ABSOLUTE-001"
+        for issue in evaluate_rules(v09_profile, ReviewContext(body=body))
+    )
+    assert matched is should_match
+
+
+def test_evidenced_percentage_observation_is_not_treated_as_unsupported_absolute(v09_profile):
+    context = ReviewContext(
+        body="亲测路线规划准确率100%",
+        test_cases=[{
+            "test_case_id": "T1", "claim": "路线规划准确率", "command": "连续规划五次",
+            "observed_result": "路线规划准确率100%", "evidence_asset_ids": ["asset-1"],
+            "app_version": "1.0", "tested_at": "2026-07-15", "device": "phone",
+            "operating_system": "iOS", "network_environment": "wifi",
+        }],
+        evidence=[{"test_case_id": "T1", "asset_id": "asset-1"}],
+        evidence_assets=[{"asset_id": "asset-1"}],
+    )
+    assert not any(
+        issue.rule_id == "CLAIM-UNSUPPORTED-ABSOLUTE-001"
+        for issue in evaluate_rules(v09_profile, context)
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "should_match"),
+    [
+        ("它可以直接预订酒店", True),
+        ("能自动筛选性价比更高的住宿", True),
+        ("会比较酒店价格并推荐更划算的一家", True),
+        ("支持酒店智能比价", True),
+        ("导航到酒店后结束行程", False),
+        ("它没有订酒店功能", False),
+        ("不能自动比较酒店价格", False),
+    ],
+)
+def test_pending_hotel_composition_matches_capabilities_with_negation_guard(v09_profile, body, should_match):
+    matched = any(
+        issue.rule_id == "CLAIM-PENDING-001"
+        for issue in evaluate_rules(v09_profile, ReviewContext(body=body))
+    )
+    assert matched is should_match
+
+
+def _bound_test_context(**test_case_updates):
+    test_case = {
+        "test_case_id": "T1", "claim": "路线规划", "command": "规划路线",
+        "observed_result": "返回路线", "evidence_asset_ids": ["asset-1"],
+        "app_version": "1.0", "tested_at": "2026-07-15", "device": "phone",
+        "operating_system": "iOS", "network_environment": "wifi",
+    }
+    test_case.update(test_case_updates)
+    return ReviewContext(
+        title="亲测导航能力", body="实测后返回路线", test_cases=[test_case],
+        evidence=[{"test_case_id": "T1", "asset_id": "asset-1"}],
+        evidence_assets=[{"asset_id": "asset-1"}],
+    )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"claim": " "},
+        {"claim": None},
+        {"command": " "},
+        {"observed_result": ""},
+        {"evidence_asset_ids": []},
+        {"evidence_asset_ids": ["missing-asset"]},
+    ],
+)
+def test_invalid_or_unbound_test_case_fields_require_evidence_review(v09_profile, updates):
+    issues = evaluate_rules(v09_profile, _bound_test_context(**updates))
+    assert any(issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
+
+
+def test_unrelated_evidence_binding_does_not_satisfy_test_case(v09_profile):
+    context = _bound_test_context()
+    context = context.model_copy(update={
+        "evidence": [{"test_case_id": "OTHER", "asset_id": "asset-1"}],
+    })
+    assert any(issue.rule_id == "TEST-EVIDENCE-001" for issue in evaluate_rules(v09_profile, context))
+
+
+def test_fully_bound_test_case_and_manifest_satisfy_evidence_rule(v09_profile):
+    assert not any(
+        issue.rule_id == "TEST-EVIDENCE-001"
+        for issue in evaluate_rules(v09_profile, _bound_test_context())
+    )
 
 
 def test_unbound_test_records_still_require_version_and_conditions(v09_profile):
@@ -173,7 +278,12 @@ def test_evidence_present_does_not_fire():
     context = ReviewContext(
         title="亲测小度想想",
         body="亲测结果很好",
-        test_cases=[{"test_case_id": "T1", "command": "输入路线", "observed_result": "返回方案"}],
+        test_cases=[{
+            "test_case_id": "T1", "claim": "路线规划", "command": "输入路线",
+            "observed_result": "返回方案", "evidence_asset_ids": ["asset-1"],
+        }],
+        evidence=[{"test_case_id": "T1", "asset_id": "asset-1"}],
+        evidence_assets=[{"asset_id": "asset-1"}],
     )
     assert evaluate_rules(profile, context) == []
 

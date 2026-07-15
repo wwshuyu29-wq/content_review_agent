@@ -63,15 +63,11 @@ def _is_safe_auto_fix(issue: Any, safe_auto_fix_rule_ids: set[str]) -> bool:
 
 def _needs_human(issue: Any, safe_auto_fix_rule_ids: set[str]) -> bool:
     severity = str(_value(issue, "severity", "")).upper()
-    text = " ".join(str(_value(issue, key, "")) for key in ("rule_id", "category", "reason")).upper()
+    action = str(_value(issue, "action", "")).upper()
     return (
-        severity in {"HIGH", "UNKNOWN"}
-        or bool(_value(issue, "human_required", False))
-        or "SYSTEM" in text
-        or "UNAVAILABLE" in text
-        or "PENDING" in text
-        or (any(token in text for token in ("EVIDENCE", "CLAIM", "FACT", "FUNCTION", "FEATURE", "NUMBER", "TEST_RESULT"))
-            and not _is_safe_auto_fix(issue, safe_auto_fix_rule_ids))
+        bool(_value(issue, "human_required", False))
+        or action == "HUMAN_REVIEW"
+        or severity in {"HIGH", "CRITICAL", "UNKNOWN"}
     )
 
 
