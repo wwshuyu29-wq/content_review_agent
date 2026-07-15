@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Barrier, Event, get_ident
+from threading import Barrier, Event, Lock, get_ident
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +16,7 @@ from scripts.text_review.reviewers.tech_media import AGENT_ORDER, TechMediaRevie
 from server.db import Base, create_db_engine
 from server.models import (
     AgentAuditProgress,
+    AuditRun,
     Batch,
     BatchAuditJob,
     ContentItem,
@@ -397,6 +398,65 @@ def test_submit_returns_while_worker_commits_agent_transitions(
         assert finished.current_agent_id is None
 
 
+def test_duplicate_worker_submissions_atomically_claim_one_queued_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import reset_db_resources
+    from server.services.audit_executor_service import run_audit_job
+
+    engine = configure_worker_database(tmp_path, monkeypatch)
+    factory_entered = Event()
+    release_factory = Event()
+    call_lock = Lock()
+    model_calls = 0
+
+    class CountingReviewer(PassingReviewer):
+        def review_structured(self, row, standards):
+            nonlocal model_calls
+            with call_lock:
+                model_calls += 1
+            return super().review_structured(row, standards)
+
+    def blocking_reviewer_factory():
+        factory_entered.set()
+        assert release_factory.wait(5)
+        return CountingReviewer()
+
+    with Session(engine) as session:
+        batch = create_auditable_batch(session, item_count=1)
+        job = create_or_get_active_job(session, batch.id, "model")
+        session.commit()
+        job_id = job.id
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(run_audit_job, job_id, blocking_reviewer_factory)
+            assert factory_entered.wait(5)
+            second = executor.submit(run_audit_job, job_id, CountingReviewer)
+            second.result(timeout=5)
+            release_factory.set()
+            first.result(timeout=5)
+
+        with Session(engine) as session:
+            job = session.get(BatchAuditJob, job_id)
+            manuscript = session.scalar(
+                select(ManuscriptAuditJob).where(ManuscriptAuditJob.audit_job_id == job_id)
+            )
+            progress = list(session.scalars(
+                select(AgentAuditProgress)
+                .where(AgentAuditProgress.manuscript_job_id == manuscript.id)
+                .order_by(AgentAuditProgress.position)
+            ))
+            assert model_calls == 1
+            assert job.status == "COMPLETED"
+            assert manuscript.status == "COMPLETED"
+            assert all(agent.status == "PENDING" for agent in progress)
+            assert len(list(session.scalars(select(AuditRun)))) == 1
+    finally:
+        release_factory.set()
+        reset_db_resources()
+
+
 def test_worker_continues_after_manuscript_failure_and_sanitizes_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -436,6 +496,72 @@ def test_worker_continues_after_manuscript_failure_and_sanitizes_error(
             assert manuscripts[0].error_summary == "审核过程中出现异常，请稍后重试或联系管理员。"
             assert "gateway" not in str(job.error_summary)
             assert "secret" not in str(job.error_summary)
+    finally:
+        reset_db_resources()
+
+
+@pytest.mark.parametrize("newer_history", ["FAILED", "SUPERSEDED", "UNAVAILABLE"])
+def test_worker_skips_when_any_valid_audit_precedes_newer_invalid_history_without_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, newer_history: str
+) -> None:
+    from server.db import reset_db_resources
+    from server.services.audit_executor_service import run_audit_job
+    from server.services.review_service import run_audit
+
+    engine = configure_worker_database(tmp_path, monkeypatch)
+    reviewer_calls = 0
+
+    class CountingReviewer(PassingReviewer):
+        def review_structured(self, row, standards):
+            nonlocal reviewer_calls
+            reviewer_calls += 1
+            return super().review_structured(row, standards)
+
+    with Session(engine) as session:
+        batch = create_auditable_batch(session, item_count=1)
+        item = batch.content_items[0]
+        valid = run_audit(session, item.id, reviewer=PassingReviewer())
+        valid.review_key = None
+
+        if newer_history == "UNAVAILABLE":
+            valid.status = "SUPERSEDED"
+            session.commit()
+            newer = run_audit(session, item.id, reviewer=TechMediaReviewer())
+            valid.status = "COMPLETED"
+        else:
+            newer = AuditRun(
+                content_item=item,
+                content_version=item.versions[-1],
+                rule_version=item.project.current_rule_version,
+                review_key=None,
+                model="historical-model",
+                prompt_version=item.project.current_rule_version.prompt_version,
+                status=newer_history,
+                completed_at=datetime.utcnow(),
+            )
+            session.add(newer)
+        session.commit()
+
+        job = create_or_get_active_job(session, batch.id, "model")
+        session.commit()
+        job_id = job.id
+        valid_id = valid.id
+        newer_id = newer.id
+
+    try:
+        run_audit_job(job_id, CountingReviewer)
+        with Session(engine) as session:
+            job = session.get(BatchAuditJob, job_id)
+            manuscript = session.scalar(
+                select(ManuscriptAuditJob).where(ManuscriptAuditJob.audit_job_id == job_id)
+            )
+            assert reviewer_calls == 0
+            assert manuscript.status == "SKIPPED"
+            assert job.status == "COMPLETED"
+            assert session.get(AuditRun, valid_id).status == "COMPLETED"
+            assert session.get(AuditRun, newer_id).status == (
+                "COMPLETED" if newer_history == "UNAVAILABLE" else newer_history
+            )
     finally:
         reset_db_resources()
 

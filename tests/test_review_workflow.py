@@ -661,6 +661,46 @@ def test_unavailable_only_audit_can_be_superseded_without_deleting_history(tmp_p
         assert item.review_status is ReviewStatus.PASSED
 
 
+def test_valid_audit_prevents_newer_unavailable_history_from_being_superseded(tmp_path: Path) -> None:
+    calls = 0
+
+    class CountingProtocolReviewer(ProtocolReviewer):
+        def review_structured(self, row, standards):
+            nonlocal calls
+            calls += 1
+            return super().review_structured(row, standards)
+
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="valid-history",
+            name="有效历史优先",
+            contents=[{
+                "external_id": "valid-history-1",
+                "title": "路线规划体验",
+                "body": "路线规划步骤清晰，正文信息完整。",
+                "payload": {"platform": "xiaohongshu"},
+            }],
+        ).content_items[0]
+        valid = run_audit(session, item.id, reviewer=ProtocolReviewer())
+        valid.review_key = None
+        valid.status = "SUPERSEDED"
+        session.commit()
+        unavailable = run_audit(session, item.id, reviewer=TechMediaReviewer())
+        valid.status = "COMPLETED"
+        session.commit()
+
+        with pytest.raises(ValueError, match="already been audited"):
+            run_audit(session, item.id, reviewer=CountingProtocolReviewer())
+
+        assert calls == 0
+        assert valid.status == "COMPLETED"
+        assert unavailable.status == "COMPLETED"
+        assert unavailable.review_key is not None
+
+
 def test_failed_historical_audit_does_not_block_retry_or_get_deleted(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project, _, item = submit_valid_content(session)

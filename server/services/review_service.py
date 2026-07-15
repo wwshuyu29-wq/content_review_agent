@@ -129,6 +129,21 @@ def _is_unavailable_only_audit(audit: AuditRun) -> bool:
     )
 
 
+def has_valid_completed_audit(
+    session: Session,
+    content_version_id: int,
+    rule_version_id: int,
+) -> bool:
+    completed_audits = session.scalars(
+        select(AuditRun).where(
+            AuditRun.content_version_id == content_version_id,
+            AuditRun.rule_version_id == rule_version_id,
+            AuditRun.status == "COMPLETED",
+        )
+    )
+    return any(not _is_unavailable_only_audit(audit) for audit in completed_audits)
+
+
 def _supersede_unavailable_audit(audit: AuditRun) -> None:
     superseded_at = datetime.utcnow()
     audit.status = "SUPERSEDED"
@@ -370,25 +385,32 @@ def run_audit(
     review_key = None
     if item.project.content_type == "TECH_MEDIA_REVIEW":
         review_key = _review_key(content_version.id, rule_version.id)
-    existing_audit = None
+    matching_audits = []
     if review_key is not None:
-        existing_audit = session.scalar(select(AuditRun).where(AuditRun.review_key == review_key))
-        if existing_audit is None:
-            existing_audit = session.scalar(
-                select(AuditRun)
-                .where(
-                    AuditRun.content_version_id == content_version.id,
-                    AuditRun.rule_version_id == rule_version.id,
-                    AuditRun.status.in_(("RUNNING", "COMPLETED")),
-                )
-                .order_by(AuditRun.id.desc())
+        matching_audits = list(session.scalars(
+            select(AuditRun)
+            .where(
+                AuditRun.content_version_id == content_version.id,
+                AuditRun.rule_version_id == rule_version.id,
+                AuditRun.status.in_(("RUNNING", "COMPLETED")),
             )
-    if existing_audit is not None:
-        if _is_unavailable_only_audit(existing_audit):
-            _supersede_unavailable_audit(existing_audit)
-            session.flush()
-        else:
-            raise ValueError("Content version has already been audited with this rule version")
+            .order_by(AuditRun.id.desc())
+        ))
+    if any(
+        audit.status == "COMPLETED" and not _is_unavailable_only_audit(audit)
+        for audit in matching_audits
+    ):
+        raise ValueError("Content version has already been audited with this rule version")
+    running_audit = next((audit for audit in matching_audits if audit.status == "RUNNING"), None)
+    if running_audit is not None:
+        raise ValueError("Content version has already been audited with this rule version")
+    unavailable_audit = next(
+        (audit for audit in matching_audits if _is_unavailable_only_audit(audit)),
+        None,
+    )
+    if unavailable_audit is not None:
+        _supersede_unavailable_audit(unavailable_audit)
+        session.flush()
     if _open_tasks(item):
         raise ValueError("Content has open review tasks; resolve them before re-audit")
     standards = _standards_from_rule_version(rule_version)

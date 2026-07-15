@@ -7,7 +7,7 @@ import os
 from threading import BoundedSemaphore, Lock
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from scripts.text_review.reviewers.tech_media import TechMediaReviewer
@@ -21,7 +21,7 @@ from server.models import (
     PublishStatus,
     ReviewStatus,
 )
-from server.services.review_service import _is_unavailable_only_audit, run_audit
+from server.services.review_service import has_valid_completed_audit, run_audit
 
 _PUBLIC_ERROR = "审核过程中出现异常，请稍后重试或联系管理员。"
 _MAX_WORKERS = max(1, int(os.environ.get("AUDIT_EXECUTOR_MAX_WORKERS", "1")))
@@ -58,26 +58,23 @@ def _load_job(session: Session, job_id: int) -> Optional[BatchAuditJob]:
     )
 
 
-def _matching_audit(session: Session, content_item: ContentItem) -> Optional[AuditRun]:
-    if not content_item.versions or content_item.project.current_rule_version_id is None:
-        return None
-    content_version = content_item.versions[-1]
-    return session.scalar(
-        select(AuditRun)
+def _claim_queued_job(session: Session, job_id: int) -> bool:
+    now = datetime.utcnow()
+    claimed = session.execute(
+        update(BatchAuditJob)
         .where(
-            AuditRun.content_version_id == content_version.id,
-            AuditRun.rule_version_id == content_item.project.current_rule_version_id,
+            BatchAuditJob.id == job_id,
+            BatchAuditJob.status == "QUEUED",
         )
-        .order_by(AuditRun.id.desc())
+        .values(
+            status="RUNNING",
+            started_at=now,
+            heartbeat_at=now,
+            error_summary=None,
+        )
     )
-
-
-def _is_valid_matching_audit(audit: Optional[AuditRun]) -> bool:
-    return bool(
-        audit is not None
-        and audit.status == "COMPLETED"
-        and not _is_unavailable_only_audit(audit)
-    )
+    session.commit()
+    return claimed.rowcount == 1
 
 
 def _update_counters(job: BatchAuditJob) -> None:
@@ -158,20 +155,14 @@ def run_audit_job(job_id: int, reviewer_factory: Callable[[], Any]) -> None:
 
     engine = get_db_engine()
     with Session(engine, expire_on_commit=False) as session:
+        if not _claim_queued_job(session, job_id):
+            return
         job = _load_job(session, job_id)
         if job is None:
-            return
-        if job.status not in {"QUEUED", "RUNNING"}:
             return
 
         try:
             reviewer = reviewer_factory()
-            now = datetime.utcnow()
-            job.status = "RUNNING"
-            job.started_at = job.started_at or now
-            job.heartbeat_at = now
-            job.error_summary = None
-            session.commit()
 
             for manuscript in job.manuscripts:
                 if manuscript.status in {"COMPLETED", "SKIPPED"}:
@@ -188,7 +179,15 @@ def run_audit_job(job_id: int, reviewer_factory: Callable[[], Any]) -> None:
                     session.commit()
                     continue
 
-                if _is_valid_matching_audit(_matching_audit(session, item)):
+                if (
+                    item.versions
+                    and item.project.current_rule_version_id is not None
+                    and has_valid_completed_audit(
+                        session,
+                        item.versions[-1].id,
+                        item.project.current_rule_version_id,
+                    )
+                ):
                     manuscript.status = "SKIPPED"
                     manuscript.completed_at = datetime.utcnow()
                     manuscript.error_summary = None
