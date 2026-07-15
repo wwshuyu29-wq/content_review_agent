@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from server.models import AuditRun, Batch, ContentItem, ContentVersion, Issue, ReviewTask, TestCase, TestEvidence
-from server.services.excel_import_service import IMPORT_COLUMNS
+from server.services.excel_import_service import CONTENT_COLUMNS
 from server.services.severity_service import highest_severity
 
 EXPORT_COLUMNS = (
@@ -82,7 +82,7 @@ def export_batch(session: Session, batch_id: int) -> bytes:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "批次导出"
-    headers = list(IMPORT_COLUMNS) + list(EXPORT_COLUMNS)
+    headers = list(CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
     worksheet.append([_sanitize_excel_value(value) for value in headers])
 
     for item in sorted(batch.content_items, key=lambda content: content.id):
@@ -111,6 +111,8 @@ def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
     return [
         _payload_value(payload, "supplier_external_id", default=item.external_id),
         _payload_value(payload, "campaign_theme"),
+        _payload_value(payload, "account_name"),
+        _payload_value(payload, "account_type"),
         _payload_value(payload, "platform"),
         _payload_value(payload, "title", default=supplier_version.title if supplier_version is not None else item.title),
         _payload_value(payload, "body", default=supplier_version.body if supplier_version is not None else ""),

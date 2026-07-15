@@ -189,6 +189,32 @@ def test_preview_ignores_blank_rows_and_rejects_more_than_500_nonblank_rows(tmp_
         preview_import(write_workbook(tmp_path / "501.xlsx", rows), None, tmp_path / "rejected")
 
 
+def test_blank_external_id_invalid_row_survives_manifest_round_trip(tmp_path: Path) -> None:
+    xlsx = write_workbook(tmp_path / "blank-id.xlsx", [valid_row(" ")])
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+    loaded = load_preview(preview.token)
+
+    assert loaded == preview
+    assert loaded.rows[0].normalized["external_id"] is None
+    assert loaded.rows[0].valid is False
+    assert_has_error(loaded, "供应商内容编号")
+
+
+def test_blank_test_owner_is_orphan_and_cannot_bind_to_blank_content_id(tmp_path: Path) -> None:
+    xlsx = write_named_workbook(
+        tmp_path / "blank-owner.xlsx",
+        [tech_row(" ")],
+        [[" ", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, None]],
+    )
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+
+    assert preview.rows[0].tests == []
+    assert preview.test_cases == []
+    assert any("<空>" in error and "不存在" in error for error in preview.errors)
+
+
 def test_preview_validates_required_values_and_content_service_lengths(tmp_path: Path) -> None:
     xlsx = write_workbook(
         tmp_path / "invalid-values.xlsx",
@@ -506,6 +532,7 @@ def test_preview_rejects_more_than_1000_zip_entries_and_cleans_up(tmp_path: Path
         lambda payload: payload.update(total_count=99),
         lambda payload: payload["rows"][0].update(valid=False),
         lambda payload: payload["rows"][0]["normalized"].update(unexpected="value"),
+        lambda payload: payload["rows"][0]["normalized"].update(external_id=None),
         lambda payload: payload["rows"][0].update(row_number="2"),
         lambda payload: payload.update(unexpected="value"),
         lambda payload: payload.update(expires_at="not-a-timestamp"),

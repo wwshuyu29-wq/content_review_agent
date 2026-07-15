@@ -13,8 +13,9 @@ from sqlalchemy.orm import Session
 
 from server import main
 from server.db import create_db_engine
-from server.models import AgentResult, AuditRun, Issue, Project
+from server.models import AgentResult, AuditRun, ContentItem, FormatStatus, Issue, Project
 from server.services import excel_import_service
+from server.services.excel_export_service import EXPORT_COLUMNS
 from server.services.excel_import_service import CONTENT_COLUMNS, TEST_CASE_COLUMNS
 
 
@@ -38,12 +39,20 @@ def excel_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     engine.dispose()
 
 
-def workbook_bytes(*, external_id: str = "content-1", body: str = "普通正文", evidence: str | None = None) -> bytes:
+def workbook_bytes(
+    *,
+    external_id: str = "content-1",
+    campaign_theme: str = "活动",
+    account_name: str = "账号",
+    account_type: str = "媒体",
+    body: str = "普通正文",
+    evidence: str | None = None,
+) -> bytes:
     workbook = Workbook()
     content = workbook.active
     content.title = "内容清单"
     content.append(list(CONTENT_COLUMNS))
-    content.append([external_id, "活动", "账号", "媒体", "小红书", "原始标题", body, None, "2026-07-20", "备注"])
+    content.append([external_id, campaign_theme, account_name, account_type, "小红书", "原始标题", body, None, "2026-07-20", "备注"])
     tests = workbook.create_sheet("测试场景")
     tests.append(list(TEST_CASE_COLUMNS))
     if evidence:
@@ -129,6 +138,40 @@ def test_confirm_is_idempotent_and_rejects_cross_identity(excel_api) -> None:
     assert client.post("/api/imports/not-a-token/confirm", json=body).status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("xlsx", "missing_field", "supplier_external_id"),
+    [
+        (workbook_bytes(external_id=" "), "供应商内容编号", None),
+        (workbook_bytes(external_id="missing-theme", campaign_theme=" "), "活动主题", "missing-theme"),
+    ],
+    ids=["missing-content-id", "missing-campaign-theme"],
+)
+def test_http_preview_and_confirm_retain_incomplete_rows(
+    excel_api, xlsx: bytes, missing_field: str, supplier_external_id: str | None
+) -> None:
+    client, engine, _ = excel_api
+    current = project(client)
+
+    preview = preview_request(client, current["id"], xlsx=xlsx)
+    assert preview.status_code == 200, preview.text
+    payload = preview.json()
+    assert payload["rows"][0]["valid"] is False
+    assert any(missing_field in error for error in payload["rows"][0]["errors"])
+
+    confirmed = client.post(
+        f"/api/imports/{payload['token']}/confirm",
+        json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    content_id = confirmed.json()["contents"][0]["id"]
+    with Session(engine) as session:
+        item = session.get(ContentItem, content_id)
+        assert item is not None
+        assert item.external_id == f"import:{payload['token'][:16]}:row:2"
+        assert item.format_status == FormatStatus.INCOMPLETE
+        assert item.versions[0].payload["supplier_external_id"] == supplier_external_id
+
+
 def test_expired_token_returns_422(excel_api) -> None:
     client, _, tmp_path = excel_api
     current = project(client)
@@ -144,13 +187,31 @@ def test_expired_token_returns_422(excel_api) -> None:
 def test_export_route_and_missing_batch(excel_api) -> None:
     client, _, _ = excel_api
     current = project(client)
-    token = preview_request(client, current["id"]).json()["token"]
+    token = preview_request(
+        client,
+        current["id"],
+        xlsx=workbook_bytes(account_name="地图账号", account_type="科技媒体"),
+    ).json()["token"]
     batch = client.post(f"/api/imports/{token}/confirm", json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"}).json()
     exported = client.get(f"/api/batches/{batch['id']}/export")
     assert exported.status_code == 200
     assert "attachment" in exported.headers["content-disposition"]
     sheet = load_workbook(BytesIO(exported.content)).active
-    assert sheet.cell(2, 1).value == "content-1"
+    headers = [cell.value for cell in sheet[1]]
+    values = [cell.value for cell in sheet[2]]
+    assert headers == list(CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
+    assert values[: len(CONTENT_COLUMNS)] == [
+        "content-1",
+        "活动",
+        "地图账号",
+        "科技媒体",
+        "小红书",
+        "原始标题",
+        "普通正文",
+        None,
+        "2026-07-20",
+        "备注",
+    ]
     assert client.get("/api/batches/99999/export").status_code == 404
 
 

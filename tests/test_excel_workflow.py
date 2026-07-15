@@ -29,31 +29,8 @@ from server.models import (
 from server.seed import seed_default_project
 from server.services import excel_import_service
 from server.services.content_service import submit_batch
-from server.services.excel_import_service import IMPORT_COLUMNS, preview_import
-
-
-EXPORT_COLUMNS = [
-    "系统内容编号",
-    "批次编号",
-    "格式校验",
-    "审核状态",
-    "发布状态",
-    "问题数量",
-    "最高风险等级",
-    "问题分类",
-    "命中规则",
-    "问题原因",
-    "原文证据",
-    "修改建议",
-    "最终标题",
-    "最终正文",
-    "最终版本来源",
-    "是否需要人工",
-    "是否已人工确认",
-    "审核模型",
-    "规则版本",
-    "审核完成时间",
-]
+from server.services.excel_export_service import EXPORT_COLUMNS
+from server.services.excel_import_service import CONTENT_COLUMNS, IMPORT_COLUMNS, preview_import
 
 
 def confirm_import(*args, **kwargs):
@@ -110,6 +87,33 @@ def supplier_row(
     return [external_id, campaign_theme, platform, title, body, image_filename, publish_time, note]
 
 
+def write_content_workbook(path: Path, rows: list[list[object]]) -> Path:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "内容清单"
+    worksheet.append(list(CONTENT_COLUMNS))
+    for row in rows:
+        worksheet.append(row)
+    workbook.save(path)
+    return path
+
+
+def content_row(
+    external_id: object,
+    *,
+    campaign_theme: object = "暑期活动",
+    account_name: object = "供应商账号",
+    account_type: object = "媒体",
+    platform: object = "小红书",
+    title: object = "原始标题",
+    body: object = "原始正文",
+    image_filename: object = None,
+    publish_time: object = "2026-07-20",
+    note: object = "供应商备注",
+) -> list[object]:
+    return [external_id, campaign_theme, account_name, account_type, platform, title, body, image_filename, publish_time, note]
+
+
 def write_zip(path: Path, entries: list[tuple[str, bytes]]) -> Path:
     with ZipFile(path, "w") as archive:
         for name, content in entries:
@@ -122,6 +126,39 @@ def payload_by_supplier_id(batch: Batch) -> dict[str, dict]:
         item.versions[0].payload["supplier_external_id"]: item.versions[0].payload
         for item in batch.content_items
     }
+
+
+def test_confirm_import_retains_rows_missing_id_or_other_required_field(tmp_path: Path) -> None:
+    xlsx = write_workbook(
+        tmp_path / "incomplete.xlsx",
+        [
+            supplier_row(" ", title="缺少编号"),
+            supplier_row("missing-theme", campaign_theme=" ", title="缺少活动"),
+        ],
+    )
+    preview = preview_import(xlsx, None, tmp_path / "previews")
+
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = confirm_import(
+            session,
+            preview.token,
+            project_id=project.id,
+            supplier_id="supplier-a",
+            batch_name="保留不完整行",
+        )
+
+        assert len(batch.content_items) == 2
+        by_title = {item.versions[0].title: item for item in batch.content_items}
+        blank_id = by_title["缺少编号"]
+        missing_theme = by_title["缺少活动"]
+        assert blank_id.external_id == f"import:{preview.token[:16]}:row:2"
+        assert blank_id.versions[0].payload["supplier_external_id"] is None
+        assert blank_id.format_status == FormatStatus.INCOMPLETE
+        assert missing_theme.external_id == f"import:{preview.token[:16]}:row:3"
+        assert missing_theme.versions[0].payload["supplier_external_id"] == "missing-theme"
+        assert missing_theme.versions[0].payload["campaign_theme"] is None
+        assert missing_theme.format_status == FormatStatus.INCOMPLETE
 
 
 def test_confirm_import_imports_multiple_preview_rows_into_one_batch(tmp_path: Path) -> None:
@@ -374,12 +411,14 @@ def test_confirm_import_returns_existing_batch_after_concurrent_import_token_con
 
 def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Path) -> None:
     completed_at = datetime(2026, 7, 15, 8, 30, 0)
-    xlsx = write_workbook(
+    xlsx = write_content_workbook(
         tmp_path / "export.xlsx",
         [
-            supplier_row(
+            content_row(
                 "supplier-1",
                 campaign_theme="新品活动",
+                account_name="地图测评号",
+                account_type="科技媒体",
                 platform="抖音",
                 title="供应商标题",
                 body="供应商正文",
@@ -480,9 +519,11 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
         headers = [cell.value for cell in worksheet[1]]
         values = {headers[index]: worksheet.cell(row=2, column=index + 1).value for index in range(len(headers))}
 
-        assert headers[:len(IMPORT_COLUMNS) + len(EXPORT_COLUMNS)] == list(IMPORT_COLUMNS) + EXPORT_COLUMNS
+        assert headers == list(CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
         assert values["供应商内容编号"] == "supplier-1"
         assert values["活动主题"] == "新品活动"
+        assert values["账号名称"] == "地图测评号"
+        assert values["账号类型"] == "科技媒体"
         assert values["平台"] == "抖音"
         assert values["标题"] == "供应商标题"
         assert values["正文"] == "供应商正文"
@@ -529,6 +570,8 @@ def test_export_batch_sanitizes_formula_like_strings(tmp_path: Path) -> None:
         supplier_payload = {
             "supplier_external_id": "=supplier-id",
             "campaign_theme": "+campaign",
+            "account_name": "=account-name",
+            "account_type": "@account-type",
             "platform": "-platform",
             "title": "@title",
             "body": "\tbody",
@@ -589,6 +632,8 @@ def test_export_batch_sanitizes_formula_like_strings(tmp_path: Path) -> None:
         expected_literals = {
             "供应商内容编号": "'=supplier-id",
             "活动主题": "'+campaign",
+            "账号名称": "'=account-name",
+            "账号类型": "'@account-type",
             "平台": "'-platform",
             "标题": "'@title",
             "正文": "'\tbody",

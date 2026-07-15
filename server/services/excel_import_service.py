@@ -1176,9 +1176,9 @@ def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime
     row_numbers = [row.row_number for row in rows]
     if row_numbers != sorted(set(row_numbers)):
         raise ValueError("预览行号无效")
-    content_ids = [row.normalized.get("external_id") for row in rows]
-    if any(not value for value in content_ids):
+    if any(row.valid and not row.normalized.get("external_id") for row in rows):
         raise ValueError("预览内容编号无效")
+    content_ids = [row.normalized.get("external_id") for row in rows if row.normalized.get("external_id")]
     duplicate_ids = {value for value in content_ids if content_ids.count(value) > 1}
     for duplicate in duplicate_ids:
         affected = [row for row in rows if row.normalized.get("external_id") == duplicate]
@@ -1187,14 +1187,15 @@ def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime
     test_ids = [test.external_test_case_id for test in tests]
     if any(not value for value in test_ids) or len(test_ids) != len(set(test_ids)):
         raise ValueError("预览测试场景编号无效或重复")
-    if any(test.content_external_id not in set(content_ids) for test in tests):
+    content_id_set = set(content_ids)
+    if any(not test.content_external_id or test.content_external_id not in content_id_set for test in tests):
         raise ValueError("预览测试场景引用不存在内容")
     for test in tests:
         if any(not _is_safe_basename(name) or Path(name).suffix.lower() not in EVIDENCE_SUFFIXES for name in test.evidence_filenames):
             raise ValueError("预览证据文件名无效")
     grouped = _group_tests(tests)
     for row in rows:
-        expected = [_test_to_dict(test) for test in grouped.get(row.normalized["external_id"], [])]
+        expected = [_test_to_dict(test) for test in grouped.get(row.normalized.get("external_id") or "", [])]
         actual = [_test_to_dict(test) for test in row.tests]
         if actual != expected:
             raise ValueError("预览行测试场景绑定不匹配")
