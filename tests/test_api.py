@@ -48,6 +48,9 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("CR_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("ONEAPI_KEY", "test-secret-key")
+    monkeypatch.setenv("INITIAL_ADMIN_USERNAME", "test-admin")
+    monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.setenv("SESSION_SECRET", "test-session-secret-with-at-least-32-bytes")
     engine = create_db_engine(database_url)
 
     def test_session():

@@ -2,6 +2,30 @@
 set -eu
 
 REPO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ENV_FILE=${ENV_FILE:-$REPO_DIR/.env}
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+if [ -z "${SESSION_SECRET:-}" ]; then
+  printf 'SESSION_SECRET is required. Configure it in the environment or ignored .env file.\n' >&2
+  exit 1
+fi
+if [ "${#SESSION_SECRET}" -lt 32 ]; then
+  printf 'SESSION_SECRET must contain at least 32 characters.\n' >&2
+  exit 1
+fi
+if { [ -n "${INITIAL_ADMIN_USERNAME:-}" ] && [ -z "${INITIAL_ADMIN_PASSWORD:-}" ]; } ||
+   { [ -z "${INITIAL_ADMIN_USERNAME:-}" ] && [ -n "${INITIAL_ADMIN_PASSWORD:-}" ]; }; then
+  printf 'INITIAL_ADMIN_USERNAME and INITIAL_ADMIN_PASSWORD must be configured together.\n' >&2
+  exit 1
+fi
+if [ -n "${INITIAL_ADMIN_PASSWORD:-}" ] && [ "${#INITIAL_ADMIN_PASSWORD}" -lt 12 ]; then
+  printf 'INITIAL_ADMIN_PASSWORD must contain at least 12 characters.\n' >&2
+  exit 1
+fi
 BACKEND_HOST=${BACKEND_HOST:-127.0.0.1}
 BACKEND_PORT=${BACKEND_PORT:-8000}
 FRONTEND_HOST=${FRONTEND_HOST:-127.0.0.1}
@@ -38,7 +62,7 @@ if [ ! -d "$REPO_DIR/web/node_modules" ]; then
   printf 'Frontend dependencies are missing. Run: cd "%s/web" && npm ci\n' "$REPO_DIR" >&2
   exit 1
 fi
-if ! "$PYTHON_BIN" -c 'import fastapi, multipart, sqlalchemy, uvicorn' >/dev/null 2>&1; then
+if ! "$PYTHON_BIN" -c 'import argon2, fastapi, multipart, sqlalchemy, uvicorn' >/dev/null 2>&1; then
   printf 'Backend dependencies are missing. Run: %s -m pip install -r "%s/requirements.txt"\n' "$PYTHON_BIN" "$REPO_DIR" >&2
   exit 1
 fi

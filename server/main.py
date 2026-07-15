@@ -7,10 +7,11 @@ import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -38,6 +39,8 @@ from server.models import (
     Project,
     ReviewTask,
     RuleVersion,
+    User,
+    UserSession,
 )
 from server.schemas import (
     AgentResultRead,
@@ -58,6 +61,18 @@ from server.schemas import (
     TestCaseRead,
 )
 from server.seed import seed_default_project
+from server.services.auth_service import (
+    SESSION_COOKIE_NAME,
+    authenticate_credentials,
+    create_session,
+    csrf_token_for_session,
+    ensure_initial_admin,
+    hash_password,
+    require_admin,
+    require_csrf,
+    require_user,
+    revoke_user_sessions,
+)
 from server.services.content_service import submit_batch
 from server.services.excel_import_service import PreviewIdentity, build_import_template, preview_import, confirm_import as confirm_excel_import
 from server.services.excel_export_service import export_batch
@@ -142,6 +157,7 @@ async def lifespan(_app: FastAPI):
     Base.metadata.create_all(engine)
     ensure_schema_upgrades(engine)
     with Session(engine) as session:
+        ensure_initial_admin(session)
         seed_default_project(session)
         session.commit()
     yield
@@ -153,11 +169,61 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
 
 
 class OrmResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserRead(OrmResponse):
+    id: int
+    username: str
+    display_name: str
+    role: str
+    is_active: bool
+
+
+class AuthResponse(BaseModel):
+    user: UserRead
+    csrf_token: str
+
+
+class LoginInput(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class AdminUserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    display_name: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=12, max_length=1024)
+    role: str = "REVIEWER"
+
+    @field_validator("username", "display_name")
+    @classmethod
+    def strip_required(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Value must not be blank")
+        return value
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in {"ADMIN", "REVIEWER"}:
+            raise ValueError("role must be ADMIN or REVIEWER")
+        return normalized
+
+
+class AdminUserUpdate(BaseModel):
+    is_active: bool
+
+
+class PasswordResetInput(BaseModel):
+    password: str = Field(min_length=12, max_length=1024)
 
 
 class RuleVersionPackageInput(BaseModel):
@@ -280,6 +346,132 @@ def _content_query():
         selectinload(ContentItem.audit_runs).selectinload(AuditRun.issues),
         selectinload(ContentItem.test_cases).selectinload(TestCase.evidence).selectinload(TestEvidence.asset),
     )
+
+
+def _secure_session_cookie() -> bool:
+    configured = os.environ.get("SESSION_COOKIE_SECURE")
+    if configured is not None:
+        return configured.strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get("ENVIRONMENT", "").strip().lower() in {"production", "prod"}
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def login(payload: LoginInput, response: Response, session: Session = Depends(get_session)):
+    user = authenticate_credentials(session, payload.username, payload.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    secrets = create_session(session, user)
+    session.commit()
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        secrets.session_token,
+        max_age=int((secrets.expires_at - datetime.utcnow()).total_seconds()),
+        httponly=True,
+        secure=_secure_session_cookie(),
+        samesite="lax",
+        path="/",
+    )
+    return AuthResponse(user=UserRead.model_validate(user), csrf_token=secrets.csrf_token)
+
+
+@app.post("/api/auth/logout", status_code=204)
+def logout(
+    request: Request,
+    response: Response,
+    _user: User = Depends(require_csrf),
+    session: Session = Depends(get_session),
+):
+    auth_session = session.get(UserSession, request.state.auth_session.id)
+    if auth_session is not None and auth_session.revoked_at is None:
+        auth_session.revoked_at = datetime.utcnow()
+        session.commit()
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=_secure_session_cookie(),
+        samesite="lax",
+        path="/",
+    )
+    response.status_code = 204
+
+
+@app.get("/api/auth/me", response_model=AuthResponse)
+def auth_me(request: Request, user: User = Depends(require_user)):
+    session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    return AuthResponse(
+        user=UserRead.model_validate(user),
+        csrf_token=csrf_token_for_session(session_token),
+    )
+
+
+@app.get("/api/admin/users", response_model=List[UserRead])
+def list_users(
+    _admin: User = Depends(require_admin),
+    session: Session = Depends(get_session),
+):
+    return list(session.scalars(select(User).order_by(User.id)))
+
+
+@app.post(
+    "/api/admin/users",
+    response_model=UserRead,
+    status_code=201,
+    dependencies=[Depends(require_admin), Depends(require_csrf)],
+)
+def create_user(payload: AdminUserCreate, session: Session = Depends(get_session)):
+    user = User(
+        username=payload.username.lower(),
+        display_name=payload.display_name,
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+        is_active=True,
+    )
+    session.add(user)
+    try:
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Username already exists") from error
+    session.refresh(user)
+    return user
+
+
+@app.patch(
+    "/api/admin/users/{user_id}",
+    response_model=UserRead,
+    dependencies=[Depends(require_admin), Depends(require_csrf)],
+)
+def update_user(user_id: int, payload: AdminUserUpdate, session: Session = Depends(get_session)):
+    user = session.get(User, user_id)
+    if user is None:
+        raise _not_found("User", user_id)
+    if user.is_active != payload.is_active:
+        user.is_active = payload.is_active
+        user.session_version += 1
+        revoke_user_sessions(session, user)
+        session.commit()
+        session.refresh(user)
+    return user
+
+
+@app.post(
+    "/api/admin/users/{user_id}/reset-password",
+    status_code=204,
+    dependencies=[Depends(require_admin), Depends(require_csrf)],
+)
+def reset_user_password(
+    user_id: int,
+    payload: PasswordResetInput,
+    session: Session = Depends(get_session),
+):
+    user = session.get(User, user_id)
+    if user is None:
+        raise _not_found("User", user_id)
+    user.password_hash = hash_password(payload.password)
+    user.session_version += 1
+    revoke_user_sessions(session, user)
+    session.commit()
+    return Response(status_code=204)
 
 
 @app.get("/api/projects", response_model=List[ProjectRead])

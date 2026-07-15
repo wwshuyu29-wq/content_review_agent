@@ -11,7 +11,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.orm import Session
 
-from server.db import Base, create_db_engine, get_session
+from server.db import Base, create_db_engine, ensure_schema_upgrades, get_session
 from server.models import (
     AgentResult,
     AuditRun,
@@ -165,7 +165,51 @@ def test_create_all_defines_every_workflow_table(tmp_path: Path) -> None:
         "rule_versions",
         "test_cases",
         "test_evidence",
+        "user_sessions",
+        "users",
     }
+
+
+def test_auth_schema_upgrade_preserves_existing_review_data_and_bootstraps_admin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.models import User
+    from server.services.auth_service import ensure_initial_admin, verify_password
+
+    engine = make_sqlite_engine(tmp_path)
+    legacy_tables = [
+        table for table in Base.metadata.sorted_tables
+        if table.name not in {"users", "user_sessions"}
+    ]
+    Base.metadata.create_all(engine, tables=legacy_tables)
+    with Session(engine) as session:
+        project = seed_default_project(session)
+        session.commit()
+        project_id = project.id
+        rule_digest = project.current_rule_version.package_digest
+
+    assert "users" not in inspect(engine).get_table_names()
+    monkeypatch.setenv("INITIAL_ADMIN_USERNAME", "migration-admin")
+    monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "migration-admin-password")
+    monkeypatch.setenv("SESSION_SECRET", "migration-session-secret-with-32-bytes")
+
+    ensure_schema_upgrades(engine)
+    with Session(engine) as session:
+        ensure_initial_admin(session)
+        session.commit()
+        admin = session.scalar(select(User))
+        project = session.get(Project, project_id)
+        assert admin is not None
+        assert admin.role == "ADMIN"
+        assert verify_password(admin.password_hash, "migration-admin-password")
+        assert project is not None
+        assert project.current_rule_version.package_digest == rule_digest
+        assert len(project.rule_versions) == 1
+
+    ensure_schema_upgrades(engine)
+    with Session(engine) as session:
+        assert len(list(session.scalars(select(User)))) == 1
+        assert session.get(Project, project_id).current_rule_version.package_digest == rule_digest
 
 
 def test_schema_upgrade_adds_import_token_to_legacy_batches_and_confirm_import_works(
