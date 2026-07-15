@@ -100,7 +100,6 @@ export interface AgentResult {
   summary: string | null;
   score: number | null;
   status: string;
-  raw_result?: JsonObject;
   created_at: string;
 }
 
@@ -418,37 +417,65 @@ function buildInit(init?: RequestInit): RequestInit {
   return { ...init, headers, credentials: "include" as RequestCredentials };
 }
 
+const SAFE_BUSINESS_DETAILS: Record<string, string> = {
+  "Invalid username or password": "用户名或密码错误。",
+  "Username already exists": "用户名已存在。",
+  "Project name already exists": "项目名称已存在。",
+  "Batch contains duplicate content identifiers": "批次中存在重复的内容编号。",
+  "Image exceeds 20MB limit": "图片超过 20MB 限制。",
+  "Upload exceeds size limit": "上传文件超过大小限制。",
+  "审核任务暂时无法启动，请稍后重试。": "审核任务暂时无法启动，请稍后重试。",
+};
+
+export function normalizeApiError(status: number, detail?: unknown): string {
+  if (typeof detail === "string" && SAFE_BUSINESS_DETAILS[detail]) return SAFE_BUSINESS_DETAILS[detail];
+  if (status === 401) return "登录状态已失效，请重新登录。";
+  if (status === 403) return "当前操作无权限或安全校验失败，请刷新后重试。";
+  if (status === 404) return "未找到请求的数据。";
+  if (status === 409) return "当前数据状态已变化，请刷新后重试。";
+  if (status === 413) return "上传文件过大，请压缩后重试。";
+  if (status === 422) return "提交信息有误，请检查后重试。";
+  if (status === 429) return "操作过于频繁，请稍后重试。";
+  if (status >= 500) return "系统服务暂时不可用，请稍后重试。";
+  return "请求失败，请稍后重试。";
+}
+
+async function fetchResponse(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, buildInit(init));
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    throw new Error("网络连接异常，请检查网络后重试。");
+  }
+}
+
+async function errorDetail(response: Response): Promise<unknown> {
+  try { return (await response.json() as { detail?: unknown }).detail; }
+  catch { return undefined; }
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, buildInit(init));
+  const response = await fetchResponse(url, init);
   if (response.status === 401) { handleUnauthorized(); }
   if (response.ok) {
     if (response.status === 204) return undefined as T;
     return response.json() as Promise<T>;
   }
-  let message = `HTTP ${response.status}`;
-  try {
-    const error = await response.json() as { detail?: string | Array<{ msg?: string }> };
-    message = typeof error.detail === "string" ? error.detail : error.detail?.map((item) => item.msg).filter(Boolean).join("；") || JSON.stringify(error);
-  } catch { /* Keep status fallback for non-JSON responses. */ }
-  throw new Error(message);
+  throw new Error(normalizeApiError(response.status, await errorDetail(response)));
 }
 
 async function requestVoid(url: string, init?: RequestInit): Promise<void> {
-  const response = await fetch(url, buildInit(init));
+  const response = await fetchResponse(url, init);
   if (response.status === 401) { handleUnauthorized(); }
   if (response.ok || response.status === 204) return;
-  let message = `HTTP ${response.status}`;
-  try { message = (await response.json() as { detail?: string }).detail || message; } catch { /* Keep fallback. */ }
-  throw new Error(message);
+  throw new Error(normalizeApiError(response.status, await errorDetail(response)));
 }
 
 async function requestBlob(url: string, init?: RequestInit): Promise<Blob> {
-  const response = await fetch(url, buildInit(init));
+  const response = await fetchResponse(url, init);
   if (response.status === 401) { handleUnauthorized(); }
   if (response.ok) return response.blob();
-  let message = `HTTP ${response.status}`;
-  try { message = (await response.json() as { detail?: string }).detail || message; } catch { /* Keep fallback. */ }
-  throw new Error(message);
+  throw new Error(normalizeApiError(response.status, await errorDetail(response)));
 }
 
 function jsonRequest(method: "POST" | "PUT", body: unknown): RequestInit {
