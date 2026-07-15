@@ -559,6 +559,9 @@ def test_start_script_validates_session_secret_without_printing_values(tmp_path:
     script = Path(__file__).resolve().parents[1] / "scripts" / "start_local.sh"
     environment = {
         **os.environ,
+        # Point ENV_FILE at a non-existent path so the script does not load
+        # the repo's .env and inherit its SESSION_SECRET value.
+        "ENV_FILE": str(tmp_path / "no-such.env"),
         "PYTHON_BIN": "definitely-not-a-python-command",
         "SESSION_SECRET": "",
         "INITIAL_ADMIN_USERNAME": "secret-admin-name",
@@ -586,7 +589,12 @@ def test_start_script_rejects_short_session_secret(tmp_path: Path) -> None:
     completed = subprocess.run(
         [str(script)],
         cwd=tmp_path,
-        env={**os.environ, "PYTHON_BIN": "definitely-not-a-python-command", "SESSION_SECRET": "short"},
+        env={
+            **os.environ,
+            "ENV_FILE": str(tmp_path / "no-such.env"),
+            "PYTHON_BIN": "definitely-not-a-python-command",
+            "SESSION_SECRET": "short",
+        },
         capture_output=True,
         text=True,
         timeout=5,
@@ -603,6 +611,7 @@ def test_start_script_rejects_short_bootstrap_password_without_printing_it(tmp_p
         cwd=tmp_path,
         env={
             **os.environ,
+            "ENV_FILE": str(tmp_path / "no-such.env"),
             "PYTHON_BIN": "definitely-not-a-python-command",
             "SESSION_SECRET": "test-session-secret-with-at-least-32-bytes",
             "INITIAL_ADMIN_USERNAME": "admin",

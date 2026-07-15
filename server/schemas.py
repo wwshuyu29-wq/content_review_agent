@@ -364,6 +364,7 @@ class ImportTestPreviewRead(BaseModel):
 
 
 class ImportRowPreviewRead(BaseModel):
+    manuscript_index: int
     row_number: int
     normalized: Dict[str, Any]
     errors: List[str] = Field(default_factory=list)

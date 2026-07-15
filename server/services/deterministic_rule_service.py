@@ -20,6 +20,7 @@ class ReviewContext(BaseModel):
     test_cases: list[Mapping[str, Any]] = Field(default_factory=list)
     evidence: list[Mapping[str, Any]] = Field(default_factory=list)
     evidence_assets: list[Mapping[str, Any]] = Field(default_factory=list)
+    image_evidence_analyses: list[Mapping[str, Any]] = Field(default_factory=list)
 
     def field_value(self, field: str) -> str:
         value = getattr(self, field, "")
@@ -300,12 +301,41 @@ def _count_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue
     return [_issue(rule, field="title", evidence=match.group(0), reason=f"标题声明 {declared} 个测试，但结构化测试场景/编号正文为 {actual} 个", suggestion=f"将测试数量改为 {actual}")]
 
 
+APPROVED_TEST_TRIGGER_PHRASES = ("亲测", "实测", "自用", "实测体验", "实测结果", "实测发现")
+IMAGE_TEST_CONFIDENCE_THRESHOLD = 0.85
+
+
+def _image_evidence_issue(rule: RuleSpec, analysis: Mapping[str, Any], rule_id: str, reason: str) -> StructuredIssue:
+    confidence = analysis.get("confidence", 0)
+    return StructuredIssue(
+        rule_id=rule_id,
+        category="deterministic",
+        severity="HIGH",
+        field="image",
+        evidence=_evidence_asset_id(analysis),
+        reason=reason,
+        suggestion="人工核对截图与当前内容的匹配关系；确认后补录版本、时间、设备、环境、步骤和适用边界等结构化测试信息",
+        action="HUMAN_REVIEW",
+        source_reference=list(rule.source_reference),
+        auto_fixable=False,
+        human_required=True,
+        confidence=float(confidence) if isinstance(confidence, (int, float)) else 0,
+    )
+
+
+def _best_image_analysis(context: ReviewContext) -> Mapping[str, Any] | None:
+    candidates = [record for record in context.image_evidence_analyses if isinstance(record, Mapping)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda record: float(record.get("confidence", 0) or 0))
+
+
 def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
-    terms = _values(rule.model_extra.get("trigger_terms", []))
-    fields = _configured_fields(rule)
-    text = "\n".join(context.field_value(field) for field in fields)
-    trigger = next((term for term in terms if term in text), None)
-    if not trigger:
+    text = f"{context.title}\n{context.body}"
+    trigger = next((term for term in APPROVED_TEST_TRIGGER_PHRASES if term in text), None)
+    analysis = _best_image_analysis(context)
+    image_candidate = bool(analysis and analysis.get("is_test_scene"))
+    if not trigger and not image_candidate:
         return []
     required = _values(rule.model_extra.get("required_fields", []))
     missing = []
@@ -330,10 +360,34 @@ def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIs
             missing.append(f"test_cases.{field}")
     if not missing:
         return []
+    if analysis is not None:
+        status = str(analysis.get("status", ""))
+        confidence = float(analysis.get("confidence", 0) or 0)
+        missing_context = [str(value) for value in analysis.get("missing_context", []) if str(value)]
+        if status == "UNAVAILABLE" and trigger:
+            return [_image_evidence_issue(
+                rule, analysis, "IMAGE-EVIDENCE-UNCERTAIN",
+                "实测表述已触发证据核验，但图像分析不可用，不能将截图认定为测试证据",
+            )]
+        if image_candidate and confidence < IMAGE_TEST_CONFIDENCE_THRESHOLD:
+            return [_image_evidence_issue(
+                rule, analysis, "IMAGE-EVIDENCE-UNCERTAIN",
+                "图像中可能存在测试输入或结果，但识别置信度不足，必须人工核验",
+            )]
+        if image_candidate and missing_context:
+            return [_image_evidence_issue(
+                rule, analysis, "IMAGE-EVIDENCE-CONTEXT-INCOMPLETE",
+                "图像可见测试输入或结果，但缺少必要测试上下文：" + ", ".join(missing_context),
+            )]
+        if image_candidate:
+            return [_image_evidence_issue(
+                rule, analysis, "IMAGE-EVIDENCE-CANDIDATE",
+                "图像分析提供了测试场景候选，但视觉候选未经人工确认且不能替代结构化测试记录",
+            )]
     return [_issue(
         rule,
         field="body",
-        evidence=trigger,
+        evidence=trigger or "",
         reason=f"出现实测触发词，但缺少结构化证据字段或测试条件：{', '.join(missing)}",
         suggestion="补充与当前内容版本绑定的测试场景、测试条件、适用边界和证据",
     )]

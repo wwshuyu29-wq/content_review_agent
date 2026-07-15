@@ -325,6 +325,85 @@ def test_evidence_present_does_not_fire():
     assert evaluate_rules(profile, context) == []
 
 
+def test_no_approved_trigger_and_no_image_scene_has_no_evidence_issue():
+    profile = profile_with(rule(
+        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["体验", "亲测"],
+        required_fields=["test_cases", "evidence"],
+    ))
+
+    issues = evaluate_rules(profile, ReviewContext(
+        title="路线规划产品介绍", body="这是普通功能体验介绍。",
+        evidence_assets=[{"asset_id": "cover", "kind": "SCREENSHOT"}],
+    ))
+
+    assert not any(issue.rule_id.startswith("IMAGE-EVIDENCE") or issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
+
+
+def test_screenshot_candidate_does_not_pretend_structured_test_metadata_exists():
+    profile = profile_with(rule(
+        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"],
+        required_fields=["test_cases", "evidence"],
+    ))
+    context = ReviewContext(
+        title="亲测路线规划", body="截图展示操作和结果。",
+        image_evidence_analyses=[{
+            "asset_id": "asset-1", "status": "ANALYZED", "is_test_scene": True,
+            "visible_input": "北京南站到故宫", "visible_result": "返回三条路线",
+            "visible_product": "百度地图", "detected_text": "北京南站 故宫",
+            "confidence": 0.94, "missing_context": ["app_version", "tested_at"],
+            "reasoning": "可见输入和结果",
+        }],
+    )
+
+    issues = evaluate_rules(profile, context)
+
+    issue = next(issue for issue in issues if issue.rule_id == "IMAGE-EVIDENCE-CONTEXT-INCOMPLETE")
+    assert issue.human_required is True
+    assert issue.evidence == "asset-1"
+    assert issue.confidence == 0.94
+    assert context.test_cases == []
+    assert not any(issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
+
+
+def test_low_confidence_image_candidate_routes_to_uncertain_human_review():
+    profile = profile_with(rule(
+        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases"]
+    ))
+    context = ReviewContext(
+        title="路线规划介绍", body="普通介绍",
+        image_evidence_analyses=[{
+            "asset_id": "asset-low", "status": "ANALYZED", "is_test_scene": True,
+            "visible_input": "可能是路线输入", "visible_result": "可能有结果",
+            "visible_product": "百度地图", "detected_text": "模糊文字",
+            "confidence": 0.61, "missing_context": [], "reasoning": "画面模糊",
+        }],
+    )
+
+    issues = evaluate_rules(profile, context)
+
+    issue = next(issue for issue in issues if issue.rule_id == "IMAGE-EVIDENCE-UNCERTAIN")
+    assert issue.human_required is True
+    assert issue.confidence == 0.61
+
+
+def test_unavailable_vision_routes_human_only_when_text_triggered():
+    profile = profile_with(rule(
+        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases"]
+    ))
+    unavailable = [{
+        "asset_id": "asset-offline", "status": "UNAVAILABLE", "is_test_scene": False,
+        "visible_input": None, "visible_result": None, "visible_product": None,
+        "detected_text": "", "confidence": 0, "missing_context": ["vision_analysis_unavailable"],
+        "reasoning": "服务不可用",
+    }]
+
+    triggered = evaluate_rules(profile, ReviewContext(title="亲测路线", image_evidence_analyses=unavailable))
+    ordinary = evaluate_rules(profile, ReviewContext(title="路线产品介绍", image_evidence_analyses=unavailable))
+
+    assert any(issue.rule_id == "IMAGE-EVIDENCE-UNCERTAIN" and issue.human_required for issue in triggered)
+    assert ordinary == []
+
+
 def test_scoped_platform_rule_only_matches_platform():
     profile = profile_with(
         rule("PLATFORM-001", "required_term", required_terms=["#小度想想#"], scope={"content_type": "TECH_MEDIA_REVIEW", "platforms": ["xiaohongshu"], "field": "body"}),

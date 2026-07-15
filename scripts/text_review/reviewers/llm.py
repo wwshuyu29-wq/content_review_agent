@@ -24,23 +24,41 @@ class OpenAICompatLLM:
     """
     name = "oneapi"
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        model: str | None = None,
+        vision_model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ):
         import requests
         self._requests = requests
-        self.base_url = os.environ.get(
+        self.base_url = (base_url or os.environ.get(
             "ONEAPI_BASE_URL", "https://oneapi-comate.baidu-int.com/v1"
-        ).rstrip("/")
-        self.api_key = os.environ.get("ONEAPI_KEY", "")
-        self.model = os.environ.get("ONEAPI_MODEL", "")
+        )).rstrip("/")
+        self.api_key = api_key if api_key is not None else os.environ.get("ONEAPI_KEY", "")
+        self.model = model if model is not None else os.environ.get("ONEAPI_MODEL", "")
+        configured_vision_model = vision_model if vision_model is not None else os.environ.get("ONEAPI_VISION_MODEL", "")
+        self.vision_model = configured_vision_model or self.model
 
-    def _request(self, prompt: str, response_format: dict[str, Any] | None = None) -> str:
+    def _request_content(
+        self,
+        content: Any,
+        response_format: dict[str, Any] | None = None,
+        *,
+        model: str | None = None,
+    ) -> str:
         if not self.api_key:
             raise EnvironmentError("缺少 ONEAPI_KEY 环境变量（在 OneAPI 控制台 /mine 领取）")
         if not self.model:
             raise EnvironmentError("缺少 ONEAPI_MODEL 环境变量（如 ernie-4.0-8k / gpt-4o）")
+        selected_model = model or self.model
+        if not selected_model:
+            raise EnvironmentError("缺少 OneAPI 模型配置")
         body = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "model": selected_model,
+            "messages": [{"role": "user", "content": content}],
             "temperature": 0.1,
         }
         if response_format is not None:
@@ -58,6 +76,9 @@ class OpenAICompatLLM:
             raise RuntimeError(f"OneAPI 错误: {data['error']}")
         return data["choices"][0]["message"]["content"]
 
+    def _request(self, prompt: str, response_format: dict[str, Any] | None = None) -> str:
+        return self._request_content(prompt, response_format)
+
     def chat(self, prompt: str) -> str:
         return self._request(prompt)
 
@@ -73,6 +94,24 @@ class OpenAICompatLLM:
                     "schema": json_schema,
                 },
             },
+        )
+
+    def chat_json_multimodal(self, prompt: str, image_data_uri: str, schema: Any) -> str:
+        json_schema = schema.model_json_schema() if hasattr(schema, "model_json_schema") else schema
+        return self._request_content(
+            [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_uri, "detail": "high"}},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "image_evidence_analysis",
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            },
+            model=self.vision_model,
         )
 
 
@@ -119,9 +158,9 @@ class ErnieLLM:
         return data.get("result", "")
 
 
-def get_llm(backend: str):
+def get_llm(backend: str, *, model: str | None = None, vision_model: str | None = None):
     if backend == "oneapi":
-        return OpenAICompatLLM()
+        return OpenAICompatLLM(model=model, vision_model=vision_model)
     if backend == "ernie":
         return ErnieLLM()
     return None

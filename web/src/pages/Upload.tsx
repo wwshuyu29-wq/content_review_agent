@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, saveBlob, type BatchDetail, type ImportPreview, type Project } from "../api";
 
@@ -34,7 +34,6 @@ export default function Upload() {
   const previewMatches = Boolean(preview && preview.project_id === projectId && preview.supplier_id === supplierId.trim() && preview.batch_name === batchName.trim());
   const canConfirm = Boolean(previewMatches && preview?.token && preview.error_count === 0 && preview.errors.length === 0 && preview.valid_count === preview.total_count && preview.total_count > 0);
   const step = result ? 5 : preview ? 4 : excel ? 3 : identityReady ? 2 : 1;
-  const previewTests = useMemo(() => preview?.rows.flatMap((row) => row.tests.map((test) => ({ row: row.row_number, ...test }))) || [], [preview]);
 
   const invalidatePreview = () => { setPreview(null); setResult(null); };
   const downloadTemplate = async () => {
@@ -106,7 +105,7 @@ export default function Upload() {
   };
 
   return <div>
-    <div className="page-heading"><div><h2>批量导入</h2><p>TECH_MEDIA_REVIEW 内容、测试用例与证据文件统一预检后入库。</p></div></div>
+    <div className="page-heading"><div><h2>批量导入</h2><p>预检仅核对内容字段和文件格式，审核标准在确认导入后执行。</p></div></div>
     <ol className="stepper" aria-label="导入步骤">
       {["项目与批次", "下载模板", "选择文件", "预检确认", "完成"].map((label, index) => <li key={label} className={step > index + 1 ? "done" : step === index + 1 ? "current" : ""}><span>{index + 1}</span>{label}</li>)}
     </ol>
@@ -119,21 +118,19 @@ export default function Upload() {
       </div>
       <div className="import-actions">
         <button type="button" className="btn btn-ghost" onClick={downloadTemplate} disabled={busy === "template"} title="下载标准 Excel 模板" aria-label="下载标准 Excel 模板">↓ {busy === "template" ? "下载中" : "下载模板"}</button>
-        <span className="small">内容表使用“标题、内容、类型、目标平台、作者、发布日期、图片/视频”七列；测试场景表保持独立，媒体与证据 ZIP 可选。</span>
+        <span className="small">内容表使用“标题、内容、类型、目标平台、作者、发布日期、图片/视频”七列；媒体 ZIP 可选。</span>
       </div>
       <div className="file-grid">
         <div className="file-field"><label htmlFor="excel-file">Excel 文件 *</label><input id="excel-file" type="file" accept=".xlsx" onChange={(event) => { setExcel(event.target.files?.[0] || null); invalidatePreview(); }} /><span>{excel?.name || "未选择 .xlsx 文件"}</span></div>
-        <div className="file-field"><label htmlFor="evidence-zip">证据 ZIP（可选）</label><input id="evidence-zip" type="file" accept=".zip" onChange={(event) => { setEvidenceZip(event.target.files?.[0] || null); invalidatePreview(); }} /><span>{evidenceZip?.name || "未选择 .zip 文件"}</span></div>
+        <div className="file-field"><label htmlFor="evidence-zip">媒体 ZIP（可选）</label><input id="evidence-zip" type="file" accept=".zip" onChange={(event) => { setEvidenceZip(event.target.files?.[0] || null); invalidatePreview(); }} /><span>{evidenceZip?.name || "未选择 .zip 文件"}</span></div>
       </div>
       <div className="btn-row"><button type="button" className="btn btn-primary" onClick={doPreview} disabled={!identityReady || !excel || !!busy}>{busy === "preview" ? "预检中..." : "预检文件"}</button><button type="button" className="btn btn-pass" onClick={confirm} disabled={!canConfirm || !!busy} title={!canConfirm ? "仅无错误且身份未变化的预检可确认" : "确认导入"}>{busy === "confirm" ? "导入中..." : "确认导入"}</button></div>
     </section>
 
     {preview && <section className="card preview-section">
-      <div className="section-heading"><div><h3>预检结果</h3><p className="small">项目 {preview.project_code} · 标准包 {preview.package_version} · Token {preview.token.slice(0, 10)}…</p></div><div className="badge-group"><span className="badge status-passed">有效 {preview.valid_count}</span><span className={`badge ${preview.error_count ? "status-invalid" : "neutral"}`}>错误 {preview.error_count}</span><span className="badge neutral">测试 {preview.test_count}</span></div></div>
+      <div className="section-heading"><div><h3>预检结果</h3><p className="small">项目 {preview.project_code} · 标准包 {preview.package_version} · Token {preview.token.slice(0, 10)}…</p></div><div className="badge-group"><span className="badge status-passed">有效 {preview.valid_count}</span><span className={`badge ${preview.error_count ? "status-invalid" : "neutral"}`}>错误 {preview.error_count}</span></div></div>
       {(preview.errors.length > 0 || preview.warnings.length > 0) && <div className="validation-summary">{preview.errors.map((error) => <p className="validation-error" key={error}>错误：{error}</p>)}{preview.warnings.map((warning) => <p className="validation-warning" key={warning}>提示：{warning}</p>)}</div>}
-      {preview.rows.length === 0 ? <p className="empty">文件中没有可预览的内容行</p> : <div className="table-wrap"><table><thead><tr><th>序号</th><th>内容编号 / 标题</th><th>校验</th></tr></thead><tbody>{preview.rows.map((row) => <tr key={row.row_number} className={!row.valid ? "invalid-row" : ""}><td><b>第{row.manuscript_index}篇</b><div className="cell-subline">Excel 第{row.row_number}行</div></td><td><b>{String(row.normalized.supplier_external_id || row.normalized.external_id || "—")}</b><div className="cell-subline">{String(row.normalized.title || row.normalized.original_title || "未提供标题")}</div></td><td>{row.valid ? <span className="badge status-passed">通过</span> : row.errors.map((error) => <div className="validation-error" key={error}>{error}</div>)}{row.warnings.map((warning) => <div className="validation-warning" key={warning}>{warning}</div>)}</td></tr>)}</tbody></table></div>}
-      <h4 className="subheading">测试用例与证据引用</h4>
-      {previewTests.length === 0 ? <p className="empty">未提供测试用例；系统不会据此推断存在测试证据。</p> : <div className="table-wrap"><table><thead><tr><th>内容 / 用例</th><th>主张</th><th>操作与结果</th><th>证据文件</th></tr></thead><tbody>{previewTests.map((test) => <tr key={`${test.row}-${test.external_test_case_id}`}><td>{test.content_external_id}<div className="cell-subline">{test.external_test_case_id}</div></td><td>{test.claim || <span className="missing">缺失</span>}</td><td>{test.command || <span className="missing">缺失</span>}<div className="cell-subline">{test.observed_result || "未提供观察结果"}</div></td><td>{test.evidence_filenames.length ? test.evidence_filenames.join("、") : <span className="missing">无证据引用</span>}</td></tr>)}</tbody></table></div>}
+      {preview.rows.length === 0 ? <p className="empty">文件中没有可预览的内容行</p> : <div className="table-wrap"><table><thead><tr><th>序号</th><th>内容编号 / 标题</th><th>字段与格式</th></tr></thead><tbody>{preview.rows.map((row) => <tr key={row.row_number} className={!row.valid ? "invalid-row" : ""}><td><b>第{row.manuscript_index}篇</b><div className="cell-subline">Excel 第{row.row_number}行</div></td><td><b>{String(row.normalized.supplier_external_id || row.normalized.external_id || "—")}</b><div className="cell-subline">{String(row.normalized.title || row.normalized.original_title || "未提供标题")}</div></td><td>{row.valid ? <span className="badge status-passed">通过</span> : row.errors.map((error) => <div className="validation-error" key={error}>{error}</div>)}{row.warnings.map((warning) => <div className="validation-warning" key={warning}>{warning}</div>)}</td></tr>)}</tbody></table></div>}
     </section>}
 
     {result && <section className="card"><div className="section-heading"><div><h3>批次已入库</h3><p className="small">#{result.id} · {result.name} · {result.content_count} 条</p></div><div className="btn-row"><button className="btn btn-ghost" onClick={exportResult} disabled={!!busy || auditBusy} aria-label="导出当前批次">↓ {busy === "export" ? "导出中" : "导出批次"}</button><button className="btn btn-primary" onClick={() => startAudit(result.id)} disabled={auditBusy || !!busy} aria-label="开始审核本批次">{auditBusy ? "启动中..." : "开始审核本批次"}</button></div></div></section>}

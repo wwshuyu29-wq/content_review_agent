@@ -261,7 +261,7 @@ def test_blank_external_id_invalid_row_survives_manifest_round_trip(tmp_path: Pa
     assert_has_error(loaded, "供应商内容编号")
 
 
-def test_blank_test_owner_is_orphan_and_cannot_bind_to_blank_content_id(tmp_path: Path) -> None:
+def test_blank_test_owner_does_not_affect_content_precheck(tmp_path: Path) -> None:
     xlsx = write_named_workbook(
         tmp_path / "blank-owner.xlsx",
         [tech_row(" ")],
@@ -272,7 +272,7 @@ def test_blank_test_owner_is_orphan_and_cannot_bind_to_blank_content_id(tmp_path
 
     assert preview.rows[0].tests == []
     assert preview.test_cases == []
-    assert any("<空>" in error and "不存在" in error for error in preview.errors)
+    assert preview.errors == []
 
 
 def test_preview_validates_required_values_and_content_service_lengths(tmp_path: Path) -> None:
@@ -689,7 +689,7 @@ def test_trigger_evidence_is_not_required_by_precheck(tmp_path: Path) -> None:
     assert preview.rows[1].valid is True
 
 
-def test_orphan_test_row_is_global_preview_error(tmp_path: Path) -> None:
+def test_orphan_test_row_does_not_affect_content_precheck(tmp_path: Path) -> None:
     xlsx = write_named_workbook(
         tmp_path / "orphan.xlsx",
         [tech_row("content-1")],
@@ -699,8 +699,10 @@ def test_orphan_test_row_is_global_preview_error(tmp_path: Path) -> None:
 
     preview = preview_import(xlsx, archive, tmp_path / "previews")
 
-    assert preview.error_count > 0
-    assert any("不存在" in error for error in preview.errors)
+    assert preview.error_count == 0
+    assert preview.errors == []
+    assert preview.rows[0].valid is True
+    assert preview.test_cases == []
 
 
 def test_preview_requires_named_content_sheet(tmp_path: Path) -> None:

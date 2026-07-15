@@ -399,6 +399,12 @@ def run_audit(
         context_test_cases = list(content_version.payload.get("test_cases", []))
         context_evidence = list(content_version.payload.get("evidence", []))
         context_evidence_assets = list(content_version.payload.get("evidence_assets", []))
+    image_evidence_analyses = [
+        analysis
+        for asset in item.assets
+        if isinstance(asset.asset_metadata, dict)
+        and isinstance((analysis := asset.asset_metadata.get("image_evidence_analysis")), dict)
+    ]
     context = ReviewContext(
         title=content_version.title,
         body=content_version.body,
@@ -409,6 +415,7 @@ def run_audit(
         test_cases=context_test_cases,
         evidence=context_evidence,
         evidence_assets=context_evidence_assets,
+        image_evidence_analyses=image_evidence_analyses,
     )
     persisted_issues: list[Issue] = []
     for deterministic in evaluate_rules(profile, context):

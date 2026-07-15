@@ -327,6 +327,7 @@ def confirm_import(
             import_token=token,
             commit=False,
         )
+        _create_confirmed_media_assets(session, batch, image_llm)
         _create_confirmed_test_records(session, batch, preview, location, saved_paths)
         session.commit()
         commit_completed = True
@@ -455,6 +456,53 @@ def _evidence_kind_and_mime(filename: str) -> Tuple[AssetKind, str]:
     if suffix not in mapping:
         raise ValueError(f"unsupported evidence suffix: {suffix}")
     return mapping[suffix]
+
+
+def _create_confirmed_media_assets(session: Session, batch: Batch, image_llm: Any) -> None:
+    for item in batch.content_items:
+        if not item.versions:
+            continue
+        version = item.versions[0]
+        filename = version.payload.get("image_filename")
+        storage_key = version.payload.get("media")
+        if not isinstance(filename, str) or not isinstance(storage_key, str):
+            continue
+        media_path = _uploads_dir() / storage_key
+        if not media_path.is_file():
+            raise ValueError(f"导入媒体文件不存在：{filename}")
+        kind, mime_type = _evidence_kind_and_mime(filename)
+        stable_id = "media:" + hashlib.sha256(
+            f"{item.external_id}\0{filename}".encode("utf-8")
+        ).hexdigest()[:32]
+        metadata: Dict[str, Any] = {}
+        if Path(filename).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            try:
+                analysis = analyze_image_evidence(
+                    asset_id=stable_id,
+                    image_path=media_path,
+                    filename=media_path.name,
+                    title=version.title,
+                    body=version.body,
+                    llm=image_llm,
+                )
+            except ValueError as error:
+                analysis = unavailable_image_analysis(stable_id, str(error))
+            metadata["image_evidence_analysis"] = {
+                **analysis.model_dump(mode="json"),
+                "verified": False,
+            }
+        create_asset(
+            session,
+            item.id,
+            asset_id=stable_id,
+            external_id=filename,
+            kind=kind,
+            filename=filename,
+            storage_key=storage_key,
+            mime_type=mime_type,
+            size_bytes=media_path.stat().st_size,
+            metadata=metadata,
+        )
 
 
 def _create_confirmed_test_records(session, batch, preview, location, saved_paths) -> None:
@@ -774,34 +822,41 @@ def _group_tests(tests: List[TestCasePreview]) -> Dict[str, List[TestCasePreview
     return grouped
 
 
-def _validate_test_cases(rows, tests, trigger_terms):
-    content_ids = {row.normalized.get("external_id") for row in rows if row.normalized.get("external_id")}
-    grouped = _group_tests(tests)
-    preview_errors: List[str] = []
+def _validate_test_cases(rows, tests, _trigger_terms):
+    content_ids = {
+        row.normalized.get("external_id")
+        for row in rows
+        if row.valid and row.normalized.get("external_id")
+    }
+    accepted_tests: List[TestCasePreview] = []
     seen = set()
-    row_errors: Dict[str, List[str]] = {}
     for test in tests:
-        owner = test.content_external_id or ""
-        if not owner or owner not in content_ids:
-            preview_errors.append(f"测试场景 {test.external_test_case_id or '<空>'} 引用的内容编号不存在：{owner or '<空>'}")
-        if not test.external_test_case_id:
-            row_errors.setdefault(owner, []).append("测试场景编号不能为空")
-        elif test.external_test_case_id in seen:
-            preview_errors.append(f"测试场景编号在批次内重复：{test.external_test_case_id}")
-        seen.add(test.external_test_case_id)
-        if not test.command:
-            row_errors.setdefault(owner, []).append(f"测试场景 {test.external_test_case_id or '<空>'} 的测试指令不能为空")
-        if not test.observed_result:
-            row_errors.setdefault(owner, []).append(f"测试场景 {test.external_test_case_id or '<空>'} 的实际返回结果不能为空")
-    owned_tests = [test for test in tests if test.content_external_id in content_ids]
-    grouped = _group_tests(owned_tests)
-    updated = []
-    for row in rows:
-        owner = row.normalized.get("external_id") or ""
-        bound = grouped.get(owner, [])
-        errors = list(row.errors) + row_errors.get(owner, [])
-        updated.append(ImportRowPreview(row.manuscript_index, row.row_number, row.normalized, errors, row.warnings, not errors, bound))
-    return updated, owned_tests, preview_errors
+        test_id = test.external_test_case_id
+        if (
+            test.content_external_id not in content_ids
+            or not test_id
+            or test_id in seen
+            or not test.command
+            or not test.observed_result
+        ):
+            continue
+        seen.add(test_id)
+        accepted_tests.append(test)
+
+    grouped = _group_tests(accepted_tests)
+    updated = [
+        ImportRowPreview(
+            row.manuscript_index,
+            row.row_number,
+            row.normalized,
+            list(row.errors),
+            row.warnings,
+            row.valid,
+            grouped.get(row.normalized.get("external_id") or "", []),
+        )
+        for row in rows
+    ]
+    return updated, accepted_tests, []
 
 
 def _valid_evidence_filename(filename: str, entries: Dict[str, ZipInfo]) -> bool:

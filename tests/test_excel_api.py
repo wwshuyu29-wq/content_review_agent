@@ -4,19 +4,24 @@ import json
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from server import main
 from server.db import create_db_engine
-from server.models import AgentResult, AuditRun, ContentItem, FormatStatus, Issue, Project
+from server.models import AgentResult, Asset, AuditRun, ContentItem, FormatStatus, Issue, Project
 from server.services import excel_import_service
 from server.services.excel_export_service import EXPORT_COLUMNS
 from server.services.excel_import_service import CONTENT_COLUMNS, TEST_CASE_COLUMNS
+
+
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
 
 
 @pytest.fixture
@@ -76,6 +81,17 @@ def workbook_bytes(
     return output.getvalue()
 
 
+def new_workbook_bytes() -> bytes:
+    workbook = Workbook()
+    content = workbook.active
+    content.title = "内容清单"
+    content.append(list(NEW_CONTENT_COLUMNS))
+    content.append(["新标题", "新内容", "图文", "小红书", "新作者", "2026-07-21", None])
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def zip_bytes(filename: str, content: bytes = b"evidence") -> bytes:
     output = BytesIO()
     with ZipFile(output, "w") as archive:
@@ -99,7 +115,70 @@ def test_template_route_has_attachment_and_exact_sheets(excel_api) -> None:
     response = client.get("/api/import-template")
     assert response.status_code == 200
     assert "attachment" in response.headers["content-disposition"]
-    assert load_workbook(BytesIO(response.content)).sheetnames == ["内容清单", "测试场景", "字段说明"]
+    workbook = load_workbook(BytesIO(response.content))
+    assert workbook.sheetnames == ["内容清单", "测试场景", "字段说明"]
+    assert tuple(cell.value for cell in workbook["内容清单"][1]) == NEW_CONTENT_COLUMNS
+    assert tuple(cell.value for cell in workbook["测试场景"][1]) == TEST_CASE_COLUMNS
+
+
+def test_preview_multipart_accepts_new_content_headers(excel_api) -> None:
+    client, _, _ = excel_api
+    current = project(client)
+
+    response = preview_request(client, current["id"], xlsx=new_workbook_bytes())
+
+    assert response.status_code == 200, response.text
+    row = response.json()["rows"][0]
+    assert row["valid"] is True
+    assert row["normalized"]["title"] == "新标题"
+    assert row["normalized"]["body"] == "新内容"
+    assert row["normalized"]["external_id"].startswith("excel:")
+
+
+def test_confirm_uses_configured_reviewer_llm_for_image_analysis(excel_api) -> None:
+    client, engine, _ = excel_api
+    current = project(client)
+    workbook = Workbook()
+    content = workbook.active
+    content.title = "内容清单"
+    content.append(list(NEW_CONTENT_COLUMNS))
+    content.append(["路线规划", "普通产品介绍", "图文", "小红书", "作者", "2026-07-21", "scene.png"])
+    output = BytesIO()
+    workbook.save(output)
+
+    class VisionTransport:
+        def chat_json_multimodal(self, prompt: str, image_data_uri: str, schema: object) -> str:
+            return json.dumps({
+                "asset_id": "model-value-is-ignored",
+                "status": "ANALYZED",
+                "is_test_scene": False,
+                "visible_input": None,
+                "visible_result": None,
+                "visible_product": "百度地图",
+                "detected_text": "百度地图",
+                "confidence": 0.98,
+                "missing_context": [],
+                "reasoning": "普通产品截图",
+            }, ensure_ascii=False)
+
+    main.app.dependency_overrides[main.get_audit_reviewer] = lambda: SimpleNamespace(llm=VisionTransport())
+    preview = preview_request(
+        client,
+        current["id"],
+        xlsx=output.getvalue(),
+        zip_content=zip_bytes("scene.png", b"\x89PNG\r\n\x1a\nimage"),
+    )
+    token = preview.json()["token"]
+    confirmed = client.post(
+        f"/api/imports/{token}/confirm",
+        json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"},
+    )
+
+    assert confirmed.status_code == 200, confirmed.text
+    with Session(engine) as session:
+        asset = session.scalar(select(Asset))
+        assert asset is not None
+        assert asset.asset_metadata["image_evidence_analysis"]["status"] == "ANALYZED"
 
 
 def test_preview_multipart_returns_typed_identity_rows_and_tests(excel_api) -> None:
@@ -212,18 +291,15 @@ def test_export_route_and_missing_batch(excel_api) -> None:
     sheet = load_workbook(BytesIO(exported.content)).active
     headers = [cell.value for cell in sheet[1]]
     values = [cell.value for cell in sheet[2]]
-    assert headers == list(CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
-    assert values[: len(CONTENT_COLUMNS)] == [
-        "content-1",
-        "活动",
-        "地图账号",
-        "科技媒体",
-        "小红书",
+    assert headers == list(NEW_CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
+    assert values[: len(NEW_CONTENT_COLUMNS)] == [
         "原始标题",
         "普通正文",
-        None,
+        "科技媒体",
+        "小红书",
+        "地图账号",
         "2026-07-20",
-        "备注",
+        None,
     ]
     assert client.get("/api/batches/99999/export").status_code == 404
 
@@ -265,7 +341,7 @@ def test_contents_table_always_returns_six_canonical_agent_slots(excel_api) -> N
     assert all(agent["status"] == "NOT_RUN" for agent in row["agents"])
 
 
-def test_preview_orphan_test_error_is_returned_and_not_confirmable(excel_api) -> None:
+def test_preview_orphan_test_does_not_block_confirmation(excel_api) -> None:
     client, _, _ = excel_api
     current = project(client)
     data = workbook_bytes()
@@ -276,6 +352,9 @@ def test_preview_orphan_test_error_is_returned_and_not_confirmable(excel_api) ->
     response = preview_request(client, current["id"], xlsx=output.getvalue(), zip_content=zip_bytes("proof.png"))
     assert response.status_code == 200
     payload = response.json()
-    assert any("不存在" in error for error in payload["errors"])
+    assert payload["errors"] == []
+    assert payload["error_count"] == 0
+    assert payload["test_count"] == 0
     confirm = client.post(f"/api/imports/{payload['token']}/confirm", json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"})
-    assert confirm.status_code == 422
+    assert confirm.status_code == 200
+    assert confirm.json()["content_count"] == 1

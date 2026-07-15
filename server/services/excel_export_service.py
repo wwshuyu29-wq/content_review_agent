@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from server.models import AuditRun, Batch, ContentItem, ContentVersion, Issue, ReviewTask, TestCase, TestEvidence
-from server.services.excel_import_service import CONTENT_COLUMNS
+from server.services.excel_import_service import NEW_CONTENT_COLUMNS
 from server.services.severity_service import highest_severity
 
 EXPORT_COLUMNS = (
@@ -48,6 +48,7 @@ _MANUAL_SEVERITIES = {"mid", "medium", "high", "unknown", "critical"}
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 _LONG_TEXT_COLUMNS = {
     "正文",
+    "内容",
     "问题分类",
     "命中规则",
     "问题原因",
@@ -82,7 +83,7 @@ def export_batch(session: Session, batch_id: int) -> bytes:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "批次导出"
-    headers = list(CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
+    headers = list(NEW_CONTENT_COLUMNS) + list(EXPORT_COLUMNS)
     worksheet.append([_sanitize_excel_value(value) for value in headers])
 
     for item in sorted(batch.content_items, key=lambda content: content.id):
@@ -109,16 +110,13 @@ def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
     tasks = _tasks_for_audit(item, latest_audit)
 
     return [
-        _payload_value(payload, "supplier_external_id", default=item.external_id),
-        _payload_value(payload, "campaign_theme"),
-        _payload_value(payload, "account_name"),
-        _payload_value(payload, "account_type"),
-        _payload_value(payload, "platform"),
         _payload_value(payload, "title", default=supplier_version.title if supplier_version is not None else item.title),
         _payload_value(payload, "body", default=supplier_version.body if supplier_version is not None else ""),
-        _payload_value(payload, "image_filename"),
+        _payload_value(payload, "account_type"),
+        _payload_value(payload, "platform"),
+        _payload_value(payload, "account_name"),
         _payload_value(payload, "publish_time"),
-        _payload_value(payload, "note"),
+        _payload_value(payload, "image_filename"),
         item.id,
         batch.id,
         _enum_value(item.format_status),
@@ -244,7 +242,7 @@ def _style_worksheet(worksheet, headers: list[str]) -> None:
 
     for index, header in enumerate(headers, start=1):
         letter = get_column_letter(index)
-        if header in {"正文", "最终正文"}:
+        if header in {"内容", "正文", "最终正文"}:
             width = 48
         elif header in _LONG_TEXT_COLUMNS:
             width = 32

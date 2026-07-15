@@ -746,11 +746,21 @@ async def preview_excel_import(
 
 
 @app.post("/api/imports/{token}/confirm", response_model=BatchDetail)
-def confirm_excel_import_endpoint(token: str, payload: ImportConfirm, session: Session = Depends(get_session)):
+def confirm_excel_import_endpoint(
+    token: str,
+    payload: ImportConfirm,
+    session: Session = Depends(get_session),
+    reviewer: Any = Depends(get_audit_reviewer),
+):
     _validated_tech_project(session, payload.project_id)
     try:
         batch = confirm_excel_import(
-            session, token, payload.project_id, payload.supplier_id, payload.batch_name
+            session,
+            token,
+            payload.project_id,
+            payload.supplier_id,
+            payload.batch_name,
+            image_llm=getattr(reviewer, "llm", None),
         )
         return BatchDetail(
             **BatchRead.model_validate(batch).model_dump(), content_count=len(batch.content_items),
