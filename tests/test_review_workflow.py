@@ -233,6 +233,14 @@ def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Pa
         assert audit.agent_results[-1].decision == "PASS_WITH_SUGGESTIONS"
         assert audit.agent_results[-1].score is None
         assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
+        brand_result = next(result for result in audit.agent_results if result.agent_id == "BRAND")
+        assert brand_result.score is None
+        assert any(
+            finding.agent_result_id == brand_result.id
+            and finding.rule_id == "SYSTEM-LLM-UNAVAILABLE"
+            for finding in audit.issues
+        )
+        assert not any(finding.rule_id == "SYSTEM-AGENT-PROTOCOL" for finding in audit.issues)
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert len(audit.issues) == 7

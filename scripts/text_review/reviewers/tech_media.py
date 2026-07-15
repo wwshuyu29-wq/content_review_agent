@@ -75,7 +75,15 @@ def role_boundary_error(result: Any) -> Optional[str]:
     issues = list(_value(result, "issues", []) or [])
     if agent_id == "CAMPAIGN_EFFECTIVENESS" and decision not in {"PASS", "PASS_WITH_SUGGESTIONS"}:
         return "role boundary: CAMPAIGN_EFFECTIVENESS is suggestions-only"
-    if agent_id == "BRAND" and decision in {"NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"}:
+    controlled_unavailable = (
+        _value(result, "score") is None
+        and allows_unavailable_score(decision, issues)
+    )
+    if (
+        agent_id == "BRAND"
+        and decision in {"NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"}
+        and not controlled_unavailable
+    ):
         fact_categories = {"BRAND_FACT", "BRAND_IDENTITY", "BRAND_NAME", "BRAND_POSITIONING_FACT"}
         if not any(str(_value(issue, "category", "")).upper() in fact_categories for issue in issues):
             return "role boundary: BRAND escalation requires an explicit brand fact or identity conflict"
