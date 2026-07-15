@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
 
 from .base import AgentIssue, AgentReviewResult, EvidenceSpan, allows_unavailable_score
 
@@ -372,27 +372,64 @@ class TechMediaReviewer:
         if error:
             raise ValueError(error)
 
-    def _llm_result(self, agent_id: str, prompt: str, profile: ReviewProfile) -> AgentReviewResult:
+    def _llm_result(
+        self,
+        agent_id: str,
+        prompt: str,
+        profile: ReviewProfile,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> AgentReviewResult:
         last_error = "no response"
-        for _attempt in range(3):
+        if progress_callback is not None:
+            progress_callback("agent_started", agent_id=agent_id, attempt=1)
+        for attempt in range(1, 4):
             try:
                 if callable(getattr(self.llm, "chat_json", None)):
                     raw = self.llm.chat_json(prompt, AgentReviewResult)
                 else:
                     raw = self.llm.chat(prompt)
-                data = json.loads((raw or "").strip())
+                data = raw if isinstance(raw, Mapping) else json.loads((raw or "").strip())
                 result = AgentReviewResult.model_validate(data)
                 self._validate_coherence(result, agent_id, profile)
-                return result
             except Exception as exc:  # transport, JSON, and protocol failures all require retry/human review
                 last_error = str(exc)
-        return self._unavailable(agent_id, last_error)
+                if progress_callback is not None and attempt < 3:
+                    progress_callback("agent_retry", agent_id=agent_id, attempt=attempt)
+                continue
+            if progress_callback is not None:
+                progress_callback(
+                    "agent_completed",
+                    agent_id=agent_id,
+                    attempt=attempt,
+                    result=result,
+                )
+            return result
+        result = self._unavailable(agent_id, last_error)
+        if progress_callback is not None:
+            progress_callback("agent_failed", agent_id=agent_id, attempt=3, result=result)
+        return result
 
-    def review_structured(self, context: ReviewContext, profile: ReviewProfile) -> list[AgentReviewResult]:
+    def review_structured(
+        self,
+        context: ReviewContext,
+        profile: ReviewProfile,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> list[AgentReviewResult]:
         prompts = self.build_prompts(context, profile)
         if self.llm is None:
-            return [self._heuristic(agent_id) for agent_id in AGENT_ORDER]
-        return [self._llm_result(agent_id, prompts[agent_id], profile) for agent_id in AGENT_ORDER]
+            results = []
+            for agent_id in AGENT_ORDER:
+                if progress_callback is not None:
+                    progress_callback("agent_started", agent_id=agent_id, attempt=1)
+                result = self._heuristic(agent_id)
+                if progress_callback is not None:
+                    progress_callback("agent_failed", agent_id=agent_id, attempt=1, result=result)
+                results.append(result)
+            return results
+        return [
+            self._llm_result(agent_id, prompts[agent_id], profile, progress_callback)
+            for agent_id in AGENT_ORDER
+        ]
 
     def rewrite(self, row: dict, standards) -> tuple[str, str]:
         """Keep compatibility with the legacy workflow without inventing an edit."""

@@ -8,6 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from scripts.text_review import schema
+from scripts.text_review.reviewers.base import AgentReviewResult
+from scripts.text_review.reviewers.tech_media import AGENT_ORDER, TechMediaReviewer
 from server.db import Base, create_db_engine
 from server.models import (
     AgentResult,
@@ -24,7 +26,9 @@ from server.models import (
 )
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
+from server.services.deterministic_rule_service import ReviewContext
 from server.services.report_service import build_report
+from server.services.review_profile_service import get_review_profile
 from server.services.review_service import _standards_from_rule_version, resolve_task, run_audit
 
 
@@ -159,6 +163,13 @@ def submit_valid_content(session: Session):
     return project, batch, batch.content_items[0]
 
 
+def tech_media_context_and_profile(tmp_path: Path):
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        profile = get_review_profile(project.current_rule_version)
+    return ReviewContext(title="路线规划体验", body="路线结构清晰。", platform="xiaohongshu"), profile
+
+
 def test_submit_batch_creates_v1_and_deterministic_format_statuses(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project = seed_default_project(session)
@@ -192,6 +203,110 @@ def test_run_audit_rejects_missing_project_identity(tmp_path: Path) -> None:
         project.code = None
         with pytest.raises(ValueError, match="missing code"):
             run_audit(session, item.id, reviewer=FakeReviewer([]), model="model-v1")
+
+
+def test_tech_media_progress_callback_reports_retries_and_terminal_transitions(
+    tmp_path: Path,
+) -> None:
+    context, profile = tech_media_context_and_profile(tmp_path)
+    attempts = {agent_id: 0 for agent_id in AGENT_ORDER}
+    events = []
+
+    class RetryingLLM:
+        def chat_json(self, prompt, _response_model):
+            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
+            attempts[agent_id] += 1
+            if agent_id == "COMPLIANCE" and attempts[agent_id] < 3:
+                raise RuntimeError("Authorization: Bearer secret retry failure")
+            return AgentReviewResult(
+                agent_id=agent_id,
+                agent_version="tech-media-v1",
+                decision="PASS",
+                summary="通过",
+                score=90,
+                confidence=0.9,
+                issues=[],
+            ).model_dump(mode="json")
+
+    results = TechMediaReviewer(llm=RetryingLLM()).review_structured(
+        context,
+        profile,
+        progress_callback=lambda event, **payload: events.append((event, payload)),
+    )
+
+    assert [result.agent_id for result in results] == list(AGENT_ORDER)
+    compliance_events = [entry for entry in events if entry[1]["agent_id"] == "COMPLIANCE"]
+    assert [event for event, _payload in compliance_events] == [
+        "agent_started",
+        "agent_retry",
+        "agent_retry",
+        "agent_completed",
+    ]
+    assert [payload["attempt"] for _event, payload in compliance_events] == [1, 1, 2, 3]
+    assert all("secret" not in str(payload) for _event, payload in compliance_events)
+
+
+def test_completed_callback_failure_does_not_retry_a_valid_model_response(tmp_path: Path) -> None:
+    context, profile = tech_media_context_and_profile(tmp_path)
+    calls = 0
+
+    class ValidLLM:
+        def chat_json(self, prompt, _response_model):
+            nonlocal calls
+            calls += 1
+            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
+            return AgentReviewResult(
+                agent_id=agent_id,
+                agent_version="tech-media-v1",
+                decision="PASS",
+                summary="通过",
+                score=90,
+                confidence=0.9,
+                issues=[],
+            ).model_dump(mode="json")
+
+    def callback(event, **_payload):
+        if event == "agent_completed":
+            raise RuntimeError("progress persistence failed")
+
+    with pytest.raises(RuntimeError, match="progress persistence failed"):
+        TechMediaReviewer(llm=ValidLLM()).review_structured(
+            context,
+            profile,
+            progress_callback=callback,
+        )
+
+    assert calls == 1
+
+
+def test_tech_media_progress_callback_reports_terminal_unavailable_result(
+    tmp_path: Path,
+) -> None:
+    context, profile = tech_media_context_and_profile(tmp_path)
+    events = []
+
+    class FailingLLM:
+        def chat_json(self, _prompt, _response_model):
+            raise RuntimeError("https://gateway.internal raw response secret")
+
+    TechMediaReviewer(llm=FailingLLM()).review_structured(
+        context,
+        profile,
+        progress_callback=lambda event, **payload: events.append((event, payload)),
+    )
+
+    first_agent_events = [entry for entry in events if entry[1]["agent_id"] == AGENT_ORDER[0]]
+    assert [event for event, _payload in first_agent_events] == [
+        "agent_started",
+        "agent_retry",
+        "agent_retry",
+        "agent_failed",
+    ]
+    failure = first_agent_events[-1][1]
+    assert failure["attempt"] == 3
+    assert failure["result"].decision == "HUMAN_REVIEW"
+    assert "gateway.internal" not in str(failure)
+    assert "secret" not in str(failure)
 
 
 def test_database_compatibility_layer_never_forwards_legacy_rule_arrays() -> None:
@@ -516,6 +631,73 @@ def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path:
         task = item.review_tasks[0]
         assert task.target_content_version_id == item.versions[-1].id
         assert task.audit_run_id == audit.id
+
+
+def test_unavailable_only_audit_can_be_superseded_without_deleting_history(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supersede",
+            name="不可用审核重试",
+            contents=[{
+                "external_id": "supersede-1",
+                "title": "路线规划体验",
+                "body": "路线规划步骤清晰，正文信息完整。",
+                "payload": {"platform": "xiaohongshu"},
+            }],
+        ).content_items[0]
+        unavailable = run_audit(session, item.id, reviewer=TechMediaReviewer())
+
+        replacement = run_audit(session, item.id, reviewer=ProtocolReviewer())
+
+        audits = list(session.scalars(select(AuditRun).where(AuditRun.content_item_id == item.id).order_by(AuditRun.id)))
+        assert [audit.id for audit in audits] == [unavailable.id, replacement.id]
+        assert unavailable.status == "SUPERSEDED"
+        assert unavailable.review_key is None
+        assert replacement.status == "COMPLETED"
+        assert all(task.status == "SUPERSEDED" for task in unavailable.review_tasks)
+        assert item.review_status is ReviewStatus.PASSED
+
+
+def test_failed_historical_audit_does_not_block_retry_or_get_deleted(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project, _, item = submit_valid_content(session)
+        failed = AuditRun(
+            content_item=item,
+            content_version=item.versions[-1],
+            rule_version=project.current_rule_version,
+            review_key=None,
+            model="failed-model",
+            prompt_version=project.current_rule_version.prompt_version,
+            status="FAILED",
+        )
+        session.add(failed)
+        session.commit()
+
+        replacement = run_audit(session, item.id, reviewer=ProtocolReviewer())
+
+        audits = list(session.scalars(
+            select(AuditRun).where(AuditRun.content_item_id == item.id).order_by(AuditRun.id)
+        ))
+        assert [audit.id for audit in audits] == [failed.id, replacement.id]
+        assert failed.status == "FAILED"
+        assert replacement.status == "COMPLETED"
+
+
+def test_incomplete_unavailable_audit_is_not_treated_as_supersedable(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        unavailable = run_audit(session, item.id, reviewer=TechMediaReviewer())
+        session.delete(unavailable.agent_results[-1])
+        session.commit()
+
+        with pytest.raises(ValueError, match="open review tasks|already been audited"):
+            run_audit(session, item.id, reviewer=ProtocolReviewer())
+
+        assert unavailable.status == "COMPLETED"
+        assert unavailable.review_key is not None
 
 
 def test_reaudit_is_rejected_while_blocking_task_is_open(tmp_path: Path) -> None:

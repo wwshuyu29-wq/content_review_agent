@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import hashlib
 import json
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -113,6 +113,30 @@ def _validate_agent_protocol(results: list[dict], profile: Any) -> Optional[str]
 
 def _review_key(content_version_id: int, rule_version_id: int) -> str:
     return f"v1:{content_version_id}:{rule_version_id}"
+
+
+def _is_unavailable_only_audit(audit: AuditRun) -> bool:
+    agent_results = list(audit.agent_results)
+    return (
+        audit.status == "COMPLETED"
+        and [result.agent_id for result in agent_results] == list(AGENT_ORDER)
+        and all(
+            result.score is None
+            and bool(result.issues)
+            and all(issue.rule_id == "SYSTEM-LLM-UNAVAILABLE" for issue in result.issues)
+            for result in agent_results
+        )
+    )
+
+
+def _supersede_unavailable_audit(audit: AuditRun) -> None:
+    superseded_at = datetime.utcnow()
+    audit.status = "SUPERSEDED"
+    audit.review_key = None
+    for task in audit.review_tasks:
+        if task.status == "OPEN":
+            task.status = "SUPERSEDED"
+            task.closed_at = superseded_at
 
 
 def _latest_version(item: ContentItem) -> ContentVersion:
@@ -257,9 +281,17 @@ def _normalize_agent_results(
     *,
     context: Optional[ReviewContext] = None,
     profile: Any = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> list[dict]:
     if isinstance(reviewer, TechMediaReviewer):
-        structured = reviewer.review_structured(context, profile)
+        if progress_callback is None:
+            structured = reviewer.review_structured(context, profile)
+        else:
+            structured = reviewer.review_structured(
+                context,
+                profile,
+                progress_callback=progress_callback,
+            )
         normalized = []
         for result in structured:
             issues = []
@@ -320,6 +352,7 @@ def run_audit(
     *,
     reviewer: Any = None,
     model: Optional[str] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
 ) -> AuditRun:
     item = session.get(ContentItem, content_item_id)
     if item is None:
@@ -328,8 +361,6 @@ def run_audit(
         raise ValueError("Rejected content is terminal")
     if item.format_status is not FormatStatus.PASSED:
         raise ValueError("Only content with PASSED format status can be audited")
-    if _open_tasks(item):
-        raise ValueError("Content has open review tasks; resolve them before re-audit")
 
     rule_version = item.project.current_rule_version
     if rule_version is None:
@@ -344,13 +375,22 @@ def run_audit(
         existing_audit = session.scalar(select(AuditRun).where(AuditRun.review_key == review_key))
         if existing_audit is None:
             existing_audit = session.scalar(
-                select(AuditRun).where(
+                select(AuditRun)
+                .where(
                     AuditRun.content_version_id == content_version.id,
                     AuditRun.rule_version_id == rule_version.id,
+                    AuditRun.status.in_(("RUNNING", "COMPLETED")),
                 )
+                .order_by(AuditRun.id.desc())
             )
     if existing_audit is not None:
-        raise ValueError("Content version has already been audited with this rule version")
+        if _is_unavailable_only_audit(existing_audit):
+            _supersede_unavailable_audit(existing_audit)
+            session.flush()
+        else:
+            raise ValueError("Content version has already been audited with this rule version")
+    if _open_tasks(item):
+        raise ValueError("Content has open review tasks; resolve them before re-audit")
     standards = _standards_from_rule_version(rule_version)
     profile = get_review_profile(rule_version)
     reviewer = reviewer or TechMediaReviewer()
@@ -436,7 +476,12 @@ def run_audit(
         session.add(persisted)
         persisted_issues.append(persisted)
     agent_result_data = _normalize_agent_results(
-        reviewer, row, standards, context=context, profile=profile
+        reviewer,
+        row,
+        standards,
+        context=context,
+        profile=profile,
+        progress_callback=progress_callback,
     )
     strict_protocol = item.project.content_type == "TECH_MEDIA_REVIEW"
     protocol_error = _validate_agent_protocol(agent_result_data, profile) if strict_protocol else None

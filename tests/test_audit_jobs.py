@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, get_ident
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import inspect, select
 from sqlalchemy.orm import Session
 
-from scripts.text_review.reviewers.tech_media import AGENT_ORDER
+from scripts.text_review import schema
+from scripts.text_review.reviewers.base import AgentReviewResult
+from scripts.text_review.reviewers.tech_media import AGENT_ORDER, TechMediaReviewer
 from server.db import Base, create_db_engine
 from server.models import (
     AgentAuditProgress,
@@ -20,6 +22,8 @@ from server.models import (
     ManuscriptAuditJob,
     Project,
 )
+from server.seed import seed_default_project
+from server.services.content_service import submit_batch
 from server.services.audit_job_service import (
     create_or_get_active_job,
     get_job_progress,
@@ -244,6 +248,225 @@ def test_interrupt_stale_jobs_leaves_recent_and_terminal_jobs_unchanged(tmp_path
         session.commit()
         assert recent.status == "RUNNING"
         assert terminal.status == "COMPLETED"
+
+
+def configure_worker_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from server.db import get_db_engine, reset_db_resources
+
+    database_url = f"sqlite:///{tmp_path / 'worker.db'}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    reset_db_resources()
+    engine = get_db_engine()
+    Base.metadata.create_all(engine)
+    return engine
+
+
+def create_auditable_batch(session: Session, item_count: int = 2) -> Batch:
+    project = seed_default_project(session)
+    return submit_batch(
+        session,
+        project_id=project.id,
+        supplier_id="worker-test",
+        name="后台审核",
+        contents=[
+            {
+                "external_id": f"worker-{index + 1}",
+                "title": f"稿件 {index + 1}",
+                "body": f"这是第 {index + 1} 篇用于后台审核的完整正文。",
+                "payload": {"platform": "xiaohongshu"},
+            }
+            for index in range(item_count)
+        ],
+    )
+
+
+class PassingReviewer:
+    name = "passing-worker-reviewer"
+
+    def review_structured(self, _row, _standards):
+        return [
+            {
+                "agent_name": agent_id,
+                "agent_id": agent_id,
+                "agent_version": "tech-media-v1",
+                "decision": "PASS",
+                "summary": "通过",
+                "score": 90,
+                "status": "PASS",
+                "issues": [],
+                "raw_result": {},
+            }
+            for agent_id in AGENT_ORDER
+        ]
+
+
+def test_submit_audit_job_submits_only_integer_job_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from server.services import audit_executor_service
+
+    submitted = []
+    completed = Future()
+    completed.set_result(None)
+
+    def capture_submission(function, *args, **kwargs):
+        submitted.append((function, args, kwargs))
+        return completed
+
+    monkeypatch.setattr(audit_executor_service._executor, "submit", capture_submission)
+
+    audit_executor_service.submit_audit_job(41)
+
+    assert len(submitted) == 1
+    function, args, kwargs = submitted[0]
+    assert function is audit_executor_service._execute_submitted_job
+    assert args == (41,)
+    assert kwargs == {}
+    audit_executor_service._submission_slots.release()
+
+
+def test_submit_returns_while_worker_commits_agent_transitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import reset_db_resources
+    from server.services import audit_executor_service
+
+    engine = configure_worker_database(tmp_path, monkeypatch)
+    block_brand = Event()
+    brand_started = Event()
+    factory_threads = []
+    caller_thread = get_ident()
+
+    class BlockingLLM:
+        def chat_json(self, prompt, _response_model):
+            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
+            if agent_id == "BRAND":
+                brand_started.set()
+                assert block_brand.wait(5)
+            return AgentReviewResult(
+                agent_id=agent_id,
+                agent_version="tech-media-v1",
+                decision="PASS",
+                summary="通过",
+                score=90,
+                confidence=0.9,
+                issues=[],
+            ).model_dump(mode="json")
+
+    def reviewer_factory():
+        factory_threads.append(get_ident())
+        return TechMediaReviewer(llm=BlockingLLM())
+
+    monkeypatch.setattr(audit_executor_service, "_reviewer_factory", reviewer_factory)
+    try:
+        with Session(engine) as request_session:
+            batch = create_auditable_batch(request_session, item_count=1)
+            job = create_or_get_active_job(request_session, batch.id, "model")
+            request_session.commit()
+            job_id = job.id
+
+            audit_executor_service.submit_audit_job(job_id)
+            assert brand_started.wait(5), "submission should return while the reviewer is blocked"
+
+            with Session(engine) as polling_session:
+                visible = polling_session.get(BatchAuditJob, job_id)
+                manuscript = polling_session.scalar(
+                    select(ManuscriptAuditJob).where(ManuscriptAuditJob.audit_job_id == job_id)
+                )
+                agents = list(polling_session.scalars(
+                    select(AgentAuditProgress)
+                    .where(AgentAuditProgress.manuscript_job_id == manuscript.id)
+                    .order_by(AgentAuditProgress.position)
+                ))
+                assert visible.status == "RUNNING"
+                assert manuscript.status == "RUNNING"
+                assert agents[0].status == "COMPLETED"
+                assert agents[0].attempt_count == 1
+                assert agents[1].status == "RUNNING"
+                assert visible.current_agent_id == "BRAND"
+
+        assert factory_threads and factory_threads[0] != caller_thread
+    finally:
+        block_brand.set()
+        audit_executor_service.wait_for_audit_jobs()
+        reset_db_resources()
+
+    with Session(engine) as polling_session:
+        finished = polling_session.get(BatchAuditJob, job_id)
+        assert finished.status == "COMPLETED"
+        assert finished.active_key is None
+        assert finished.current_content_item_id is None
+        assert finished.current_agent_id is None
+
+
+def test_worker_continues_after_manuscript_failure_and_sanitizes_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import reset_db_resources
+    from server.services.audit_executor_service import run_audit_job
+
+    engine = configure_worker_database(tmp_path, monkeypatch)
+
+    class FailsFirstReviewer(PassingReviewer):
+        def review_structured(self, row, standards):
+            if row[schema.COL_ID] == "worker-1":
+                raise RuntimeError(
+                    "POST https://gateway.internal failed Authorization: Bearer sk-secret Traceback raw response"
+                )
+            return super().review_structured(row, standards)
+
+    with Session(engine) as session:
+        batch = create_auditable_batch(session, item_count=2)
+        job = create_or_get_active_job(session, batch.id, "model")
+        session.commit()
+        job_id = job.id
+
+    try:
+        run_audit_job(job_id, FailsFirstReviewer)
+        with Session(engine) as session:
+            job = session.get(BatchAuditJob, job_id)
+            manuscripts = list(session.scalars(
+                select(ManuscriptAuditJob)
+                .where(ManuscriptAuditJob.audit_job_id == job_id)
+                .order_by(ManuscriptAuditJob.position)
+            ))
+            assert [manuscript.status for manuscript in manuscripts] == ["FAILED", "COMPLETED"]
+            assert job.status == "COMPLETED_WITH_ERRORS"
+            assert job.active_key is None
+            assert job.failed_count == 1
+            assert job.completed_count == 1
+            assert manuscripts[0].error_summary == "审核过程中出现异常，请稍后重试或联系管理员。"
+            assert "gateway" not in str(job.error_summary)
+            assert "secret" not in str(job.error_summary)
+    finally:
+        reset_db_resources()
+
+
+def test_worker_skips_content_with_valid_matching_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import reset_db_resources
+    from server.services.audit_executor_service import run_audit_job
+    from server.services.review_service import run_audit
+
+    engine = configure_worker_database(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        batch = create_auditable_batch(session, item_count=1)
+        run_audit(session, batch.content_items[0].id, reviewer=PassingReviewer())
+        job = create_or_get_active_job(session, batch.id, "model")
+        session.commit()
+        job_id = job.id
+
+    try:
+        run_audit_job(job_id, PassingReviewer)
+        with Session(engine) as session:
+            job = session.get(BatchAuditJob, job_id)
+            manuscript = session.scalar(
+                select(ManuscriptAuditJob).where(ManuscriptAuditJob.audit_job_id == job_id)
+            )
+            assert manuscript.status == "SKIPPED"
+            assert job.status == "COMPLETED"
+            assert job.skipped_count == 1
+    finally:
+        reset_db_resources()
 
 
 def test_application_startup_interrupts_stale_jobs(

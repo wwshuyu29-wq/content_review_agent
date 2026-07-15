@@ -23,6 +23,7 @@ from scripts.text_review.reviewer import get_reviewer
 from scripts.text_review.reviewers.llm import get_llm
 from scripts.text_review.reviewers.tech_media import TechMediaReviewer
 from server.db import Base, ensure_schema_upgrades, get_db_engine, get_session
+from server.services.audit_executor_service import set_reviewer_factory
 from server.services.audit_job_service import interrupt_stale_jobs
 from server.models import (
     AgentResult,
@@ -168,6 +169,7 @@ async def lifespan(_app: FastAPI):
         stale_seconds = max(1, int(os.environ.get("AUDIT_JOB_STALE_SECONDS", "300")))
         interrupt_stale_jobs(session, datetime.utcnow() - timedelta(seconds=stale_seconds))
         session.commit()
+    set_reviewer_factory(get_audit_reviewer)
     yield
 
 
