@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,6 +25,8 @@ def auth_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "correct horse battery staple")
     monkeypatch.setenv("SESSION_SECRET", "test-session-secret-with-at-least-32-bytes")
     monkeypatch.setenv("SESSION_COOKIE_SECURE", "false")
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("TRUSTED_PUBLIC_ORIGINS", "http://testserver")
     reset_db_resources()
     with TestClient(main.app) as client:
         yield client, create_db_engine(database_url)
@@ -37,6 +40,79 @@ def login(client: TestClient, username: str = "admin", password: str = "correct 
 
 def csrf_headers(response) -> dict[str, str]:
     return {"X-CSRF-Token": response.json()["csrf_token"], "Origin": "http://testserver"}
+
+
+def test_only_health_and_login_are_public_business_surfaces(auth_api) -> None:
+    client, _, = auth_api
+
+    assert client.get("/api/health").status_code == 200
+    assert login(client).status_code == 200
+    client.cookies.clear()
+
+    representative_reads = (
+        ("/api/projects", None),
+        ("/api/import-template", None),
+        ("/api/batches", None),
+        ("/api/batches/1/export", None),
+        ("/api/contents", None),
+        ("/api/contents/1", None),
+        ("/api/contents/1/test-cases", None),
+        ("/api/audit-runs", None),
+        ("/api/review-tasks", None),
+        ("/api/reports", {"project_id": 1}),
+        ("/api/config", None),
+        ("/api/media/1", None),
+    )
+    for path, params in representative_reads:
+        response = client.get(path, params=params)
+        assert response.status_code == 401, path
+
+
+def test_every_business_mutation_category_requires_authentication(auth_api) -> None:
+    client, _ = auth_api
+    mutations = (
+        ("post", "/api/projects", {"json": {"name": "anonymous"}}),
+        ("post", "/api/projects/1/rule-versions", {"json": {}}),
+        ("post", "/api/imports/preview", {}),
+        ("post", "/api/imports/token/confirm", {"json": {}}),
+        ("post", "/api/batches", {}),
+        ("post", "/api/contents/1/audit", {}),
+        ("post", "/api/batches/1/audit", {}),
+        ("post", "/api/review-tasks/1/resolve", {"json": {}}),
+        ("put", "/api/config", {"json": {"reviewer": "heuristic", "model": ""}}),
+    )
+
+    for method, path, kwargs in mutations:
+        response = client.request(method, path, **kwargs)
+        assert response.status_code == 401, path
+
+
+def test_every_business_mutation_category_requires_csrf(auth_api) -> None:
+    client, _ = auth_api
+    authenticated = login(client)
+    mutations = (
+        ("post", "/api/projects", {"json": {"name": "missing-csrf"}}),
+        ("post", "/api/projects/1/rule-versions", {"json": {}}),
+        ("post", "/api/imports/preview", {}),
+        ("post", "/api/imports/token/confirm", {"json": {}}),
+        ("post", "/api/batches", {}),
+        ("post", "/api/contents/1/audit", {}),
+        ("post", "/api/batches/1/audit", {}),
+        ("post", "/api/review-tasks/1/resolve", {"json": {}}),
+        ("put", "/api/config", {"json": {"reviewer": "heuristic", "model": ""}}),
+    )
+
+    for method, path, kwargs in mutations:
+        missing = client.request(method, path, headers={"Origin": "http://testserver"}, **kwargs)
+        wrong = client.request(
+            method,
+            path,
+            headers={"Origin": "http://testserver", "X-CSRF-Token": "wrong"},
+            **kwargs,
+        )
+        assert missing.status_code == 403, path
+        assert wrong.status_code == 403, path
+    assert authenticated.json()["csrf_token"]
 
 
 def test_passwords_use_argon2id_and_invalid_password_is_rejected() -> None:
@@ -139,6 +215,75 @@ def test_missing_bootstrap_secrets_fail_only_when_no_users_exist(
         ensure_initial_admin(session)
 
 
+def test_username_normalization_is_shared_by_bootstrap_and_admin_creation(auth_api) -> None:
+    from server.models import User
+
+    client, engine = auth_api
+    authenticated = login(client)
+    created = client.post(
+        "/api/admin/users",
+        headers=csrf_headers(authenticated),
+        json={
+            "username": "  Review.User  ",
+            "display_name": "Review User",
+            "password": "reviewer password value",
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["username"] == "review.user"
+    with Session(engine) as session:
+        assert session.scalar(select(User).where(User.username == "review.user")) is not None
+
+
+def test_bootstrap_rejects_username_not_accepted_by_admin_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.services.auth_service import ensure_initial_admin
+
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'invalid-bootstrap-username.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setenv("INITIAL_ADMIN_USERNAME", "invalid username")
+    monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "valid-bootstrap-password")
+    monkeypatch.setenv("SESSION_SECRET", "bootstrap-session-secret-with-32-bytes")
+
+    with Session(engine) as session:
+        with pytest.raises(RuntimeError, match="INITIAL_ADMIN_USERNAME is invalid"):
+            ensure_initial_admin(session)
+
+
+def test_concurrent_initial_admin_bootstrap_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.models import User
+    from server.services.auth_service import ensure_initial_admin
+
+    database_url = f"sqlite:///{tmp_path / 'concurrent-bootstrap.db'}"
+    engine = create_db_engine(database_url)
+    Base.metadata.create_all(engine)
+    monkeypatch.setenv("INITIAL_ADMIN_USERNAME", "concurrent-admin")
+    monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "concurrent-admin-password")
+    monkeypatch.setenv("SESSION_SECRET", "concurrent-session-secret-with-32-bytes")
+
+    def bootstrap() -> str:
+        with Session(engine) as session:
+            admin = ensure_initial_admin(session)
+            session.commit()
+            if admin is None:
+                admin = session.scalar(select(User).where(User.username == "concurrent-admin"))
+            return admin.username
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: bootstrap(), range(2)))
+
+    with Session(engine) as session:
+        users = list(session.scalars(select(User)))
+    assert results == ["concurrent-admin", "concurrent-admin"]
+    assert len(users) == 1
+    assert users[0].role == "ADMIN"
+    assert users[0].is_active is True
+
+
 def test_login_sets_secure_aware_http_only_same_site_cookie_and_me_works(auth_api) -> None:
     client, _ = auth_api
 
@@ -185,6 +330,24 @@ def test_invalid_password_and_disabled_user_share_generic_login_error(auth_api) 
     assert invalid.json() == disabled.json() == {"detail": "Invalid username or password"}
 
 
+def test_authenticated_request_persists_session_last_used_time(auth_api) -> None:
+    from server.models import UserSession
+
+    client, engine = auth_api
+    login(client)
+    stale_time = datetime.utcnow() - timedelta(days=1)
+    with Session(engine) as session:
+        stored = session.scalar(select(UserSession))
+        stored.last_used_at = stale_time
+        session.commit()
+
+    assert client.get("/api/projects").status_code == 200
+
+    with Session(engine) as session:
+        refreshed = session.scalar(select(UserSession))
+        assert refreshed.last_used_at > stale_time
+
+
 def test_logout_requires_csrf_and_revokes_session(auth_api) -> None:
     client, _ = auth_api
     authenticated = login(client)
@@ -199,9 +362,13 @@ def test_logout_requires_csrf_and_revokes_session(auth_api) -> None:
 
 def test_no_public_registration_and_admin_only_user_creation(auth_api) -> None:
     client, _ = auth_api
-    assert client.post("/api/auth/register", json={"username": "public", "password": "password value"}).status_code == 404
-
     admin_login = login(client)
+    assert client.post(
+        "/api/auth/register",
+        headers=csrf_headers(admin_login),
+        json={"username": "public", "password": "password value"},
+    ).status_code == 404
+
     created = client.post(
         "/api/admin/users",
         headers=csrf_headers(admin_login),
@@ -223,6 +390,27 @@ def test_no_public_registration_and_admin_only_user_creation(auth_api) -> None:
         json={"username": "other", "display_name": "Other", "password": "other password value"},
     )
     assert forbidden.status_code == 403
+
+
+def test_last_active_administrator_cannot_disable_self(auth_api) -> None:
+    from server.models import User
+
+    client, engine = auth_api
+    authenticated = login(client)
+    admin_id = authenticated.json()["user"]["id"]
+
+    response = client.patch(
+        f"/api/admin/users/{admin_id}",
+        headers=csrf_headers(authenticated),
+        json={"is_active": False},
+    )
+
+    assert response.status_code == 409
+    assert client.get("/api/auth/me").status_code == 200
+    with Session(engine) as session:
+        admin = session.get(User, admin_id)
+        assert admin.is_active is True
+        assert admin.role == "ADMIN"
 
 
 def test_admin_can_list_disable_and_reset_users_and_sessions_are_invalidated(auth_api) -> None:
@@ -268,6 +456,66 @@ def test_admin_can_list_disable_and_reset_users_and_sessions_are_invalidated(aut
     assert disabled.status_code == 200
     client.cookies.clear()
     assert login(client, "reviewer", "new password value").status_code == 401
+
+
+def test_csrf_origin_requires_exact_scheme_and_effective_port(auth_api) -> None:
+    client, _ = auth_api
+
+    scheme_login = login(client)
+    scheme_mismatch = client.post(
+        "/api/auth/logout",
+        headers={"Origin": "https://testserver", "X-CSRF-Token": scheme_login.json()["csrf_token"]},
+    )
+    assert scheme_mismatch.status_code == 403
+
+    client.cookies.clear()
+    port_login = login(client)
+    port_mismatch = client.post(
+        "/api/auth/logout",
+        headers={"Origin": "http://testserver:81", "X-CSRF-Token": port_login.json()["csrf_token"]},
+    )
+    assert port_mismatch.status_code == 403
+
+    canonical_login = login(client)
+    canonical_default_port = client.post(
+        "/api/auth/logout",
+        headers={"Origin": "http://testserver:80", "X-CSRF-Token": canonical_login.json()["csrf_token"]},
+    )
+    assert canonical_default_port.status_code == 204
+
+
+def test_csrf_origin_accepts_configured_comma_separated_public_origin(
+    auth_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _ = auth_api
+    monkeypatch.setenv(
+        "TRUSTED_PUBLIC_ORIGINS",
+        "https://other.example, https://review.example:443",
+    )
+    authenticated = login(client)
+
+    response = client.post(
+        "/api/auth/logout",
+        headers={"Origin": "https://review.example", "X-CSRF-Token": authenticated.json()["csrf_token"]},
+    )
+
+    assert response.status_code == 204
+
+
+def test_production_has_no_implicit_local_trusted_origins(
+    auth_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, _ = auth_api
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("TRUSTED_PUBLIC_ORIGINS")
+    authenticated = login(client)
+
+    response = client.post(
+        "/api/auth/logout",
+        headers={"Origin": "http://testserver", "X-CSRF-Token": authenticated.json()["csrf_token"]},
+    )
+
+    assert response.status_code == 403
 
 
 def test_start_script_validates_session_secret_without_printing_values(tmp_path: Path) -> None:

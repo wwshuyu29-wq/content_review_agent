@@ -51,6 +51,7 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("INITIAL_ADMIN_USERNAME", "test-admin")
     monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "test-admin-password")
     monkeypatch.setenv("SESSION_SECRET", "test-session-secret-with-at-least-32-bytes")
+    monkeypatch.setenv("TRUSTED_PUBLIC_ORIGINS", "http://testserver")
     engine = create_db_engine(database_url)
 
     def test_session():
@@ -60,6 +61,15 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     main.app.dependency_overrides[main.get_session] = test_session
     main.app.dependency_overrides[main.get_audit_reviewer] = lambda: FakeReviewer()
     with TestClient(main.app) as client:
+        authenticated = client.post(
+            "/api/auth/login",
+            json={"username": "test-admin", "password": "test-admin-password"},
+        )
+        assert authenticated.status_code == 200
+        client.headers.update({
+            "Origin": "http://testserver",
+            "X-CSRF-Token": authenticated.json()["csrf_token"],
+        })
         yield client, engine, tmp_path
     main.app.dependency_overrides.clear()
     engine.dispose()

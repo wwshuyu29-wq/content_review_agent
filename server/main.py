@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -64,14 +64,19 @@ from server.seed import seed_default_project
 from server.services.auth_service import (
     SESSION_COOKIE_NAME,
     authenticate_credentials,
+    authenticate_request,
     create_session,
     csrf_token_for_session,
     ensure_initial_admin,
     hash_password,
+    normalize_username,
     require_admin,
     require_csrf,
     require_user,
     revoke_user_sessions,
+    set_user_active,
+    trusted_public_origin_values,
+    validate_csrf_request,
 )
 from server.services.content_service import submit_batch
 from server.services.excel_import_service import PreviewIdentity, build_import_template, preview_import, confirm_import as confirm_excel_import
@@ -166,11 +171,29 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="内容审核后端", version="2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=trusted_public_origin_values(),
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
+
+PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc"}
+SAFE_METHODS = {"GET", "HEAD"}
+
+
+@app.middleware("http")
+async def enforce_api_authentication(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or path in PUBLIC_PATHS or not path.startswith("/api/"):
+        return await call_next(request)
+    try:
+        with Session(get_db_engine()) as session:
+            authenticate_request(request, session)
+            if request.method not in SAFE_METHODS:
+                validate_csrf_request(request)
+    except HTTPException as error:
+        return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
+    return await call_next(request)
 
 
 class OrmResponse(BaseModel):
@@ -196,14 +219,19 @@ class LoginInput(BaseModel):
 
 
 class AdminUserCreate(BaseModel):
-    username: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    username: str = Field(min_length=1, max_length=200)
     display_name: str = Field(min_length=1, max_length=200)
     password: str = Field(min_length=12, max_length=1024)
     role: str = "REVIEWER"
 
-    @field_validator("username", "display_name")
+    @field_validator("username")
     @classmethod
-    def strip_required(cls, value: str) -> str:
+    def normalize_required_username(cls, value: str) -> str:
+        return normalize_username(value)
+
+    @field_validator("display_name")
+    @classmethod
+    def strip_required_display_name(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("Value must not be blank")
@@ -420,7 +448,7 @@ def list_users(
 )
 def create_user(payload: AdminUserCreate, session: Session = Depends(get_session)):
     user = User(
-        username=payload.username.lower(),
+        username=payload.username,
         display_name=payload.display_name,
         password_hash=hash_password(payload.password),
         role=payload.role,
@@ -442,15 +470,16 @@ def create_user(payload: AdminUserCreate, session: Session = Depends(get_session
     dependencies=[Depends(require_admin), Depends(require_csrf)],
 )
 def update_user(user_id: int, payload: AdminUserUpdate, session: Session = Depends(get_session)):
-    user = session.get(User, user_id)
+    try:
+        user = set_user_active(session, user_id, payload.is_active)
+    except ValueError as error:
+        session.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if user is None:
+        session.rollback()
         raise _not_found("User", user_id)
-    if user.is_active != payload.is_active:
-        user.is_active = payload.is_active
-        user.session_version += 1
-        revoke_user_sessions(session, user)
-        session.commit()
-        session.refresh(user)
+    session.commit()
+    session.refresh(user)
     return user
 
 

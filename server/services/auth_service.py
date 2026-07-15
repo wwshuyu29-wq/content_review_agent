@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -12,7 +13,8 @@ from urllib.parse import urlsplit
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from server.db import get_session
@@ -30,6 +32,13 @@ class SessionSecrets:
     session_token: str
     csrf_token: str
     expires_at: datetime
+
+
+def normalize_username(username: str) -> str:
+    normalized = username.strip().lower()
+    if not normalized or len(normalized) > 100 or re.fullmatch(r"[a-z0-9._-]+", normalized) is None:
+        raise ValueError("Username must use 1-100 ASCII letters, numbers, dots, underscores, or hyphens")
+    return normalized
 
 
 def hash_password(password: str) -> str:
@@ -114,16 +123,27 @@ def lookup_session(session: Session, session_token: str) -> Optional[UserSession
         or record.session_version != record.user.session_version
     ):
         return None
-    record.last_used_at = now
     return record
 
 
 def authenticate_request(request: Request, session: Session) -> User:
+    existing_user = getattr(request.state, "auth_user", None)
+    if existing_user is not None:
+        return existing_user
     record = lookup_session(session, request.cookies.get(SESSION_COOKIE_NAME, ""))
     if record is None:
         raise HTTPException(status_code=401, detail="Authentication required")
+    user = record.user
+    now = datetime.utcnow()
+    session.execute(
+        update(UserSession).where(UserSession.id == record.id).values(last_used_at=now)
+    )
+    session.commit()
+    session.refresh(record)
+    session.refresh(user)
     request.state.auth_session = record
-    return record.user
+    request.state.auth_user = user
+    return user
 
 
 def require_user(request: Request, session: Session = Depends(get_session)) -> User:
@@ -136,17 +156,66 @@ def require_admin(user: User = Depends(require_user)) -> User:
     return user
 
 
+def _canonical_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlsplit(value.strip())
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Origin must contain only scheme, host, and optional port")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Origin port is invalid") from error
+    scheme = parsed.scheme.lower()
+    return scheme, parsed.hostname.lower(), port or (443 if scheme == "https" else 80)
+
+
+def trusted_public_origins() -> set[tuple[str, str, int]]:
+    configured = os.environ.get("TRUSTED_PUBLIC_ORIGINS", "")
+    if configured.strip():
+        values = [value.strip() for value in configured.split(",") if value.strip()]
+    elif os.environ.get("ENVIRONMENT", "").strip().lower() in {"production", "prod"}:
+        values = []
+    else:
+        values = [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+        ]
+        if os.environ.get("ENVIRONMENT", "").strip().lower() == "test":
+            values.append("http://testserver")
+    try:
+        return {_canonical_origin(value) for value in values}
+    except ValueError as error:
+        raise RuntimeError("TRUSTED_PUBLIC_ORIGINS contains an invalid origin") from error
+
+
+def trusted_public_origin_values() -> list[str]:
+    values = []
+    for scheme, host, port in sorted(trusted_public_origins()):
+        default_port = 443 if scheme == "https" else 80
+        values.append(f"{scheme}://{host}" + (f":{port}" if port != default_port else ""))
+    return values
+
+
 def _validate_request_origin(request: Request) -> None:
     origin = request.headers.get("origin")
-    if not origin:
+    try:
+        canonical = _canonical_origin(origin or "")
+    except ValueError:
         raise HTTPException(status_code=403, detail="CSRF validation failed")
-    parsed = urlsplit(origin)
-    request_host = request.url.hostname
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.hostname != request_host:
+    if canonical not in trusted_public_origins():
         raise HTTPException(status_code=403, detail="CSRF validation failed")
 
 
-def require_csrf(request: Request, user: User = Depends(require_user)) -> User:
+def validate_csrf_request(request: Request) -> None:
     _validate_request_origin(request)
     record = getattr(request.state, "auth_session", None)
     supplied_token = request.headers.get("x-csrf-token", "")
@@ -155,11 +224,18 @@ def require_csrf(request: Request, user: User = Depends(require_user)) -> User:
     supplied_hash = _secret_hash(supplied_token)
     if not hmac.compare_digest(record.csrf_hash, supplied_hash):
         raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+
+def require_csrf(request: Request, user: User = Depends(require_user)) -> User:
+    validate_csrf_request(request)
     return user
 
 
 def authenticate_credentials(session: Session, username: str, password: str) -> Optional[User]:
-    normalized = username.strip().lower()
+    try:
+        normalized = normalize_username(username)
+    except ValueError:
+        normalized = "invalid-login-username"
     user = session.scalar(select(User).where(User.username == normalized))
     candidate_hash = user.password_hash if user is not None else _dummy_password_hash()
     password_valid = verify_password(candidate_hash, password)
@@ -177,17 +253,56 @@ def revoke_user_sessions(session: Session, user: User) -> None:
     )
 
 
+def set_user_active(session: Session, user_id: int, is_active: bool) -> Optional[User]:
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        session.execute(text("BEGIN IMMEDIATE"))
+    user = session.get(User, user_id)
+    if user is None:
+        return None
+    if user.is_active == is_active:
+        return user
+    if not is_active and user.role == "ADMIN":
+        query = select(User.id).where(User.role == "ADMIN", User.is_active.is_(True))
+        if dialect == "postgresql":
+            query = query.with_for_update()
+        active_admin_ids = list(session.scalars(query))
+        if len(active_admin_ids) == 1 and active_admin_ids[0] == user.id:
+            raise ValueError("Cannot disable the last active administrator")
+    user.is_active = is_active
+    user.session_version += 1
+    revoke_user_sessions(session, user)
+    return user
+
+
+def _acquire_initial_admin_lock(session: Session) -> None:
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        session.execute(text("BEGIN IMMEDIATE"))
+    elif dialect == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": 1869771365})
+
+
+def _verified_initial_admin(session: Session, username: str) -> User:
+    existing = session.scalar(select(User).where(User.username == username))
+    if existing is None or existing.role != "ADMIN" or not existing.is_active:
+        raise RuntimeError("Concurrent initial administrator bootstrap did not create an active ADMIN")
+    return existing
+
+
 def ensure_initial_admin(session: Session) -> Optional[User]:
+    _acquire_initial_admin_lock(session)
     if session.scalar(select(func.count(User.id))) > 0:
         return None
     required_names = ("INITIAL_ADMIN_USERNAME", "INITIAL_ADMIN_PASSWORD", "SESSION_SECRET")
     missing = [name for name in required_names if not os.environ.get(name)]
     if missing:
         raise RuntimeError(f"Missing required bootstrap settings: {', '.join(missing)}")
-    username = os.environ["INITIAL_ADMIN_USERNAME"].strip().lower()
+    try:
+        username = normalize_username(os.environ["INITIAL_ADMIN_USERNAME"])
+    except ValueError as error:
+        raise RuntimeError("INITIAL_ADMIN_USERNAME is invalid") from error
     password = os.environ["INITIAL_ADMIN_PASSWORD"]
-    if not username:
-        raise RuntimeError("INITIAL_ADMIN_USERNAME must not be blank")
     if len(password) < 12:
         raise RuntimeError("INITIAL_ADMIN_PASSWORD must contain at least 12 characters")
     _session_secret()
@@ -199,5 +314,9 @@ def ensure_initial_admin(session: Session) -> Optional[User]:
         is_active=True,
     )
     session.add(admin)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        return _verified_initial_admin(session, username)
     return admin
