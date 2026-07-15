@@ -90,6 +90,12 @@ class BatchRead(OrmSchema):
 BUSINESS_SAFE_AUDIT_ERROR_MESSAGE = "审核过程中出现异常，请稍后重试或联系管理员。"
 
 
+class AuditJobStartRead(BaseModel):
+    job_id: int
+    batch_id: int
+    status: str
+
+
 def business_safe_audit_error(error_summary: Optional[str]) -> Optional[str]:
     return BUSINESS_SAFE_AUDIT_ERROR_MESSAGE if error_summary else None
 

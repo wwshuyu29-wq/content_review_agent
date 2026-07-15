@@ -325,6 +325,62 @@ export interface AuthUser {
 export interface AuthResponse { user: AuthUser; csrf_token: string; }
 
 export interface BatchAuditResult { content_id: number; status: "success" | "error"; audit_run_id: number | null; error: string | null; }
+
+export interface AuditJobStart {
+  job_id: number;
+  batch_id: number;
+  status: string;
+}
+
+export interface AgentProgress {
+  id: number;
+  manuscript_job_id: number;
+  agent_id: AgentId | string;
+  position: number;
+  status: string;
+  attempt_count: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  decision: string | null;
+  score: number | null;
+  error_summary: string | null;
+}
+
+export interface ManuscriptProgress {
+  id: number;
+  audit_job_id: number;
+  content_item_id: number;
+  position: number;
+  status: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_summary: string | null;
+  agents: AgentProgress[];
+}
+
+export interface AuditJobProgress {
+  id: number;
+  batch_id: number;
+  model: string;
+  status: string;
+  total_count: number;
+  completed_count: number;
+  failed_count: number;
+  skipped_count: number;
+  running_count: number;
+  pending_count: number;
+  current_content_item_id: number | null;
+  current_agent_id: string | null;
+  heartbeat_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_summary: string | null;
+  created_at: string;
+  updated_at: string;
+  manuscripts: ManuscriptProgress[];
+  current_agents: AgentProgress[];
+}
 export interface ContentFilters { project_id?: number; batch_id?: number; format_status?: FormatStatus; review_status?: ReviewStatus; publish_status?: PublishStatus; }
 
 function query(params: Record<string, string | number | undefined>): string {
@@ -424,6 +480,9 @@ export const api = {
   content: (id: number, signal?: AbortSignal): Promise<ContentDetail> => request(`/api/contents/${id}`, { signal }),
   contentTestCases: (id: number, signal?: AbortSignal): Promise<TestCase[]> => request(`/api/contents/${id}/test-cases`, { signal }),
   auditContent: (id: number): Promise<AuditDetail> => request(`/api/contents/${id}/audit`, { method: "POST" }),
+  startAuditJob: (batchId: number): Promise<AuditJobStart> => request(`/api/batches/${batchId}/audit-jobs`, { method: "POST" }),
+  auditJob: (jobId: number, signal?: AbortSignal): Promise<AuditJobProgress> => request(`/api/audit-jobs/${jobId}`, { signal }),
+  batchAuditJob: (batchId: number, signal?: AbortSignal): Promise<AuditJobProgress | null> => request(`/api/batches/${batchId}/audit-job`, { signal }),
   auditBatch: (id: number): Promise<{ batch_id: number; audited: number; audit_run_ids: number[]; results: BatchAuditResult[] }> =>
     request(`/api/batches/${id}/audit`, { method: "POST" }),
   reviewTasks: (filters: { status?: string; project_id?: number; batch_id?: number }): Promise<ReviewTask[]> =>

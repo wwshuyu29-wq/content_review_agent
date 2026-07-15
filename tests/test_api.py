@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from server import main
 from server.db import create_db_engine
 from scripts.text_review.reviewers.tech_media import TechMediaReviewer
-from server.models import Asset, ContentItem, Project, ReviewStatus, TestCase as EvidenceTestCase, TestEvidence as EvidenceBinding
+from server.models import Asset, BatchAuditJob, ContentItem, Project, ReviewStatus, TestCase as EvidenceTestCase, TestEvidence as EvidenceBinding
 
 
 class FakeReviewer:
@@ -617,3 +617,89 @@ def test_not_found_validation_and_failed_batch_transaction(api) -> None:
     healthy = client.get("/api/health")
     assert healthy.status_code == 200
     assert healthy.json()["ok"] is True
+
+
+def _create_audit_job_batch(client: TestClient, suffix: str = "one") -> dict:
+    project_id = client.get("/api/projects").json()[0]["id"]
+    return client.post(
+        "/api/batches",
+        data={
+            "project_id": str(project_id), "supplier_id": f"job-api-{suffix}", "name": f"后台审核 {suffix}",
+            "contents": json.dumps([
+                {"external_id": f"job-{suffix}-1", "title": "标题一", "body": "正文一", "payload": {}},
+                {"external_id": f"job-{suffix}-2", "title": "标题二", "body": "正文二", "payload": {}},
+            ]),
+        },
+        files=[
+            ("files", (f"job-{suffix}-1.png", b"one", "image/png")),
+            ("files", (f"job-{suffix}-2.png", b"two", "image/png")),
+        ],
+    ).json()
+
+
+def test_audit_job_endpoints_start_immediately_reuse_and_restore_progress(api, monkeypatch) -> None:
+    client, engine, _ = api
+    batch = _create_audit_job_batch(client)
+    submitted = []
+
+    def capture_submission(job_id: int) -> None:
+        with Session(engine) as independent_session:
+            assert independent_session.get(BatchAuditJob, job_id).status == "QUEUED"
+        submitted.append(job_id)
+
+    monkeypatch.setattr(main, "submit_audit_job", capture_submission, raising=False)
+    first = client.post(f"/api/batches/{batch['id']}/audit-jobs")
+    duplicate = client.post(f"/api/batches/{batch['id']}/audit-jobs")
+    assert first.status_code == duplicate.status_code == 202
+    assert first.json() == duplicate.json() == {
+        "job_id": first.json()["job_id"], "batch_id": batch["id"], "status": "QUEUED",
+    }
+    assert submitted == [first.json()["job_id"]]
+
+    progress = client.get(f"/api/audit-jobs/{first.json()['job_id']}")
+    restored = client.get(f"/api/batches/{batch['id']}/audit-job")
+    assert progress.status_code == restored.status_code == 200
+    assert restored.json() == progress.json()
+    payload = progress.json()
+    assert (payload["total_count"], payload["pending_count"], payload["running_count"]) == (2, 2, 0)
+    assert [row["position"] for row in payload["manuscripts"]] == [1, 2]
+    assert len(payload["manuscripts"][0]["agents"]) == 6
+    assert payload["current_agents"] == []
+
+
+def test_audit_job_endpoints_require_authentication_and_start_requires_csrf(api) -> None:
+    client, _, _ = api
+    batch = _create_audit_job_batch(client, "security")
+    with TestClient(main.app) as unauthenticated:
+        assert unauthenticated.post(f"/api/batches/{batch['id']}/audit-jobs").status_code == 401
+        assert unauthenticated.get("/api/audit-jobs/999999").status_code == 401
+        assert unauthenticated.get(f"/api/batches/{batch['id']}/audit-job").status_code == 401
+    csrf_token = client.headers.pop("X-CSRF-Token")
+    try:
+        assert client.post(f"/api/batches/{batch['id']}/audit-jobs").status_code == 403
+    finally:
+        client.headers["X-CSRF-Token"] = csrf_token
+
+
+def test_audit_job_reads_enforce_batch_relationship_and_hide_raw_errors(api, monkeypatch) -> None:
+    client, engine, _ = api
+    owned_batch = _create_audit_job_batch(client, "owned")
+    other_batch = _create_audit_job_batch(client, "other")
+    monkeypatch.setattr(main, "submit_audit_job", lambda _job_id: None, raising=False)
+    started = client.post(f"/api/batches/{owned_batch['id']}/audit-jobs").json()
+    technical_error = "POST https://gateway.internal Authorization: Bearer sk-secret raw response Traceback RuntimeError"
+    with Session(engine) as session:
+        job = session.get(BatchAuditJob, started["job_id"])
+        job.error_summary = technical_error
+        job.manuscripts[0].error_summary = technical_error
+        job.manuscripts[0].agents[0].error_summary = technical_error
+        session.commit()
+
+    assert client.get(f"/api/batches/{other_batch['id']}/audit-job").json() is None
+    assert client.get("/api/audit-jobs/999999").status_code == 404
+    payload = client.get(f"/api/audit-jobs/{started['job_id']}").json()
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert payload["batch_id"] == owned_batch["id"]
+    assert payload["error_summary"] == "审核过程中出现异常，请稍后重试或联系管理员。"
+    for secret in ("https://", "sk-secret", "raw response", "Traceback", "RuntimeError"):
+        assert secret not in serialized

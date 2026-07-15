@@ -23,8 +23,12 @@ from scripts.text_review.reviewer import get_reviewer
 from scripts.text_review.reviewers.llm import get_llm
 from scripts.text_review.reviewers.tech_media import TechMediaReviewer
 from server.db import Base, ensure_schema_upgrades, get_db_engine, get_session
-from server.services.audit_executor_service import set_reviewer_factory
-from server.services.audit_job_service import interrupt_stale_jobs
+from server.services.audit_executor_service import set_reviewer_factory, submit_audit_job
+from server.services.audit_job_service import (
+    create_or_get_active_job,
+    get_job_progress,
+    interrupt_stale_jobs,
+)
 from server.models import (
     AgentResult,
     AuditRun,
@@ -34,6 +38,7 @@ from server.models import (
     TestCase,
     TestEvidence,
     Batch,
+    BatchAuditJob,
     ContentItem,
     ContentVersion,
     HumanDecision,
@@ -46,6 +51,8 @@ from server.models import (
 )
 from server.schemas import (
     AgentResultRead,
+    AuditJobProgressRead,
+    AuditJobStartRead,
     AuditRunRead,
     ContentTableAgent,
     ContentTableRow,
@@ -796,6 +803,77 @@ def list_batches(
     if project_id is not None:
         query = query.where(Batch.project_id == project_id)
     return list(session.scalars(query))
+
+
+def _batch_with_project(session: Session, batch_id: int) -> Optional[Batch]:
+    return session.scalar(
+        select(Batch).join(Project, Batch.project_id == Project.id).where(Batch.id == batch_id)
+    )
+
+
+@app.post(
+    "/api/batches/{batch_id}/audit-jobs",
+    response_model=AuditJobStartRead,
+    status_code=202,
+    dependencies=[Depends(require_csrf)],
+)
+def start_audit_job(batch_id: int, session: Session = Depends(get_session)):
+    batch = _batch_with_project(session, batch_id)
+    if batch is None:
+        raise _not_found("Batch", batch_id)
+    existing = session.scalar(
+        select(BatchAuditJob).where(BatchAuditJob.active_key == f"batch:{batch_id}")
+    )
+    config = _validated_config(_load_config())
+    try:
+        job = create_or_get_active_job(session, batch.id, config["model"] or config["reviewer"])
+        session.commit()
+        job_id, status = job.id, job.status
+    except ValueError as error:
+        session.rollback()
+        raise _service_error(error) from error
+
+    if existing is None:
+        try:
+            submit_audit_job(job_id)
+        except Exception:
+            with Session(get_db_engine()) as recovery_session:
+                queued = recovery_session.get(BatchAuditJob, job_id)
+                if queued is not None and queued.status == "QUEUED":
+                    queued.status = "FAILED"
+                    queued.active_key = None
+                    queued.completed_at = datetime.utcnow()
+                    queued.error_summary = "审核任务暂时无法启动，请稍后重试。"
+                    recovery_session.commit()
+            raise HTTPException(status_code=503, detail="审核任务暂时无法启动，请稍后重试。")
+
+    return AuditJobStartRead(job_id=job_id, batch_id=batch.id, status=status)
+
+
+@app.get("/api/audit-jobs/{job_id}", response_model=AuditJobProgressRead)
+def read_audit_job(job_id: int, _user: User = Depends(require_user), session: Session = Depends(get_session)):
+    owned_job_id = session.scalar(
+        select(BatchAuditJob.id)
+        .join(Batch, BatchAuditJob.batch_id == Batch.id)
+        .join(Project, Batch.project_id == Project.id)
+        .where(BatchAuditJob.id == job_id)
+    )
+    if owned_job_id is None:
+        raise _not_found("AuditJob", job_id)
+    return get_job_progress(session, owned_job_id)
+
+
+@app.get("/api/batches/{batch_id}/audit-job", response_model=Optional[AuditJobProgressRead])
+def read_batch_audit_job(batch_id: int, _user: User = Depends(require_user), session: Session = Depends(get_session)):
+    if _batch_with_project(session, batch_id) is None:
+        raise _not_found("Batch", batch_id)
+    job_id = session.scalar(
+        select(BatchAuditJob.id)
+        .where(BatchAuditJob.batch_id == batch_id)
+        .order_by(BatchAuditJob.active_key.is_(None), BatchAuditJob.id.desc())
+        .limit(1)
+    )
+    return get_job_progress(session, job_id) if job_id is not None else None
 
 
 @app.post("/api/batches", response_model=BatchDetail, status_code=201)
