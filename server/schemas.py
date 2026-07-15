@@ -234,6 +234,7 @@ class AgentResultCreate(BaseModel):
 
 
 class AgentResultRead(OrmSchema):
+    """Business-facing audit result; raw_result remains persisted but is not serialized."""
     id: int
     audit_run_id: int
     agent_name: str
@@ -243,7 +244,6 @@ class AgentResultRead(OrmSchema):
     summary: Optional[str]
     score: Optional[int]
     status: str
-    raw_result: Dict[str, Any]
     created_at: datetime
 
 

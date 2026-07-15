@@ -159,7 +159,7 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     content = detail.json()
     assert content["review_status"] == "AUTO_FIX_PENDING"
     assert [version["source"] for version in content["versions"]] == ["SUPPLIER", "AI_PROPOSED"]
-    assert content["latest_audit"]["agent_results"][0]["raw_result"] == {"source": "fake"}
+    assert "raw_result" not in content["latest_audit"]["agent_results"][0]
     assert content["latest_audit"]["issues"][0]["rule_id"] == "REPLACE-001"
     task = content["open_tasks"][0]
     assert task["task_type"] == "AUTO_FIX_PROPOSAL"

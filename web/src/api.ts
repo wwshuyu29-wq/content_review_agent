@@ -100,7 +100,7 @@ export interface AgentResult {
   summary: string | null;
   score: number | null;
   status: string;
-  raw_result: JsonObject;
+  raw_result?: JsonObject;
   created_at: string;
 }
 
