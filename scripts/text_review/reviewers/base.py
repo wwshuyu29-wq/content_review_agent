@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, get_args
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .. import schema
 
@@ -46,9 +46,19 @@ class AgentReviewResult(BaseModel):
     agent_version: str
     decision: Literal["PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"]
     summary: str
-    score: int = Field(ge=0, le=100)
+    score: Optional[int] = Field(ge=0, le=100)
     confidence: float = Field(ge=0, le=1)
     issues: list[AgentIssue]
+
+    @model_validator(mode="after")
+    def require_score_for_model_results(self) -> "AgentReviewResult":
+        unavailable = (
+            self.decision in {"HUMAN_REVIEW", "PASS_WITH_SUGGESTIONS"}
+            and any(issue.rule_id == "SYSTEM-LLM-UNAVAILABLE" for issue in self.issues)
+        )
+        if self.score is None and not unavailable:
+            raise ValueError("score may be null only for unavailable system results")
+        return self
 
 
 def agent_review_protocol_contract() -> dict[str, Any]:

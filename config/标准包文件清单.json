@@ -18,7 +18,7 @@
     "data/standards/rules/replacement_rules.json": "fe233e9170e6d71940ee82b72bcb7e03cd4dfd72d139a005f89a8b8ae5ae0f48",
     "data/standards/rules/term_dictionary.json": "2f87eec8107f3b0223fe295b23c3be7a86bae12d274978ef4d3e79c5ee11b647",
     "data/standards/schemas/project_standard.schema.json": "748eb6d7df33e5f82149de8a65bcc7953a22eb5b881e07a9381dd04c04a135c7",
-    "data/standards/schemas/review_result.schema.json": "f23b9b69e1ff056cc3b6fcff090c8a5f1fdda405549e00f12eb77cf22186695f",
+    "data/standards/schemas/review_result.schema.json": "c4fee5ca15e87ba9af49adf683807155e995d35ae961f10ada0266327e543587",
     "data/standards/schemas/test_case.schema.json": "e1fed3c9e65f3e68bf1f1258a9171e945721712e9369f47de2add60071c560ae",
     "prompts/产品功能准确性审核Agent.md": "899a5cab170cb2c37c29cfe75340d9a37cf96730acae116aef90026cb836e088",
     "prompts/传播有效性审核Agent.md": "0a0e5bf49cbcbd6024b90ab093cbf8f8cc385981061bfe1bd0a49513a0465291",

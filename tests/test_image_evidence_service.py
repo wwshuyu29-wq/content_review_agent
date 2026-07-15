@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from scripts.text_review.reviewers.llm import OpenAICompatLLM
+from scripts.text_review.reviewers.llm import OpenAICompatLLM, oneapi_strict_schema
 from server.services.image_evidence_service import (
     IMAGE_EVIDENCE_MAX_BYTES,
     ImageEvidenceAnalysis,
@@ -109,6 +109,16 @@ def test_analysis_schema_forbids_extra_fields() -> None:
         })
 
 
+def test_oneapi_schema_recursively_requires_nullable_optional_properties_without_mutating_source() -> None:
+    source = ImageEvidenceAnalysis.model_json_schema()
+    adapted = oneapi_strict_schema(source)
+
+    assert set(adapted["required"]) == set(adapted["properties"])
+    assert adapted["additionalProperties"] is False
+    assert "visible_input" not in source.get("required", [])
+    assert {branch.get("type") for branch in adapted["properties"]["visible_input"]["anyOf"]} >= {"string", "null"}
+
+
 def test_oneapi_multimodal_transport_uses_data_uri_and_strict_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
@@ -141,5 +151,7 @@ def test_oneapi_multimodal_transport_uses_data_uri_and_strict_schema(monkeypatch
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,c2FmZQ==", "detail": "high"}},
     ]
     assert body["response_format"]["type"] == "json_schema"
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert set(schema["required"]) == set(schema["properties"])
     assert "secret-key" not in json.dumps(body)
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer secret-key"

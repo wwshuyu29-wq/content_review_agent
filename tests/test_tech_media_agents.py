@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from scripts.text_review.reviewers.base import AgentIssue, AgentReviewResult, EvidenceSpan
-from scripts.text_review.reviewers.llm import OpenAICompatLLM
+from scripts.text_review.reviewers.llm import OpenAICompatLLM, oneapi_strict_schema
 from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer
 from server.models import PublishStatus, ReviewStatus
 from server.services.deterministic_rule_service import ReviewContext, evaluate_rules
@@ -87,6 +87,22 @@ def test_output_models_forbid_extra_fields_and_bound_scores():
         AgentReviewResult(
             agent_id="COMPLIANCE", agent_version="v1", decision="PASS",
             summary="ok", score=101, confidence=1, issues=[], extra="nope",
+        )
+    with pytest.raises(ValidationError):
+        AgentReviewResult(
+            agent_id="COMPLIANCE", agent_version="v1", decision="PASS",
+            summary="ok", score=None, confidence=1, issues=[],
+        )
+    unavailable_issue = AgentIssue(
+        rule_id="SYSTEM-LLM-UNAVAILABLE", category="system", severity="HIGH", field="review",
+        evidence=EvidenceSpan(quote=""), reason="不可用", suggestion="人工审核",
+        source_reference=["SYSTEM:LLM_UNAVAILABLE"], auto_fixable=False,
+        human_required=True, confidence=1,
+    )
+    with pytest.raises(ValidationError):
+        AgentReviewResult(
+            agent_id="COMPLIANCE", agent_version="v1", decision="PASS",
+            summary="not unavailable", score=None, confidence=1, issues=[unavailable_issue],
         )
 
 
@@ -334,7 +350,11 @@ def test_heuristic_mode_returns_nonblocking_campaign_fallback_and_human_review_f
     assert results[-1].decision == "PASS_WITH_SUGGESTIONS"
     assert all(result.issues for result in results)
     assert all(result.issues[0].rule_id == "SYSTEM-LLM-UNAVAILABLE" for result in results)
+    assert all(result.score is None for result in results)
     assert all(result.confidence > 0.9 for result in results)
+    assert all("不可用" in result.summary for result in results)
+    assert all("不可用" in result.issues[0].reason for result in results)
+    assert all("重试" in result.issues[0].suggestion or "人工审核" in result.issues[0].suggestion for result in results)
 
 
 def test_llm_parse_retry_succeeds_on_third_call():
@@ -353,6 +373,19 @@ def test_llm_parse_retry_succeeds_on_third_call():
     results = TechMediaReviewer(llm=llm).review_structured(CONTEXT, PROFILE)
     assert llm.calls == 18
     assert results[0].decision == "PASS"
+
+
+def test_oneapi_schema_recursively_requires_all_properties_and_preserves_nullable_optionals():
+    source = AgentReviewResult.model_json_schema()
+    adapted = oneapi_strict_schema(source)
+    evidence = adapted["$defs"]["EvidenceSpan"]
+
+    assert set(adapted["required"]) == set(adapted["properties"])
+    assert set(adapted["$defs"]["AgentIssue"]["required"]) == set(adapted["$defs"]["AgentIssue"]["properties"])
+    assert set(evidence["required"]) == set(evidence["properties"])
+    assert evidence["additionalProperties"] is False
+    assert {branch.get("type") for branch in evidence["properties"]["asset_id"]["anyOf"]} >= {"string", "null"}
+    assert "asset_id" not in source["$defs"]["EvidenceSpan"].get("required", [])
 
 
 def test_oneapi_chat_json_sends_strict_schema_without_api_key_in_body(monkeypatch):
@@ -379,8 +412,46 @@ def test_oneapi_chat_json_sends_strict_schema_without_api_key_in_body(monkeypatc
     body = captured["kwargs"]["json"]
     assert body["response_format"]["type"] == "json_schema"
     assert body["response_format"]["json_schema"]["strict"] is True
-    assert "agent_id" in body["response_format"]["json_schema"]["schema"]["properties"]
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert "agent_id" in schema["properties"]
+    assert set(schema["required"]) == set(schema["properties"])
     assert "secret-key" not in json.dumps(body)
+
+
+def test_oneapi_http_error_is_useful_and_sanitized(monkeypatch):
+    class Response:
+        status_code = 400
+
+        def raise_for_status(self):
+            raise RuntimeError("400 for https://gateway.example/v1/chat/completions?key=secret-key")
+
+        def json(self):
+            return {
+                "error": {
+                    "message": "schema rejected by https://gateway.example using secret-key",
+                    "type": "invalid_request_error",
+                    "code": "bad_schema",
+                }
+            }
+
+    class Requests:
+        def post(self, url, **kwargs):
+            return Response()
+
+    monkeypatch.setenv("ONEAPI_KEY", "secret-key")
+    monkeypatch.setenv("ONEAPI_MODEL", "model")
+    client = OpenAICompatLLM()
+    client._requests = Requests()
+
+    with pytest.raises(RuntimeError) as raised:
+        client.chat_json("prompt", AgentReviewResult)
+
+    message = str(raised.value)
+    assert "HTTP 400" in message
+    assert "invalid_request_error" in message
+    assert "bad_schema" in message
+    assert "secret-key" not in message
+    assert "https://" not in message
 
 
 def test_exhausted_llm_retry_returns_human_review_not_pass():
@@ -391,5 +462,5 @@ def test_exhausted_llm_retry_returns_human_review_not_pass():
     result = TechMediaReviewer(llm=LLM()).review_structured(CONTEXT, PROFILE)[0]
     assert result.decision == "HUMAN_REVIEW"
     assert result.issues[0].human_required is True
-    assert "unavailable review" in result.issues[0].reason
+    assert "不可用" in result.issues[0].reason
     assert result.confidence > 0.8

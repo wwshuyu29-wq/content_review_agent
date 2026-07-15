@@ -10,8 +10,29 @@ dodo-happywork-v1-internal 等内网模型：若也走 OneAPI，直接用 "oneap
 """
 from __future__ import annotations
 
+import copy
 import os
+import re
 from typing import Any
+
+
+def oneapi_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a JSON Schema to OneAPI strict mode without mutating its source."""
+    adapted = copy.deepcopy(schema)
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object" and isinstance(node.get("properties"), dict):
+                node["required"] = list(node["properties"])
+                node["additionalProperties"] = False
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(adapted)
+    return adapted
 
 
 class OpenAICompatLLM:
@@ -70,6 +91,23 @@ class OpenAICompatLLM:
             json=body,
             timeout=60,
         )
+        status_code = getattr(r, "status_code", 200)
+        if status_code >= 400:
+            try:
+                error = r.json().get("error", {})
+            except (AttributeError, TypeError, ValueError):
+                error = {}
+            if isinstance(error, dict):
+                details = "; ".join(
+                    f"{key}={error[key]}" for key in ("type", "code", "message") if error.get(key)
+                )
+            else:
+                details = str(error)
+            sanitized = re.sub(r"https?://\S+", "[已隐藏URL]", details)
+            if self.api_key:
+                sanitized = sanitized.replace(self.api_key, "[已隐藏凭据]")
+            suffix = f": {sanitized}" if sanitized else ""
+            raise RuntimeError(f"OneAPI 请求失败 (HTTP {status_code}){suffix}")
         r.raise_for_status()
         data = r.json()
         if "error" in data and data["error"]:
@@ -91,7 +129,7 @@ class OpenAICompatLLM:
                 "json_schema": {
                     "name": "agent_review_result",
                     "strict": True,
-                    "schema": json_schema,
+                    "schema": oneapi_strict_schema(json_schema),
                 },
             },
         )
@@ -108,7 +146,7 @@ class OpenAICompatLLM:
                 "json_schema": {
                     "name": "image_evidence_analysis",
                     "strict": True,
-                    "schema": json_schema,
+                    "schema": oneapi_strict_schema(json_schema),
                 },
             },
             model=self.vision_model,
