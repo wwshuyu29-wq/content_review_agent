@@ -1,116 +1,25 @@
-import { useEffect, useState } from "react";
-import { api, type Project, type ProjectDetail, type RuleVersion, type RuleVersionInput } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { api, type Project, type ProjectDetail, type RuleVersion } from "../api";
 
-type Draft = { dimension_standards: string; project_facts: string; structured_rules: string; prompt_version: string };
-const emptyDraft: Draft = { dimension_standards: "{}", project_facts: "{}", structured_rules: "{}", prompt_version: "prompt-v1" };
-
-function draftFrom(version: RuleVersion | null): Draft {
-  if (!version) return emptyDraft;
-  return {
-    dimension_standards: JSON.stringify(version.dimension_standards, null, 2),
-    project_facts: JSON.stringify(version.project_facts, null, 2),
-    structured_rules: JSON.stringify(version.structured_rules, null, 2),
-    prompt_version: version.prompt_version,
-  };
-}
-
-function parseObject(label: string, value: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(value);
-  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error(`${label}必须是 JSON 对象`);
-  return parsed as Record<string, unknown>;
-}
+const DIMENSIONS = [{ key: "COMPLIANCE", label: "合规" }, { key: "BRAND", label: "品牌" }, { key: "PRODUCT_ACCURACY", label: "产品准确性" }, { key: "TEST_CREDIBILITY", label: "测试可信度" }, { key: "CONTENT_QUALITY", label: "内容质量" }, { key: "CAMPAIGN_EFFECTIVENESS", label: "传播效果" }];
+const getDimension = (version: RuleVersion, key: string): unknown => version.dimension_standards[key] || version.dimension_standards[key.toLowerCase()] || version.structured_rules[key] || version.structured_rules[key.toLowerCase()] || null;
 
 export default function Standards() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState(0);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [selectedVersionId, setSelectedVersionId] = useState(0);
-  const [draft, setDraft] = useState<Draft>(emptyDraft);
-  const [newProject, setNewProject] = useState({ name: "", description: "" });
-  const [message, setMessage] = useState<{ type: "ok" | "err"; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [dimension, setDimension] = useState(DIMENSIONS[0].key);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const loadProjects = async (preferredId?: number) => {
-    const data = await api.projects();
-    setProjects(data);
-    const next = preferredId || projectId || data[0]?.id || 0;
-    setProjectId(next);
-  };
-  const loadDetail = async (id: number, preferredVersionId?: number) => {
-    const data = await api.project(id);
-    setDetail(data);
-    const selected = data.rule_versions.find((version) => version.id === preferredVersionId)
-      || data.current_rule_version || data.rule_versions[data.rule_versions.length - 1] || null;
-    setSelectedVersionId(selected?.id || 0);
-    setDraft(draftFrom(selected));
-  };
-
-  useEffect(() => { loadProjects().catch((error: Error) => setMessage({ type: "err", text: error.message })); }, []);
-  useEffect(() => { if (projectId) loadDetail(projectId).catch((error: Error) => setMessage({ type: "err", text: error.message })); }, [projectId]);
-
-  const selectVersion = (id: number) => {
-    setSelectedVersionId(id);
-    setDraft(draftFrom(detail?.rule_versions.find((version) => version.id === id) || null));
-    setMessage(null);
-  };
-
-  const createProject = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!newProject.name.trim()) return setMessage({ type: "err", text: "项目名称不能为空" });
-    setBusy(true);
-    try {
-      const created = await api.createProject({ name: newProject.name.trim(), description: newProject.description.trim() || undefined });
-      setNewProject({ name: "", description: "" });
-      await loadProjects(created.id);
-      setMessage({ type: "ok", text: `项目「${created.name}」已创建，请创建首个规则版本` });
-    } catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "创建失败" }); }
-    finally { setBusy(false); }
-  };
-
-  const createVersion = async () => {
-    if (!projectId || !draft.prompt_version.trim()) return setMessage({ type: "err", text: "Prompt 版本不能为空" });
-    setBusy(true);
-    try {
-      const payload: RuleVersionInput = {
-        dimension_standards: parseObject("分维度标准", draft.dimension_standards),
-        project_facts: parseObject("项目事实", draft.project_facts),
-        structured_rules: parseObject("结构化规则", draft.structured_rules),
-        prompt_version: draft.prompt_version.trim(),
-      };
-      const version = await api.createRuleVersion(projectId, payload);
-      await loadDetail(projectId, version.id);
-      setMessage({ type: "ok", text: `规则 V${version.version} 已创建，发布前不会用于审核` });
-    } catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "版本创建失败" }); }
-    finally { setBusy(false); }
-  };
-
-  const publish = async (version: RuleVersion) => {
-    setBusy(true);
-    try {
-      await api.publishRuleVersion(projectId, version.id);
-      await loadDetail(projectId, version.id);
-      await loadProjects(projectId);
-      setMessage({ type: "ok", text: `规则 V${version.version} 已发布为当前版本` });
-    } catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "发布失败" }); }
-    finally { setBusy(false); }
-  };
-
+  const load = async (id: number, versionId?: number) => { setLoading(true); setError(""); try { const data = await api.project(id); setDetail(data); const selected = data.rule_versions.find((version) => version.id === versionId) || data.current_rule_version || data.rule_versions[data.rule_versions.length - 1]; setSelectedVersionId(selected?.id || 0); } catch (e) { setError(e instanceof Error ? e.message : "标准包加载失败"); } finally { setLoading(false); } };
+  useEffect(() => { api.projects().then((data) => { const tech = data.filter((project) => project.content_type === "TECH_MEDIA_REVIEW"); setProjects(tech); setProjectId(tech[0]?.id || 0); }).catch((e: Error) => setError(e.message)); }, []);
+  useEffect(() => { if (projectId) load(projectId); }, [projectId]);
   const selected = detail?.rule_versions.find((version) => version.id === selectedVersionId) || null;
-  return <div>
-    <div className="page-heading"><div><h2>标准管理</h2><p>历史版本保持不可变，编辑内容将创建新版本。</p></div></div>
-    <div className="standards-layout">
-      <aside>
-        <form className="card compact-card" onSubmit={createProject}><h3>创建项目</h3><div className="field"><label htmlFor="project-name">项目名称</label><input id="project-name" type="text" value={newProject.name} onChange={(event) => setNewProject({ ...newProject, name: event.target.value })} /></div><div className="field"><label htmlFor="project-description">说明</label><textarea id="project-description" rows={3} value={newProject.description} onChange={(event) => setNewProject({ ...newProject, description: event.target.value })} /></div><button className="btn btn-primary" disabled={busy}>创建</button></form>
-        <section className="card compact-card"><h3>项目</h3><div className="stack-list">{projects.map((project) => <button type="button" className={`list-button ${project.id === projectId ? "active" : ""}`} key={project.id} onClick={() => setProjectId(project.id)}><span>{project.name}</span><small>{project.current_rule_version_id ? "已发布规则" : "未发布规则"}</small></button>)}</div></section>
-      </aside>
-      <div className="standards-main">
-        {message && <div className={`msg ${message.type}`}>{message.text}</div>}
-        {detail && <>
-          <section className="card"><div className="section-heading"><div><h3>{detail.name}</h3><p className="small">{detail.description || "无项目说明"}</p></div>{detail.current_rule_version && <span className="badge status-approved">当前 V{detail.current_rule_version.version}</span>}</div><div className="version-strip">{detail.rule_versions.map((version) => <button type="button" className={`version-chip ${selectedVersionId === version.id ? "active" : ""}`} key={version.id} onClick={() => selectVersion(version.id)}>V{version.version}{detail.current_rule_version_id === version.id ? " · 当前" : ""}</button>)}{detail.rule_versions.length === 0 && <span className="empty">尚无规则版本</span>}</div></section>
-          <section className="card"><div className="section-heading"><div><h3>{selected ? `基于 V${selected.version} 创建新版本` : "创建首个版本"}</h3><p className="small">编辑区是新版本草稿，不会修改所选历史版本。</p></div>{selected && detail.current_rule_version_id !== selected.id && <button className="btn btn-ghost" type="button" disabled={busy} onClick={() => publish(selected)}>发布所选 V{selected.version}</button>}</div><div className="field"><label htmlFor="prompt-version">Prompt 版本</label><input id="prompt-version" type="text" value={draft.prompt_version} onChange={(event) => setDraft({ ...draft, prompt_version: event.target.value })} /></div><div className="json-grid"><div className="field"><label htmlFor="dimension-standards">分维度标准 JSON</label><textarea id="dimension-standards" rows={16} value={draft.dimension_standards} onChange={(event) => setDraft({ ...draft, dimension_standards: event.target.value })} /></div><div className="field"><label htmlFor="project-facts">项目事实 JSON</label><textarea id="project-facts" rows={16} value={draft.project_facts} onChange={(event) => setDraft({ ...draft, project_facts: event.target.value })} /></div><div className="field span-2"><label htmlFor="structured-rules">结构化规则 JSON</label><textarea id="structured-rules" rows={12} value={draft.structured_rules} onChange={(event) => setDraft({ ...draft, structured_rules: event.target.value })} /></div></div><div className="btn-row"><button className="btn btn-primary" type="button" disabled={busy} onClick={createVersion}>{busy ? "处理中..." : "创建不可变新版本"}</button></div></section>
-          <section className="card"><h3>版本历史</h3><div className="table-wrap"><table><thead><tr><th>版本</th><th>Prompt</th><th>创建时间</th><th>状态</th><th>操作</th></tr></thead><tbody>{[...detail.rule_versions].reverse().map((version) => <tr key={version.id}><td>V{version.version}</td><td>{version.prompt_version}</td><td>{new Date(version.created_at).toLocaleString()}</td><td>{detail.current_rule_version_id === version.id ? "当前版本" : "历史版本"}</td><td><button className="text-button" type="button" onClick={() => selectVersion(version.id)}>查看 / 克隆</button>{detail.current_rule_version_id !== version.id && <button className="text-button" type="button" disabled={busy} onClick={() => publish(version)}>发布</button>}</td></tr>)}</tbody></table></div></section>
-        </>}
-      </div>
-    </div>
-  </div>;
+  const dimensionValue = useMemo(() => selected ? getDimension(selected, dimension) : null, [selected, dimension]);
+  const publish = async (version: RuleVersion) => { if (!version.project_code || !version.package_version) return; setLoading(true); setError(""); try { await api.publishPackage(projectId, { project_code: version.project_code, package_version: version.package_version }); await load(projectId, version.id); setMessage(`标准包 ${version.package_version} 已发布`); } catch (e) { setError(e instanceof Error ? e.message : "发布失败"); } finally { setLoading(false); } };
+
+  return <div><div className="page-heading"><div><h2>标准包</h2><p>展示 TECH_MEDIA_REVIEW 已发布标准快照；历史版本不可变。</p></div></div><section className="filter-bar card"><div className="field"><label htmlFor="standard-project">项目</label><select id="standard-project" value={projectId} onChange={(e) => setProjectId(Number(e.target.value))}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div><div className="field grow"><label>当前标准快照</label><div className="readonly-value">{detail?.current_rule_version ? `V${detail.current_rule_version.version} · ${detail.current_rule_version.package_version || "未标记包版本"}` : "未发布"}</div></div></section>{message && <div className="msg ok">{message}</div>}{error && <div className="msg err">{error}</div>}{loading && <p className="empty">正在加载标准包...</p>}{detail && !loading && <><section className="card package-identity"><div><h3>包身份</h3><p className="small">项目代码与摘要来自后端发布版本，不在前端编辑。</p></div><dl className="identity-grid"><div><dt>项目代码</dt><dd>{selected?.project_code || detail.code || "—"}</dd></div><div><dt>内容类型</dt><dd>{selected?.content_type || detail.content_type || "—"}</dd></div><div><dt>包版本</dt><dd>{selected?.package_version || "—"}</dd></div><div><dt>Digest</dt><dd className="mono">{selected?.package_digest || "—"}</dd></div></dl></section><section className="card"><div className="section-heading"><div><h3>发布版本</h3><p className="small">选择版本仅查看；发布动作调用真实标准包 API。</p></div></div><div className="version-strip">{detail.rule_versions.map((version) => <button type="button" className={`version-chip ${selectedVersionId === version.id ? "active" : ""}`} key={version.id} onClick={() => setSelectedVersionId(version.id)}>V{version.version} · {version.package_version || "无包版本"}{detail.current_rule_version_id === version.id ? " · 当前" : ""}</button>)}</div></section><section className="card"><div className="tabs" role="tablist" aria-label="六个审核维度">{DIMENSIONS.map((item) => <button type="button" role="tab" aria-selected={dimension === item.key} className={dimension === item.key ? "tab active" : "tab"} key={item.key} onClick={() => setDimension(item.key)}>{item.label}</button>)}</div><div className="standard-view"><div className="section-heading"><div><h3>{DIMENSIONS.find((item) => item.key === dimension)?.label}</h3><p className="small">版本 V{selected?.version} · 只读</p></div>{selected && selected.id !== detail.current_rule_version_id && selected.package_version && selected.project_code && <button className="btn btn-ghost" onClick={() => publish(selected)} disabled={loading}>发布此版本</button>}</div>{dimensionValue ? <pre className="standard-json">{JSON.stringify(dimensionValue, null, 2)}</pre> : <div className="empty validation-box">当前标准包未提供此维度内容。</div>}</div></section><section className="card"><h3>版本校验</h3><div className="validation-box">{selected?.package_digest ? <p className="validation-success">已读取包 digest：{selected.package_digest}</p> : <p className="validation-error">缺少 package_digest，不能将此版本视为完整发布快照。</p>}{selected?.package_version ? <p className="small">包版本已声明：{selected.package_version}</p> : <p className="validation-warning">未声明 package_version。</p>}</div></section></>}</div>;
 }

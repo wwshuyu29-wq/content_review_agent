@@ -176,6 +176,75 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     assert report.json()["status_counts"] == {"PASSED": 1}
 
 
+def test_content_test_cases_endpoint_returns_bound_evidence(api) -> None:
+    from server.services.evidence_service import attach_evidence, create_asset, create_test_case
+
+    client, engine, _ = api
+    project = client.get("/api/projects").json()[0]
+    uploaded = client.post(
+        "/api/batches",
+        data={
+            "project_id": str(project["id"]),
+            "supplier_id": "evidence-supplier",
+            "name": "evidence-batch",
+            "contents": json.dumps([{"external_id": "evidence-content", "title": "实测标题", "body": "实测正文"}]),
+        },
+        files=[("files", ("cover.png", b"png-content", "image/png"))],
+    ).json()
+    item = uploaded["contents"][0]
+    with Session(engine) as session:
+        asset = create_asset(
+            session, item["id"], asset_id="proof-1", kind="SCREENSHOT", filename="proof.png",
+            mime_type="image/png", size_bytes=128,
+        )
+        case = create_test_case(
+            session, item["id"], item["versions"][0]["id"], external_test_case_id="TEST-1",
+            claim="路线生成成功", command="输入起终点", observed_result="返回三条路线", city="北京",
+        )
+        binding = attach_evidence(session, case.id, asset.id)
+        session.flush()
+        case_id, asset_db_id, binding_id = case.id, asset.id, binding.id
+        session.commit()
+
+    response = client.get(f"/api/contents/{item['id']}/test-cases")
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "id": case_id,
+        "content_item_id": item["id"],
+        "content_version_id": item["versions"][0]["id"],
+        "external_test_case_id": "TEST-1",
+        "claim": "路线生成成功",
+        "command": "输入起终点",
+        "observed_result": "返回三条路线",
+        "city": "北京",
+        "tested_at": None,
+        "app_version": None,
+        "device": None,
+        "operating_system": None,
+        "network_environment": None,
+        "test_metadata": {},
+        "evidence": [{
+            "id": binding_id,
+            "test_case_id": case_id,
+            "asset_id": asset_db_id,
+            "asset": {
+                "id": asset_db_id,
+                "content_item_id": item["id"],
+                "asset_id": "proof-1",
+                "external_id": None,
+                "kind": "SCREENSHOT",
+                "filename": "proof.png",
+                "storage_key": None,
+                "mime_type": "image/png",
+                "size_bytes": 128,
+                "asset_metadata": {},
+                "created_at": response.json()[0]["evidence"][0]["asset"]["created_at"],
+            },
+        }],
+    }]
+
+
 def test_default_heuristic_audit_routes_to_human_review(api) -> None:
     client, _, _ = api
     main.app.dependency_overrides[main.get_audit_reviewer] = main.get_audit_reviewer

@@ -55,6 +55,7 @@ from server.schemas import (
     ProjectRead,
     ReviewTaskRead,
     RuleVersionRead,
+    TestCaseRead,
 )
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
@@ -692,6 +693,18 @@ def get_content(content_id: int, session: Session = Depends(get_session)):
     if item is None:
         raise _not_found("ContentItem", content_id)
     return _content_detail(item)
+
+
+@app.get("/api/contents/{content_id}/test-cases", response_model=List[TestCaseRead])
+def get_content_test_cases(content_id: int, session: Session = Depends(get_session)):
+    if session.get(ContentItem, content_id) is None:
+        raise _not_found("ContentItem", content_id)
+    return list(session.scalars(
+        select(TestCase)
+        .where(TestCase.content_item_id == content_id)
+        .options(selectinload(TestCase.evidence).selectinload(TestEvidence.asset))
+        .order_by(TestCase.id)
+    ))
 
 
 @app.post("/api/contents/{content_id}/audit", response_model=AuditDetail)

@@ -1,49 +1,15 @@
-import { useEffect, useState } from "react";
-import { api, type Batch, type Project, type ReportData } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { api, type Batch, type ContentTableRow, type Project, type ReportData } from "../api";
 
-const STATUS_LABELS: Record<string, string> = {
-  NOT_STARTED: "未开始", AI_REVIEWING: "AI 审核中", MANUAL_REQUIRED: "需人工", FIX_PROPOSED: "待确认建议", APPROVED: "已通过", REJECTED: "已拒绝",
-};
-
-function Distribution({ title, values }: { title: string; values: Record<string, number> }) {
-  const entries = Object.entries(values).sort((a, b) => b[1] - a[1]);
-  const max = Math.max(1, ...entries.map(([, value]) => value));
-  return <section className="card"><h3>{title}</h3>{entries.length === 0 ? <p className="empty">暂无数据</p> : <div className="metric-list">{entries.map(([label, value]) => <div className="metric-row" key={label}><span title={label}>{STATUS_LABELS[label] || label}</span><div className="metric-bar"><i style={{ width: `${(value / max) * 100}%` }} /></div><b>{value}</b></div>)}</div>}</section>;
-}
+const label = (value: string) => ({ PASS: "通过", PASS_WITH_SUGGESTIONS: "通过·有建议", HUMAN_REVIEW: "需人工", NEED_TEXT_FIX: "需修改", BLOCK: "阻断" }[value] || value);
+function Distribution({ title, values }: { title: string; values: Record<string, number> }) { const entries = Object.entries(values).sort((a, b) => b[1] - a[1]); const max = Math.max(1, ...entries.map(([, value]) => value)); return <section className="card"><h3>{title}</h3>{entries.length === 0 ? <p className="empty">暂无数据</p> : <div className="metric-list">{entries.map(([key, value]) => <div className="metric-row" key={key}><span title={key}>{label(key)}</span><div className="metric-bar"><i style={{ width: `${value / max * 100}%` }} /></div><b>{value}</b></div>)}</div>}</section>; }
+function Metric({ title, value, detail }: { title: string; value: string; detail?: string }) { return <div className="stat"><b>{value}</b><span>{title}</span>{detail && <small>{detail}</small>}</div>; }
 
 export default function Report() {
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [batches, setBatches] = useState<Batch[]>([]);
-  const [projectId, setProjectId] = useState(0);
-  const [batchId, setBatchId] = useState(0);
-  const [report, setReport] = useState<ReportData | null>(null);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => { api.projects().then((data) => { setProjects(data); if (data[0]) setProjectId(data[0].id); }).catch((err: Error) => setError(err.message)); }, []);
-  useEffect(() => { if (!projectId) return; setBatchId(0); api.batches(projectId).then(setBatches).catch((err: Error) => setError(err.message)); }, [projectId]);
-  useEffect(() => {
-    if (!projectId) return;
-    setLoading(true); setError("");
-    api.report(projectId, batchId || undefined).then(setReport).catch((err: Error) => setError(err.message)).finally(() => setLoading(false));
-  }, [projectId, batchId]);
-
-  return (
-    <div>
-      <div className="page-heading"><div><h2>审核报告</h2><p>按项目或批次查看审核结果与人工介入情况。</p></div></div>
-      <div className="filter-bar card">
-        <div className="field"><label htmlFor="report-project">项目</label><select id="report-project" value={projectId} onChange={(event) => setProjectId(Number(event.target.value))}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div>
-        <div className="field"><label htmlFor="report-batch">批次</label><select id="report-batch" value={batchId} onChange={(event) => setBatchId(Number(event.target.value))}><option value={0}>全部批次</option>{batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.name}</option>)}</select></div>
-      </div>
-      {error && <div className="msg err">{error}</div>}
-      {loading && <p className="empty">正在统计...</p>}
-      {report && !loading && <>
-        <div className="report-title"><h3>{report.project.name}</h3><span>{report.batch ? `批次：${report.batch.name}` : "全部批次"}</span></div>
-        <div className="stats-grid">
-          <div className="stat"><b>{report.totals.contents}</b><span>内容总数</span></div><div className="stat"><b>{report.totals.issues}</b><span>当前问题</span></div><div className="stat"><b>{report.totals.tasks}</b><span>开放任务</span></div><div className="stat accent"><b>{Math.round(report.manual_metrics.rate * 100)}%</b><span>当前人工介入率</span></div>
-        </div>
-        <div className="report-grid"><Distribution title="审核状态" values={report.status_counts} /><Distribution title="问题类别" values={report.category_counts} /><Distribution title="规则命中" values={report.rule_counts} /><section className="card"><h3>人工审核</h3><dl className="detail-list"><div><dt>涉及内容</dt><dd>{report.manual_metrics.contents}</dd></div><div><dt>风险任务</dt><dd>{report.manual_metrics.tasks}</dd></div><div><dt>介入占比</dt><dd>{(report.manual_metrics.rate * 100).toFixed(1)}%</dd></div><div><dt>历史问题</dt><dd>{report.historical_totals.issues}</dd></div><div><dt>历史任务</dt><dd>{report.historical_totals.tasks}</dd></div></dl></section></div>
-      </>}
-    </div>
-  );
+  const [projects, setProjects] = useState<Project[]>([]); const [batches, setBatches] = useState<Batch[]>([]); const [projectId, setProjectId] = useState(0); const [batchId, setBatchId] = useState(0); const [report, setReport] = useState<ReportData | null>(null); const [rows, setRows] = useState<ContentTableRow[]>([]); const [error, setError] = useState(""); const [loading, setLoading] = useState(false);
+  useEffect(() => { api.projects().then((data) => { const tech = data.filter((project) => project.content_type === "TECH_MEDIA_REVIEW"); setProjects(tech); setProjectId(tech[0]?.id || 0); }).catch((e: Error) => setError(e.message)); }, []);
+  useEffect(() => { if (!projectId) return; setBatchId(0); api.batches(projectId).then(setBatches).catch((e: Error) => setError(e.message)); }, [projectId]);
+  useEffect(() => { if (!projectId) return; setLoading(true); setError(""); Promise.all([api.report(projectId, batchId || undefined), api.contentTable({ project_id: projectId, batch_id: batchId || undefined })]).then(([summary, table]) => { setReport(summary); setRows(table); }).catch((e: Error) => setError(e.message)).finally(() => setLoading(false)); }, [projectId, batchId]);
+  const metrics = useMemo(() => { const missing = rows.filter((row) => row.evidence_status === "MISSING").length; const pendingClaims = rows.reduce((sum, row) => sum + row.issues.filter((issue) => issue.category.toLowerCase().includes("claim") || issue.rule_id.toLowerCase().includes("claim") || issue.rule_id.toLowerCase().includes("accuracy")).length, 0); const rework = rows.reduce((sum, row) => sum + row.open_task_types.filter((type) => type.includes("REVISION") || type.includes("FIX")).length, 0); const agents: Record<string, number> = {}; rows.flatMap((row) => row.agents).forEach((agent) => { if (agent.status !== "NOT_RUN" && agent.decision) agents[agent.decision] = (agents[agent.decision] || 0) + 1; }); return { missing: rows.length ? `${Math.round(missing / rows.length * 100)}%` : "—", pendingClaims: rows.length ? String(pendingClaims) : "—", rework: rows.length ? String(rework) : "—", agents }; }, [rows]);
+  return <div><div className="page-heading"><div><h2>科技媒体测评报告</h2><p>指标仅基于当前项目真实 API 数据；未提供的统计明确标记为不可用。</p></div></div><div className="filter-bar card"><div className="field"><label htmlFor="report-project">项目</label><select id="report-project" value={projectId} onChange={(e) => setProjectId(Number(e.target.value))}>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></div><div className="field"><label htmlFor="report-batch">批次</label><select id="report-batch" value={batchId} onChange={(e) => setBatchId(Number(e.target.value))}><option value={0}>全部批次</option>{batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.name}</option>)}</select></div></div>{error && <div className="msg err">{error}</div>}{loading && <p className="empty">正在统计...</p>}{report && !loading && <><div className="report-title"><h3>{report.project.name}</h3><span>{report.batch ? `批次：${report.batch.name}` : "全部批次"}</span></div><div className="stats-grid"><Metric title="内容总数" value={String(report.totals.contents)} /><Metric title="缺失证据率" value={metrics.missing} detail="基于测试记录绑定情况" /><Metric title="待处理 claim 数" value={metrics.pendingClaims} /><Metric title="返工任务数" value={metrics.rework} /></div><div className="report-grid"><Distribution title="Agent 命中分布" values={metrics.agents} /><Distribution title="审核状态" values={report.status_counts} /><Distribution title="问题类别" values={report.category_counts} /><section className="card"><h3>人工质量指标</h3><dl className="detail-list"><div><dt>人工纠正率</dt><dd className="unavailable">不可用</dd></div><div><dt>建议采纳率</dt><dd className="unavailable">不可用</dd></div><div><dt>开放任务</dt><dd>{report.totals.tasks}</dd></div><div><dt>当前问题</dt><dd>{report.totals.issues}</dd></div><div><dt>历史问题</dt><dd>{report.historical_totals.issues}</dd></div></dl><p className="small">后端当前未提供逐条人工决策的完整聚合接口，因此不展示推算数值。</p></section></div></>}</div>;
 }

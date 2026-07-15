@@ -1,105 +1,129 @@
-import { useEffect, useState } from "react";
-import { api, type BatchDetail, type Project } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { api, saveBlob, type BatchDetail, type ImportPreview, type Project } from "../api";
 
-const initialForm = {
-  supplier_id: "",
-  batch_name: "",
-  external_id: "",
-  platform: "微博",
-  publish_time: "",
-  title: "",
-  body: "",
-};
+const initialManual = { external_id: "", platform: "微博", publish_time: "", title: "", body: "" };
+
+type Message = { type: "ok" | "err"; text: string };
 
 export default function Upload() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState(0);
-  const [form, setForm] = useState(initialForm);
-  const [file, setFile] = useState<File | null>(null);
+  const [supplierId, setSupplierId] = useState("");
+  const [batchName, setBatchName] = useState("");
+  const [excel, setExcel] = useState<File | null>(null);
+  const [evidenceZip, setEvidenceZip] = useState<File | null>(null);
+  const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [result, setResult] = useState<BatchDetail | null>(null);
-  const [message, setMessage] = useState<{ type: "ok" | "err"; text: string } | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<Message | null>(null);
+  const [busy, setBusy] = useState("");
+  const [manual, setManual] = useState(initialManual);
+  const [manualFile, setManualFile] = useState<File | null>(null);
 
   useEffect(() => {
     api.projects().then((data) => {
-      setProjects(data);
-      if (data[0]) setProjectId(data[0].id);
+      const techProjects = data.filter((project) => project.content_type === "TECH_MEDIA_REVIEW");
+      setProjects(techProjects);
+      setProjectId(techProjects[0]?.id || 0);
     }).catch((error: Error) => setMessage({ type: "err", text: error.message }));
   }, []);
 
-  const setField = (key: keyof typeof initialForm) => (
-    event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>,
-  ) => setForm((current) => ({ ...current, [key]: event.target.value }));
+  const identityReady = Boolean(projectId && supplierId.trim() && batchName.trim());
+  const previewMatches = Boolean(preview && preview.project_id === projectId && preview.supplier_id === supplierId.trim() && preview.batch_name === batchName.trim());
+  const canConfirm = Boolean(previewMatches && preview?.token && preview.error_count === 0 && preview.errors.length === 0 && preview.valid_count === preview.total_count && preview.total_count > 0);
+  const step = result ? 5 : preview ? 4 : excel ? 3 : identityReady ? 2 : 1;
+  const previewTests = useMemo(() => preview?.rows.flatMap((row) => row.tests.map((test) => ({ row: row.row_number, ...test }))) || [], [preview]);
 
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!projectId || !form.supplier_id.trim() || !form.batch_name.trim() || !form.external_id.trim() || !form.title.trim() || !form.body.trim() || !file) {
-      setMessage({ type: "err", text: "项目、批次、供应商、内容编号、标题、正文和图片均为必填项" });
-      return;
-    }
-    setBusy(true);
-    setMessage(null);
-    setResult(null);
+  const invalidatePreview = () => { setPreview(null); setResult(null); };
+  const downloadTemplate = async () => {
+    setBusy("template"); setMessage(null);
+    try { saveBlob(await api.importTemplate(), "tech-media-import-template.xlsx"); }
+    catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "模板下载失败" }); }
+    finally { setBusy(""); }
+  };
+  const doPreview = async () => {
+    if (!identityReady || !excel) return setMessage({ type: "err", text: "请先选择项目并填写供应商、批次和 Excel 文件" });
+    setBusy("preview"); setMessage(null); setResult(null);
     try {
       const data = new FormData();
       data.append("project_id", String(projectId));
-      data.append("supplier_id", form.supplier_id.trim());
-      data.append("name", form.batch_name.trim());
-      data.append("contents", JSON.stringify([{
-        external_id: form.external_id.trim(),
-        title: form.title,
-        body: form.body,
-        payload: { platform: form.platform, publish_time: form.publish_time },
-      }]));
-      if (file) data.append("files", file);
-      const created = await api.createBatch(data);
-      setResult(created);
-      setMessage({ type: "ok", text: `批次 #${created.id} 已创建，共接收 ${created.content_count} 条内容` });
-      setForm((current) => ({ ...initialForm, supplier_id: current.supplier_id, platform: current.platform }));
-      setFile(null);
+      data.append("supplier_id", supplierId.trim());
+      data.append("batch_name", batchName.trim());
+      data.append("excel_file", excel);
+      if (evidenceZip) data.append("evidence_zip", evidenceZip);
+      setPreview(await api.previewImport(data));
     } catch (error) {
-      setMessage({ type: "err", text: error instanceof Error ? error.message : "上传失败" });
-    } finally {
-      setBusy(false);
+      setPreview(null);
+      setMessage({ type: "err", text: error instanceof Error ? error.message : "预检失败" });
+    } finally { setBusy(""); }
+  };
+  const confirm = async () => {
+    if (!preview || !canConfirm) return setMessage({ type: "err", text: "预检结果无效或已过期，不能确认导入" });
+    setBusy("confirm"); setMessage(null);
+    try {
+      const created = await api.confirmImport(preview.token, { project_id: projectId, supplier_id: supplierId.trim(), batch_name: batchName.trim() });
+      setResult(created);
+      setMessage({ type: "ok", text: `批次 #${created.id} 导入完成，共 ${created.content_count} 条内容` });
+    } catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "确认导入失败" }); }
+    finally { setBusy(""); }
+  };
+  const exportResult = async () => {
+    if (!result) return;
+    setBusy("export");
+    try { saveBlob(await api.exportBatch(result.id), `batch-${result.id}.xlsx`); }
+    catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "导出失败" }); }
+    finally { setBusy(""); }
+  };
+  const submitManual = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!identityReady || !manual.external_id.trim() || !manual.title.trim() || !manual.body.trim() || !manualFile) {
+      return setMessage({ type: "err", text: "请完整填写手工录入必填项" });
     }
+    setBusy("manual"); setMessage(null);
+    try {
+      const data = new FormData();
+      data.append("project_id", String(projectId)); data.append("supplier_id", supplierId.trim()); data.append("name", batchName.trim());
+      data.append("contents", JSON.stringify([{ external_id: manual.external_id.trim(), title: manual.title, body: manual.body, payload: { platform: manual.platform, publish_time: manual.publish_time } }]));
+      data.append("files", manualFile);
+      const created = await api.createBatch(data);
+      setResult(created); setMessage({ type: "ok", text: `单条批次 #${created.id} 已创建` });
+      setManual(initialManual); setManualFile(null);
+    } catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "创建失败" }); }
+    finally { setBusy(""); }
   };
 
-  return (
-    <div>
-      <div className="page-heading">
-        <div><h2>供应商上传</h2><p>创建批次并生成不可变供应商原稿 V1。</p></div>
+  return <div>
+    <div className="page-heading"><div><h2>批量导入</h2><p>TECH_MEDIA_REVIEW 内容、测试用例与证据文件统一预检后入库。</p></div></div>
+    <ol className="stepper" aria-label="导入步骤">
+      {["项目与批次", "下载模板", "选择文件", "预检确认", "完成"].map((label, index) => <li key={label} className={step > index + 1 ? "done" : step === index + 1 ? "current" : ""}><span>{index + 1}</span>{label}</li>)}
+    </ol>
+    {message && <div className={`msg ${message.type}`} role="status">{message.text}</div>}
+    <section className="card import-shell">
+      <div className="form-grid">
+        <div className="field span-2"><label htmlFor="upload-project">科技媒体测评项目 *</label><select id="upload-project" value={projectId} onChange={(event) => { setProjectId(Number(event.target.value)); invalidatePreview(); }}><option value={0}>请选择</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>{projects.length === 0 && <p className="field-help">暂无可导入的 TECH_MEDIA_REVIEW 项目</p>}</div>
+        <div className="field"><label htmlFor="supplier">供应商 ID *</label><input id="supplier" value={supplierId} onChange={(event) => { setSupplierId(event.target.value); invalidatePreview(); }} /></div>
+        <div className="field"><label htmlFor="batch-name">批次名称 *</label><input id="batch-name" value={batchName} onChange={(event) => { setBatchName(event.target.value); invalidatePreview(); }} /></div>
       </div>
-      <form className="card form-card" onSubmit={submit}>
-        <div className="form-grid">
-          <div className="field span-2">
-            <label htmlFor="upload-project">项目 *</label>
-            <select id="upload-project" value={projectId} onChange={(event) => setProjectId(Number(event.target.value))}>
-              {projects.length === 0 && <option value={0}>暂无项目</option>}
-              {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-            </select>
-          </div>
-          <div className="field"><label htmlFor="supplier">供应商 ID *</label><input id="supplier" type="text" value={form.supplier_id} onChange={setField("supplier_id")} /></div>
-          <div className="field"><label htmlFor="batch-name">批次名称 *</label><input id="batch-name" type="text" value={form.batch_name} onChange={setField("batch_name")} /></div>
-          <div className="field"><label htmlFor="external-id">内容编号 *</label><input id="external-id" type="text" value={form.external_id} onChange={setField("external_id")} /></div>
-          <div className="field"><label htmlFor="platform">平台</label><select id="platform" value={form.platform} onChange={setField("platform")}><option>微博</option><option>抖音</option><option>小红书</option><option>B站</option><option>其他</option></select></div>
-          <div className="field span-2"><label htmlFor="publish-time">计划发布时间</label><input id="publish-time" type="text" value={form.publish_time} onChange={setField("publish_time")} placeholder="2026-07-14 18:00" /></div>
-          <div className="field span-2"><label htmlFor="title">标题 *</label><input id="title" type="text" value={form.title} onChange={setField("title")} /></div>
-          <div className="field span-2"><label htmlFor="body">正文 / 脚本 *</label><textarea id="body" rows={7} value={form.body} onChange={setField("body")} /></div>
-          <div className="field span-2"><label htmlFor="media">图片（JPG / PNG / WEBP）*</label><input id="media" type="file" accept=".jpg,.jpeg,.png,.webp" required onChange={(event) => setFile(event.target.files?.[0] || null)} /></div>
-        </div>
-        {message && <div className={`msg ${message.type}`}>{message.text}</div>}
-        <button className="btn btn-primary" type="submit" disabled={busy || projects.length === 0}>{busy ? "提交中..." : "创建批次"}</button>
-      </form>
+      <div className="import-actions">
+        <button type="button" className="btn btn-ghost" onClick={downloadTemplate} disabled={busy === "template"} title="下载标准 Excel 模板" aria-label="下载标准 Excel 模板">↓ {busy === "template" ? "下载中" : "下载模板"}</button>
+        <span className="small">模板包含内容与测试用例工作表；证据 ZIP 为可选文件。</span>
+      </div>
+      <div className="file-grid">
+        <div className="file-field"><label htmlFor="excel-file">Excel 文件 *</label><input id="excel-file" type="file" accept=".xlsx" onChange={(event) => { setExcel(event.target.files?.[0] || null); invalidatePreview(); }} /><span>{excel?.name || "未选择 .xlsx 文件"}</span></div>
+        <div className="file-field"><label htmlFor="evidence-zip">证据 ZIP（可选）</label><input id="evidence-zip" type="file" accept=".zip" onChange={(event) => { setEvidenceZip(event.target.files?.[0] || null); invalidatePreview(); }} /><span>{evidenceZip?.name || "未选择 .zip 文件"}</span></div>
+      </div>
+      <div className="btn-row"><button type="button" className="btn btn-primary" onClick={doPreview} disabled={!identityReady || !excel || !!busy}>{busy === "preview" ? "预检中..." : "预检文件"}</button><button type="button" className="btn btn-pass" onClick={confirm} disabled={!canConfirm || !!busy} title={!canConfirm ? "仅无错误且身份未变化的预检可确认" : "确认导入"}>{busy === "confirm" ? "导入中..." : "确认导入"}</button></div>
+    </section>
 
-      {result && (
-        <section className="card">
-          <div className="section-heading"><h3>批次结果</h3><span className="badge neutral">{result.status}</span></div>
-          <div className="meta-line">#{result.id} · {result.name} · 供应商 {result.supplier_id}</div>
-          <div className="table-wrap"><table><thead><tr><th>内容编号</th><th>标题</th><th>格式</th><th>审核状态</th><th>版本</th></tr></thead><tbody>
-            {result.contents.map((content) => <tr key={content.id}><td>{content.external_id}</td><td>{content.title}</td><td><span className={`badge status-${content.format_status.toLowerCase()}`}>{content.format_status}</span></td><td>{content.review_status}</td><td>V{content.versions[content.versions.length - 1]?.version ?? 1}</td></tr>)}
-          </tbody></table></div>
-        </section>
-      )}
-    </div>
-  );
+    {preview && <section className="card preview-section">
+      <div className="section-heading"><div><h3>预检结果</h3><p className="small">项目 {preview.project_code} · 标准包 {preview.package_version} · Token {preview.token.slice(0, 10)}…</p></div><div className="badge-group"><span className="badge status-passed">有效 {preview.valid_count}</span><span className={`badge ${preview.error_count ? "status-invalid" : "neutral"}`}>错误 {preview.error_count}</span><span className="badge neutral">测试 {preview.test_count}</span></div></div>
+      {(preview.errors.length > 0 || preview.warnings.length > 0) && <div className="validation-summary">{preview.errors.map((error) => <p className="validation-error" key={error}>错误：{error}</p>)}{preview.warnings.map((warning) => <p className="validation-warning" key={warning}>提示：{warning}</p>)}</div>}
+      {preview.rows.length === 0 ? <p className="empty">文件中没有可预览的内容行</p> : <div className="table-wrap"><table><thead><tr><th>行</th><th>内容编号 / 标题</th><th>测试 / 证据</th><th>校验</th></tr></thead><tbody>{preview.rows.map((row) => <tr key={row.row_number} className={!row.valid ? "invalid-row" : ""}><td>{row.row_number}</td><td><b>{String(row.normalized.supplier_external_id || row.normalized.external_id || "—")}</b><div className="cell-subline">{String(row.normalized.title || row.normalized.original_title || "未提供标题")}</div></td><td>{row.tests.length} 个测试 · {row.tests.reduce((sum, test) => sum + test.evidence_filenames.length, 0)} 个证据引用</td><td>{row.valid ? <span className="badge status-passed">通过</span> : row.errors.map((error) => <div className="validation-error" key={error}>{error}</div>)}{row.warnings.map((warning) => <div className="validation-warning" key={warning}>{warning}</div>)}</td></tr>)}</tbody></table></div>}
+      <h4 className="subheading">测试用例与证据引用</h4>
+      {previewTests.length === 0 ? <p className="empty">未提供测试用例；系统不会据此推断存在测试证据。</p> : <div className="table-wrap"><table><thead><tr><th>内容 / 用例</th><th>主张</th><th>操作与结果</th><th>证据文件</th></tr></thead><tbody>{previewTests.map((test) => <tr key={`${test.row}-${test.external_test_case_id}`}><td>{test.content_external_id}<div className="cell-subline">{test.external_test_case_id}</div></td><td>{test.claim || <span className="missing">缺失</span>}</td><td>{test.command || <span className="missing">缺失</span>}<div className="cell-subline">{test.observed_result || "未提供观察结果"}</div></td><td>{test.evidence_filenames.length ? test.evidence_filenames.join("、") : <span className="missing">无证据引用</span>}</td></tr>)}</tbody></table></div>}
+    </section>}
+
+    {result && <section className="card"><div className="section-heading"><div><h3>批次已入库</h3><p className="small">#{result.id} · {result.name} · {result.content_count} 条</p></div><button className="btn btn-ghost" onClick={exportResult} disabled={!!busy} aria-label="导出当前批次">↓ {busy === "export" ? "导出中" : "导出批次"}</button></div></section>}
+
+    <details className="secondary-tool"><summary>手工录入单条内容</summary><form className="card" onSubmit={submitManual}><p className="small">沿用上方项目、供应商与批次信息。此入口仅用于临时补录。</p><div className="form-grid"><div className="field"><label htmlFor="manual-id">内容编号 *</label><input id="manual-id" value={manual.external_id} onChange={(e) => setManual({ ...manual, external_id: e.target.value })} /></div><div className="field"><label htmlFor="manual-platform">平台</label><select id="manual-platform" value={manual.platform} onChange={(e) => setManual({ ...manual, platform: e.target.value })}><option>微博</option><option>抖音</option><option>小红书</option><option>B站</option><option>其他</option></select></div><div className="field span-2"><label htmlFor="manual-title">标题 *</label><input id="manual-title" value={manual.title} onChange={(e) => setManual({ ...manual, title: e.target.value })} /></div><div className="field span-2"><label htmlFor="manual-body">正文 *</label><textarea id="manual-body" rows={5} value={manual.body} onChange={(e) => setManual({ ...manual, body: e.target.value })} /></div><div className="field span-2"><label htmlFor="manual-media">图片 *</label><input id="manual-media" type="file" accept=".jpg,.jpeg,.png,.webp" onChange={(e) => setManualFile(e.target.files?.[0] || null)} /></div></div><button className="btn btn-ghost" disabled={!!busy}>{busy === "manual" ? "提交中..." : "创建单条批次"}</button></form></details>
+  </div>;
 }
