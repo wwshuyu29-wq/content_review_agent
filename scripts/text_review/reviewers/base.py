@@ -36,6 +36,18 @@ class AgentIssue(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
+def allows_unavailable_score(decision: Any, issues: list[Any]) -> bool:
+    """Return whether a controlled system-unavailable result may use a null score."""
+    return (
+        str(decision).upper() in {"HUMAN_REVIEW", "PASS_WITH_SUGGESTIONS"}
+        and any(
+            (issue.get("rule_id") if isinstance(issue, dict) else getattr(issue, "rule_id", None))
+            == "SYSTEM-LLM-UNAVAILABLE"
+            for issue in issues
+        )
+    )
+
+
 class AgentReviewResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -52,11 +64,7 @@ class AgentReviewResult(BaseModel):
 
     @model_validator(mode="after")
     def require_score_for_model_results(self) -> "AgentReviewResult":
-        unavailable = (
-            self.decision in {"HUMAN_REVIEW", "PASS_WITH_SUGGESTIONS"}
-            and any(issue.rule_id == "SYSTEM-LLM-UNAVAILABLE" for issue in self.issues)
-        )
-        if self.score is None and not unavailable:
+        if self.score is None and not allows_unavailable_score(self.decision, self.issues):
             raise ValueError("score may be null only for unavailable system results")
         return self
 

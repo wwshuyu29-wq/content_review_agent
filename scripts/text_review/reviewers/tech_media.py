@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Optional, TYPE_CHECKING
 
-from .base import AgentIssue, AgentReviewResult, EvidenceSpan
+from .base import AgentIssue, AgentReviewResult, EvidenceSpan, allows_unavailable_score
 
 if TYPE_CHECKING:
     from server.services.deterministic_rule_service import ReviewContext
@@ -87,12 +87,21 @@ def validate_agent_result(result: Any, expected_agent_id: str, known_references:
         return f"agent_id must be {expected_agent_id}"
     if _value(result, "agent_version") != AGENT_VERSION:
         return f"Agent {expected_agent_id} has an unexpected agent_version"
-    if any(_value(result, key) in (None, "") for key in ("decision", "summary", "score")):
+    if any(_value(result, key) in (None, "") for key in ("decision", "summary")):
         return f"Agent {expected_agent_id} is missing a stable protocol field"
+    if isinstance(result, Mapping):
+        score_present = "score" in result
+    else:
+        score_present = hasattr(result, "score")
+    if not score_present:
+        return f"Agent {expected_agent_id} is missing required score"
     decision = str(_value(result, "decision", "")).upper()
     if decision not in {"PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"}:
         return f"Agent {expected_agent_id} has an invalid decision"
     issues = list(_value(result, "issues", []) or [])
+    score = _value(result, "score")
+    if score == "" or (score is None and not allows_unavailable_score(decision, issues)):
+        return f"Agent {expected_agent_id} has an invalid score"
     for issue in issues:
         references = list(_value(issue, "source_reference", []) or [])
         rule_id = str(_value(issue, "rule_id", ""))

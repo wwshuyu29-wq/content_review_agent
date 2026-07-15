@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from scripts.text_review.reviewers.base import AgentIssue, AgentReviewResult, EvidenceSpan
 from scripts.text_review.reviewers.llm import OpenAICompatLLM, oneapi_strict_schema
-from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer
+from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer, validate_agent_result
 from server.models import PublishStatus, ReviewStatus
 from server.services.deterministic_rule_service import ReviewContext, evaluate_rules
 from server.services.review_arbiter_service import arbitrate_review
@@ -357,6 +357,19 @@ def test_heuristic_mode_returns_nonblocking_campaign_fallback_and_human_review_f
     assert all("重试" in result.issues[0].suggestion or "人工审核" in result.issues[0].suggestion for result in results)
 
 
+def test_protocol_validator_requires_score_but_allows_controlled_unavailable_null_score():
+    unavailable = TechMediaReviewer._unavailable("CAMPAIGN_EFFECTIVENESS", "gateway failure").model_dump()
+
+    assert unavailable["score"] is None
+    assert validate_agent_result(unavailable, "CAMPAIGN_EFFECTIVENESS", set()) is None
+
+    missing_score = {key: value for key, value in unavailable.items() if key != "score"}
+    assert "missing" in validate_agent_result(missing_score, "CAMPAIGN_EFFECTIVENESS", set()).lower()
+
+    noncontrolled = {**unavailable, "issues": [{**unavailable["issues"][0], "rule_id": "OTHER-ISSUE"}]}
+    assert "score" in validate_agent_result(noncontrolled, "CAMPAIGN_EFFECTIVENESS", set()).lower()
+
+
 def test_llm_parse_retry_succeeds_on_third_call():
     class LLM:
         def __init__(self):
@@ -452,6 +465,47 @@ def test_oneapi_http_error_is_useful_and_sanitized(monkeypatch):
     assert "bad_schema" in message
     assert "secret-key" not in message
     assert "https://" not in message
+
+
+def test_oneapi_http_200_error_envelope_is_sanitized_without_raw_payload(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "error": {
+                    "message": "failed at https://gateway.example/v1/chat/completions with secret-key",
+                    "type": "gateway_error",
+                    "code": "upstream_failed",
+                    "request": {"messages": [{"content": "private prompt fragment"}]},
+                    "response_body": "private response fragment",
+                }
+            }
+
+    class Requests:
+        def post(self, url, **kwargs):
+            return Response()
+
+    monkeypatch.setenv("ONEAPI_KEY", "secret-key")
+    monkeypatch.setenv("ONEAPI_MODEL", "model")
+    client = OpenAICompatLLM()
+    client._requests = Requests()
+
+    with pytest.raises(RuntimeError) as raised:
+        client.chat_json("private prompt fragment", AgentReviewResult)
+
+    message = str(raised.value)
+    assert "HTTP 200" in message
+    assert "gateway_error" in message
+    assert "upstream_failed" in message
+    for sensitive in (
+        "secret-key", "https://", "private prompt fragment", "private response fragment",
+        "messages", "request", "response_body",
+    ):
+        assert sensitive not in message
 
 
 def test_exhausted_llm_retry_returns_human_review_not_pass():

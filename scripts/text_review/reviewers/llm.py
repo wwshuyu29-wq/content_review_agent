@@ -16,6 +16,21 @@ import re
 from typing import Any
 
 
+def _oneapi_error_message(status_code: int, error: Any, api_key: str) -> str:
+    """Build an error message from allowlisted metadata, never from raw gateway content."""
+    details = []
+    if isinstance(error, dict):
+        for key in ("type", "code"):
+            value = error.get(key)
+            if value is None:
+                continue
+            token = str(value)
+            if token != api_key and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", token):
+                details.append(f"{key}={token}")
+    suffix = f": {'; '.join(details)}" if details else ""
+    return f"OneAPI 请求失败 (HTTP {status_code}){suffix}"
+
+
 def oneapi_strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Adapt a JSON Schema to OneAPI strict mode without mutating its source."""
     adapted = copy.deepcopy(schema)
@@ -97,21 +112,11 @@ class OpenAICompatLLM:
                 error = r.json().get("error", {})
             except (AttributeError, TypeError, ValueError):
                 error = {}
-            if isinstance(error, dict):
-                details = "; ".join(
-                    f"{key}={error[key]}" for key in ("type", "code", "message") if error.get(key)
-                )
-            else:
-                details = str(error)
-            sanitized = re.sub(r"https?://\S+", "[已隐藏URL]", details)
-            if self.api_key:
-                sanitized = sanitized.replace(self.api_key, "[已隐藏凭据]")
-            suffix = f": {sanitized}" if sanitized else ""
-            raise RuntimeError(f"OneAPI 请求失败 (HTTP {status_code}){suffix}")
+            raise RuntimeError(_oneapi_error_message(status_code, error, self.api_key))
         r.raise_for_status()
         data = r.json()
         if "error" in data and data["error"]:
-            raise RuntimeError(f"OneAPI 错误: {data['error']}")
+            raise RuntimeError(_oneapi_error_message(status_code, data["error"], self.api_key))
         return data["choices"][0]["message"]["content"]
 
     def _request(self, prompt: str, response_format: dict[str, Any] | None = None) -> str:

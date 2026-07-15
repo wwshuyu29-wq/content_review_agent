@@ -231,11 +231,35 @@ def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Pa
         ]
         assert [result.decision for result in audit.agent_results[:-1]] == ["HUMAN_REVIEW"] * 5
         assert audit.agent_results[-1].decision == "PASS_WITH_SUGGESTIONS"
+        assert audit.agent_results[-1].score is None
         assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert len(audit.issues) == 7
         assert sum(issue.human_required for issue in audit.issues) == 5
+
+
+def test_unavailable_campaign_null_score_does_not_become_protocol_error(tmp_path: Path) -> None:
+    results = ProtocolReviewer().review_structured(None, None)
+    unavailable_issue = issue(
+        "low", rule_id="SYSTEM-LLM-UNAVAILABLE", category="system_suggestion",
+        auto_fixable=False, human_required=False,
+    )
+    unavailable_issue["source_reference"] = ["SYSTEM:LLM_UNAVAILABLE"]
+    results[-1] = {
+        **results[-1],
+        "decision": "PASS_WITH_SUGGESTIONS",
+        "summary": "建议型专项审核不可用，当前仅返回非阻断性系统提示。",
+        "score": None,
+        "issues": [unavailable_issue],
+    }
+
+    with make_session(tmp_path) as session:
+        _, _, item = submit_valid_content(session)
+        audit = run_audit(session, item.id, reviewer=FakeReviewer(results))
+
+        assert audit.agent_results[-1].score is None
+        assert not any(finding.rule_id == "SYSTEM-AGENT-PROTOCOL" for finding in audit.issues)
 
 
 @pytest.mark.parametrize("decision", ["HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"])
