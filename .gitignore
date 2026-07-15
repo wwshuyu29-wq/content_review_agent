@@ -24,7 +24,9 @@ data/standards/global/*
 
 # V1 审核配置、Prompt 与有意保留的旧标准归档
 !config/
+config/*
 !config/审核Agent配置.json
+!config/标准包文件清单.json
 !prompts/
 !prompts/*.md
 !archive/

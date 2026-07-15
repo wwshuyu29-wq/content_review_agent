@@ -146,12 +146,29 @@ class TechMediaReviewer:
     @staticmethod
     def _needs_authorization_standard(context: ReviewContext) -> bool:
         content = f"{context.title}\n{context.body}".lower()
-        return any(term in content for term in (
+        if any(term in content for term in (
             "授权", "版权", "第三方素材", "素材来源", "隐私", "个人信息",
             "公众人物", "竞品", "社会事件", "截图来源",
-        ))
+        )):
+            return True
+        structured_assets = list(context.evidence or []) + list(context.evidence_assets or [])
+        return bool(structured_assets)
+
+    @staticmethod
+    def _is_v1(profile: ReviewProfile) -> bool:
+        try:
+            return int(profile.package_version.split(".", 1)[0]) >= 1
+        except (TypeError, ValueError):
+            return False
 
     def build_prompts(self, context: ReviewContext, profile: ReviewProfile) -> dict[str, str]:
+        if self._is_v1(profile):
+            if (
+                set(profile.agent_standard_bindings) != set(AGENT_ORDER)
+                or set(profile.agent_prompts) != set(AGENT_ORDER)
+                or not profile.public_prompt
+            ):
+                raise ValueError("V1 prompt building requires every configured Agent binding and prompt")
         common = {
             "identity": {
                 "business_domain": profile.business_domain,
@@ -179,6 +196,10 @@ class TechMediaReviewer:
         def primary_standard(agent_id: str) -> str:
             binding = profile.agent_standard_bindings.get(agent_id, {})
             filename = binding.get("global_standard") if isinstance(binding, dict) else None
+            if self._is_v1(profile):
+                if not filename or filename not in profile.global_standards:
+                    raise ValueError(f"missing configured primary standard binding for {agent_id}")
+                return profile.global_standards[filename]
             return profile.global_standards.get(filename or legacy_standard_names[agent_id], "")
 
         prompt_slices = {

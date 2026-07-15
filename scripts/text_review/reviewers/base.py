@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,6 +49,21 @@ class AgentReviewResult(BaseModel):
     score: int = Field(ge=0, le=100)
     confidence: float = Field(ge=0, le=1)
     issues: list[AgentIssue]
+
+
+def agent_review_protocol_contract() -> dict[str, Any]:
+    """Return the strict runtime protocol used to validate the committed JSON Schema."""
+    return {
+        "result_fields": tuple(AgentReviewResult.model_fields),
+        "issue_fields": tuple(AgentIssue.model_fields),
+        "evidence_fields": tuple(EvidenceSpan.model_fields),
+        "evidence_required_fields": tuple(
+            name for name, field_info in EvidenceSpan.model_fields.items() if field_info.is_required()
+        ),
+        "agent_ids": tuple(get_args(AgentReviewResult.model_fields["agent_id"].annotation)),
+        "decisions": tuple(get_args(AgentReviewResult.model_fields["decision"].annotation)),
+        "severities": tuple(get_args(AgentIssue.model_fields["severity"].annotation)),
+    }
 
 
 @dataclass

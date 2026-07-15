@@ -1,1 +1,97 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["metadata","issues"],"properties":{"metadata":{"type":"object"},"issues":{"type":"array"}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "review_result.schema.json",
+  "title": "AgentReviewResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "agent_id",
+    "agent_version",
+    "decision",
+    "summary",
+    "score",
+    "confidence",
+    "issues"
+  ],
+  "properties": {
+    "agent_id": {
+      "type": "string",
+      "enum": [
+        "COMPLIANCE",
+        "BRAND",
+        "PRODUCT_ACCURACY",
+        "TEST_CREDIBILITY",
+        "CONTENT_QUALITY",
+        "CAMPAIGN_EFFECTIVENESS"
+      ]
+    },
+    "agent_version": {"type": "string"},
+    "decision": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "PASS_WITH_SUGGESTIONS",
+        "NEED_TEXT_FIX",
+        "HUMAN_REVIEW",
+        "BLOCK"
+      ]
+    },
+    "summary": {"type": "string"},
+    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "issues": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/AgentIssue"}
+    }
+  },
+  "$defs": {
+    "EvidenceSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["quote"],
+      "properties": {
+        "quote": {"type": "string"},
+        "start": {"type": ["integer", "null"]},
+        "end": {"type": ["integer", "null"]},
+        "asset_id": {"type": ["string", "null"]},
+        "timestamp": {"type": ["string", "null"]}
+      }
+    },
+    "AgentIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "category",
+        "severity",
+        "field",
+        "evidence",
+        "reason",
+        "suggestion",
+        "source_reference",
+        "auto_fixable",
+        "human_required",
+        "confidence"
+      ],
+      "properties": {
+        "rule_id": {"type": "string"},
+        "category": {"type": "string"},
+        "severity": {
+          "type": "string",
+          "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        },
+        "field": {"type": "string"},
+        "evidence": {"$ref": "#/$defs/EvidenceSpan"},
+        "reason": {"type": "string"},
+        "suggestion": {"type": "string"},
+        "source_reference": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "auto_fixable": {"type": "boolean"},
+        "human_required": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    }
+  }
+}

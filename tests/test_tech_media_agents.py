@@ -130,7 +130,44 @@ def test_production_prompts_use_configured_public_specialist_and_one_primary_sta
         assert profile.agent_prompts[agent_id].splitlines()[0] in prompt
         assert standard_markers[agent_id] in prompt
         assert sum(marker in prompt for marker in standard_markers.values()) == 1
-        assert "[AUTH-" not in prompt
+
+
+def test_v1_prompt_building_rejects_missing_configured_binding() -> None:
+    profile = PROFILE.model_copy(update={"package_version": "1.0"})
+
+    with pytest.raises(ValueError, match="configured.*binding|binding.*configured"):
+        TechMediaReviewer().build_prompts(CONTEXT, profile)
+
+
+def test_clean_text_without_structured_media_does_not_load_authorization(
+    representative_context_and_profile,
+):
+    _, profile = representative_context_and_profile
+    context = ReviewContext(title="路线规划体验", body="路线结构清晰。", platform="xiaohongshu")
+    prompts = TechMediaReviewer().build_prompts(context, profile)
+
+    assert all("[AUTH-" not in prompt for prompt in prompts.values())
+
+
+@pytest.mark.parametrize(
+    "context_update",
+    [
+        {"evidence": [{"asset_id": "asset-1"}]},
+        {"evidence_assets": [{"asset_id": "asset-1", "license": "unknown"}]},
+        {"evidence_assets": [{"asset_id": "asset-1", "third_party": True}]},
+    ],
+)
+def test_structured_evidence_or_asset_loads_authorization_for_compliance_and_brand(
+    representative_context_and_profile,
+    context_update,
+):
+    _, profile = representative_context_and_profile
+    context = ReviewContext(title="路线规划体验", body="路线结构清晰。", **context_update)
+    prompts = TechMediaReviewer().build_prompts(context, profile)
+
+    assert "[AUTH-" in prompts["COMPLIANCE"]
+    assert "[AUTH-" in prompts["BRAND"]
+    assert all("[AUTH-" not in prompts[agent_id] for agent_id in AGENT_ORDER[2:])
 
 
 def test_authorization_standard_is_conditionally_supplemental_for_compliance_and_brand_only(

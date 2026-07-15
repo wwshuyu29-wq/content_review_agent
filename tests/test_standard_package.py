@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as validate_json_schema
 from sqlalchemy.orm import Session
@@ -18,6 +19,7 @@ from server.services.standard_package_service import (
     load_standard_package,
     publish_standard_package,
 )
+from scripts.text_review.reviewers.base import AgentIssue, AgentReviewResult, EvidenceSpan
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,10 +42,27 @@ EXPECTED_AGENT_IDS = {
 }
 
 
+def refresh_manifest(
+    standards_root: Path,
+    project_code: str = "bdmap_xdxx_tech_review_2026",
+    package_version: str = "1.0",
+) -> None:
+    standard_package_service.regenerate_standard_manifest(
+        standards_root,
+        project_code,
+        package_version,
+        repository_root=standards_root.parents[1],
+    )
+
+
 @pytest.fixture
 def standards_root(tmp_path: Path) -> Path:
-    root = tmp_path / "standards"
+    repository_root = tmp_path / "package"
+    root = repository_root / "data" / "standards"
     shutil.copytree(REPO_ROOT / "data" / "standards", root)
+    shutil.copytree(REPO_ROOT / "config", repository_root / "config")
+    shutil.copytree(REPO_ROOT / "prompts", repository_root / "prompts")
+    refresh_manifest(root)
     return root
 
 
@@ -53,12 +72,74 @@ def test_production_global_directory_contains_only_canonical_chinese_files() -> 
     assert {path.name for path in global_root.iterdir() if path.is_file()} == CANONICAL_GLOBAL_FILES
 
 
+def test_public_prompt_names_exact_runtime_json_contract() -> None:
+    prompt = (REPO_ROOT / "prompts" / "公共审核约束.md").read_text(encoding="utf-8")
+    result_fields = set(AgentReviewResult.model_fields)
+    issue_fields = set(AgentIssue.model_fields)
+    evidence_fields = set(EvidenceSpan.model_fields)
+
+    assert "问题编号" not in prompt
+    assert all(f"`{field}`" in prompt for field in result_fields | issue_fields | evidence_fields)
+
+
+def test_review_result_schema_is_strict_and_matches_runtime_protocol() -> None:
+    schema = json.loads(
+        (REPO_ROOT / "data" / "standards" / "schemas" / "review_result.schema.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    valid = AgentReviewResult(
+        agent_id="COMPLIANCE",
+        agent_version="tech-media-v1",
+        decision="PASS",
+        summary="ok",
+        score=100,
+        confidence=1.0,
+        issues=[],
+    ).model_dump()
+    validate_json_schema(valid, schema)
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(AgentReviewResult.model_fields)
+    issue_schema = schema["$defs"]["AgentIssue"]
+    assert issue_schema["additionalProperties"] is False
+    assert set(issue_schema["required"]) == set(AgentIssue.model_fields)
+    assert schema["properties"]["decision"]["enum"] == [
+        "PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK",
+    ]
+
+    with pytest.raises(JsonSchemaValidationError):
+        validate_json_schema({**valid, "extra": True}, schema)
+
+
+def test_loader_rejects_schema_that_disagrees_with_runtime_protocol(standards_root: Path) -> None:
+    schema_path = standards_root / "schemas" / "review_result.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["properties"]["decision"]["enum"].remove("BLOCK")
+    schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+    refresh_manifest(standards_root)
+
+    with pytest.raises(ValueError, match="runtime protocol|decision"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_loader_rejects_invalid_review_result_schema(standards_root: Path) -> None:
+    schema_path = standards_root / "schemas" / "review_result.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["type"] = "not-a-json-schema-type"
+    schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+    refresh_manifest(standards_root)
+
+    with pytest.raises(ValueError, match="schema is invalid"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
 def test_agent_standard_config_has_exact_six_unique_global_bindings() -> None:
     bindings = standard_package_service.AGENT_STANDARD_CONFIG
 
     assert set(bindings) == EXPECTED_AGENT_IDS
     global_files = [binding.global_standard for binding in bindings.values()]
     assert len(global_files) == len(set(global_files)) == 6
+    assert set(global_files) == CANONICAL_GLOBAL_FILES - {"舆情与素材授权.md"}
 
 
 def test_authorization_is_supplemental_only_for_compliance_and_brand() -> None:
@@ -70,6 +151,75 @@ def test_authorization_is_supplemental_only_for_compliance_and_brand() -> None:
     }
 
     assert authorization_agents == {"COMPLIANCE", "BRAND"}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda config: config.update({"额外字段": True}), "extra|额外字段"),
+        (lambda config: config.update({"配置版本": "1.1"}), "配置版本"),
+        (lambda config: config["审核Agent"].pop("BRAND"), "exact six"),
+        (
+            lambda config: config["审核Agent"].update(
+                {"UNKNOWN": config["审核Agent"].pop("BRAND")}
+            ),
+            "exact six",
+        ),
+        (
+            lambda config: config["审核Agent"]["COMPLIANCE"].update(
+                {"全局标准": "data/standards/global/品牌一致性.md"}
+            ),
+            "primary|全局标准",
+        ),
+        (
+            lambda config: config["审核Agent"]["COMPLIANCE"].update(
+                {"Prompt": "../prompts/合规与广告表达审核Agent.md"}
+            ),
+            "Prompt|path",
+        ),
+    ],
+)
+def test_rejects_invalid_agent_config(standards_root: Path, mutation, message: str) -> None:
+    config_path = standards_root.parents[1] / "config" / "审核Agent配置.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    mutation(config)
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_production_manifest_matches_exact_loaded_path_set() -> None:
+    package = load_standard_package(REPO_ROOT / "data" / "standards", "bdmap_xdxx_tech_review_2026")
+    manifest = json.loads((REPO_ROOT / "config" / "标准包文件清单.json").read_text(encoding="utf-8"))
+
+    assert manifest == {"版本": "1.0", "文件SHA256": package.file_hashes}
+    assert "config/标准包文件清单.json" not in manifest["文件SHA256"]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "additional", "mismatch"])
+def test_manifest_fails_closed_for_path_or_hash_changes(standards_root: Path, mutation: str) -> None:
+    manifest_path = standards_root.parents[1] / "config" / "标准包文件清单.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        manifest["文件SHA256"].pop(next(iter(manifest["文件SHA256"])))
+    elif mutation == "additional":
+        manifest["文件SHA256"]["prompts/不存在.md"] = "0" * 64
+    else:
+        first_path = next(iter(manifest["文件SHA256"]))
+        manifest["文件SHA256"][first_path] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest|清单|hash|SHA256|path set"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_manifest_detects_loaded_file_tampering(standards_root: Path) -> None:
+    prompt_path = standards_root.parents[1] / "prompts" / "公共审核约束.md"
+    prompt_path.write_text(prompt_path.read_text(encoding="utf-8") + "\n篡改", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest|清单|hash|SHA256"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
 
 
 def test_loads_v1_package_from_canonical_chinese_paths() -> None:
@@ -109,15 +259,37 @@ def test_rejects_rule_section_without_rule_id(standards_root: Path) -> None:
         ),
         encoding="utf-8",
     )
+    refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="rule section.*RULE-ID|RULE-ID.*rule section"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
 
 
-def test_allows_introductory_heading_without_rule_id(standards_root: Path) -> None:
-    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+def test_rejects_substantive_chinese_number_heading_without_rule_id(standards_root: Path) -> None:
+    standard_file = standards_root / "global" / "内容质量.md"
+    standard_file.write_text(
+        standard_file.read_text(encoding="utf-8").replace(
+            "## [QUAL-LANGUAGE-001] 一、基础语言质量",
+            "## 一、基础语言质量",
+        ),
+        encoding="utf-8",
+    )
+    refresh_manifest(standards_root)
 
-    assert "## 一、基础语言质量" in package.global_standards["内容质量.md"]
+    with pytest.raises(ValueError, match="RULE-ID"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
+def test_allows_only_explicit_metadata_heading_without_rule_id(standards_root: Path) -> None:
+    standard_file = standards_root / "global" / "内容质量.md"
+    standard_file.write_text(
+        standard_file.read_text(encoding="utf-8") + "\n## 文档元数据\n\n版本：1.0\n",
+        encoding="utf-8",
+    )
+    refresh_manifest(standards_root)
+
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+    assert "## 文档元数据" in package.global_standards["内容质量.md"]
 
 
 def test_v1_official_claims_are_approved_while_pending_claims_stay_pending() -> None:
@@ -215,6 +387,7 @@ def test_rejects_cross_domain_or_unresolved_rule_reference(standards_root: Path)
         ),
         encoding="utf-8",
     )
+    refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="business_domain"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
@@ -231,6 +404,7 @@ def test_loads_future_semantic_version_from_matching_project_directory(standards
         .replace('version: "1.0"', 'version: "1.1"'),
         encoding="utf-8",
     )
+    refresh_manifest(standards_root, "future_tech_review_2027", "1.1")
 
     package = load_standard_package(standards_root, "future_tech_review_2027", "1.1")
 
@@ -244,6 +418,7 @@ def test_rejects_unknown_top_level_package_fields(standards_root: Path) -> None:
         project_file.read_text(encoding="utf-8") + "unexpected_field: true\n",
         encoding="utf-8",
     )
+    refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="unexpected_field"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.0")
@@ -254,6 +429,7 @@ def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
     rules = json.loads(rules_file.read_text(encoding="utf-8"))
     rules["rules"][0]["source_reference"] = ["CLAIM-DOES-NOT-EXIST"]
     rules_file.write_text(json.dumps(rules, ensure_ascii=False), encoding="utf-8")
+    refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="CLAIM-DOES-NOT-EXIST"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
@@ -271,6 +447,7 @@ def test_rejects_unknown_matcher_in_package(standards_root: Path) -> None:
     rules = json.loads(rules_file.read_text(encoding="utf-8"))
     rules["rules"][0]["matcher"] = "unknown_composition"
     rules_file.write_text(json.dumps(rules, ensure_ascii=False), encoding="utf-8")
+    refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="unsupported matcher"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
@@ -281,6 +458,7 @@ def test_rejects_legacy_rule_arrays(standards_root: Path) -> None:
     rules = json.loads(rules_file.read_text(encoding="utf-8"))
     rules["deny_words"] = ["legacy"]
     rules_file.write_text(json.dumps(rules, ensure_ascii=False), encoding="utf-8")
+    refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="deny_words"):
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.0")

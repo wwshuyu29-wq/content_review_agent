@@ -4,14 +4,18 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
+from jsonschema import Draft202012Validator
+from jsonschema import SchemaError as JsonSchemaError
 from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema import validate as validate_json_schema
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+
+from scripts.text_review.reviewers.base import agent_review_protocol_contract
 
 from ..models import Project, RuleVersion
 
@@ -27,7 +31,9 @@ SUPPORTED_MATCHERS = {
 }
 _SEMANTIC_VERSION = re.compile(r"^\d+\.\d+(?:\.\d+)?$")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_CONFIG_PATH = _REPO_ROOT / "config" / "审核Agent配置.json"
+_CONFIG_LOGICAL_PATH = "config/审核Agent配置.json"
+_MANIFEST_LOGICAL_PATH = "config/标准包文件清单.json"
+_CONFIG_PATH = _REPO_ROOT / _CONFIG_LOGICAL_PATH
 _CANONICAL_GLOBAL_FILES = (
     "合规与广告表达.md",
     "品牌一致性.md",
@@ -45,13 +51,25 @@ _EXPECTED_AGENT_IDS = {
     "CONTENT_QUALITY",
     "CAMPAIGN_EFFECTIVENESS",
 }
-_NON_RULE_HEADINGS = {
-    "评分标准",
-    "风险与动作",
-    "自动修改边界",
-    "处理动作",
-    "风险等级与建议动作",
+_EXPECTED_PRIMARY_PATHS = {
+    "COMPLIANCE": "data/standards/global/合规与广告表达.md",
+    "BRAND": "data/standards/global/品牌一致性.md",
+    "PRODUCT_ACCURACY": "data/standards/global/内容准确性.md",
+    "TEST_CREDIBILITY": "data/standards/global/实测可信度.md",
+    "CONTENT_QUALITY": "data/standards/global/内容质量.md",
+    "CAMPAIGN_EFFECTIVENESS": "data/standards/global/传播有效性.md",
 }
+_EXPECTED_PROMPT_PATHS = {
+    "COMPLIANCE": "prompts/合规与广告表达审核Agent.md",
+    "BRAND": "prompts/品牌一致性审核Agent.md",
+    "PRODUCT_ACCURACY": "prompts/产品功能准确性审核Agent.md",
+    "TEST_CREDIBILITY": "prompts/实测可信度审核Agent.md",
+    "CONTENT_QUALITY": "prompts/内容质量审核Agent.md",
+    "CAMPAIGN_EFFECTIVENESS": "prompts/传播有效性审核Agent.md",
+}
+_PUBLIC_PROMPT_LOGICAL_PATH = "prompts/公共审核约束.md"
+_AUTHORIZATION_LOGICAL_PATH = "data/standards/global/舆情与素材授权.md"
+_NON_RULE_HEADINGS = {"文档元数据"}
 
 
 class StrictModel(BaseModel):
@@ -64,53 +82,91 @@ class AgentStandardBinding(StrictModel):
     supplemental_standards: tuple[str, ...] = ()
 
 
-def _repo_relative_path(raw_path: str) -> Path:
-    path = (_REPO_ROOT / raw_path).resolve()
+class AgentConfigEntry(StrictModel):
+    global_standard: str = Field(alias="全局标准")
+    supplemental_standards: List[str] = Field(alias="补充标准")
+    specialist_prompt: str = Field(alias="Prompt")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class AgentConfigFile(StrictModel):
+    version: Literal["1.0"] = Field(alias="配置版本")
+    public_prompt: str = Field(alias="公共Prompt")
+    agents: Dict[str, AgentConfigEntry] = Field(alias="审核Agent")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class StandardManifest(StrictModel):
+    version: Literal["1.0"] = Field(alias="版本")
+    file_hashes: Dict[str, str] = Field(alias="文件SHA256")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+def _repository_root_for(root: Path, repository_root: Optional[Path] = None) -> Path:
+    candidate = (repository_root or root.parents[1]).resolve()
+    expected_root = candidate / "data" / "standards"
+    if root.resolve() != expected_root.resolve():
+        raise ValueError("standards root must be the canonical repository data/standards path")
+    return candidate
+
+
+def _configured_path(repository_root: Path, logical_path: str, expected_path: str) -> Path:
+    if logical_path != expected_path:
+        raise ValueError(f"configured path must be canonical: {expected_path}")
+    path = (repository_root / logical_path).resolve()
+    expected = (repository_root / expected_path).resolve()
     try:
-        path.relative_to(_REPO_ROOT.resolve())
+        path.relative_to(repository_root.resolve())
     except ValueError as exc:
-        raise ValueError(f"configured path escapes repository: {raw_path}") from exc
+        raise ValueError(f"configured path escapes allowed root: {logical_path}") from exc
+    if path != expected:
+        raise ValueError(f"configured path must resolve to canonical production file: {logical_path}")
     if not path.is_file():
-        raise ValueError(f"configured file is missing: {raw_path}")
+        raise ValueError(f"configured file is missing: {logical_path}")
     return path
 
 
-def _load_agent_config() -> tuple[dict[str, AgentStandardBinding], str]:
+def _load_agent_config(repository_root: Path = _REPO_ROOT) -> tuple[dict[str, AgentStandardBinding], str]:
+    config_path = repository_root / _CONFIG_LOGICAL_PATH
     try:
-        config = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"failed to load Agent config: {exc}") from exc
-    agents = config.get("审核Agent")
-    if not isinstance(agents, dict) or set(agents) != _EXPECTED_AGENT_IDS:
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw_config, dict):
+            raise ValueError("config must contain an object")
+        config = AgentConfigFile(**raw_config)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid Agent config: {exc}") from exc
+    if set(config.agents) != _EXPECTED_AGENT_IDS:
         raise ValueError("Agent config must contain the exact six internal Agent IDs")
-    public_prompt = config.get("公共Prompt")
-    if not isinstance(public_prompt, str):
-        raise ValueError("Agent config must define 公共Prompt")
-    _repo_relative_path(public_prompt)
+    if config.public_prompt != _PUBLIC_PROMPT_LOGICAL_PATH:
+        raise ValueError("公共Prompt path must be canonical")
+    _configured_path(repository_root, config.public_prompt, _PUBLIC_PROMPT_LOGICAL_PATH)
     bindings: dict[str, AgentStandardBinding] = {}
-    for agent_id, raw in agents.items():
-        if not isinstance(raw, dict):
-            raise ValueError(f"Agent config for {agent_id} must be an object")
-        binding = AgentStandardBinding(
-            global_standard=Path(raw["全局标准"]).name,
-            specialist_prompt=raw["Prompt"],
-            supplemental_standards=tuple(Path(item).name for item in raw.get("补充标准", [])),
+    for agent_id in sorted(_EXPECTED_AGENT_IDS):
+        raw = config.agents[agent_id]
+        primary_path = _EXPECTED_PRIMARY_PATHS[agent_id]
+        prompt_path = _EXPECTED_PROMPT_PATHS[agent_id]
+        if raw.global_standard != primary_path:
+            raise ValueError(f"invalid primary 全局标准 for {agent_id}")
+        _configured_path(repository_root, raw.global_standard, primary_path)
+        _configured_path(repository_root, raw.specialist_prompt, prompt_path)
+        expected_supplemental = [_AUTHORIZATION_LOGICAL_PATH] if agent_id in {"COMPLIANCE", "BRAND"} else []
+        if raw.supplemental_standards != expected_supplemental:
+            raise ValueError(f"invalid supplemental standards for {agent_id}")
+        for supplemental in raw.supplemental_standards:
+            _configured_path(repository_root, supplemental, _AUTHORIZATION_LOGICAL_PATH)
+        bindings[agent_id] = AgentStandardBinding(
+            global_standard=Path(primary_path).name,
+            specialist_prompt=prompt_path,
+            supplemental_standards=tuple(Path(item).name for item in expected_supplemental),
         )
-        _repo_relative_path(raw["全局标准"])
-        _repo_relative_path(raw["Prompt"])
-        for supplemental in raw.get("补充标准", []):
-            _repo_relative_path(supplemental)
-        bindings[agent_id] = binding
-    primary_files = [binding.global_standard for binding in bindings.values()]
-    if len(primary_files) != len(set(primary_files)):
-        raise ValueError("each Agent must load exactly one unique global standard")
-    supplemental_agents = {
-        agent_id for agent_id, binding in bindings.items()
-        if "舆情与素材授权.md" in binding.supplemental_standards
-    }
-    if supplemental_agents != {"COMPLIANCE", "BRAND"}:
-        raise ValueError("authorization standard is supplemental only for COMPLIANCE and BRAND")
-    return bindings, public_prompt
+    if {binding.global_standard for binding in bindings.values()} != {
+        Path(path).name for path in _EXPECTED_PRIMARY_PATHS.values()
+    }:
+        raise ValueError("Agent primary standard set is not canonical")
+    return bindings, config.public_prompt
 
 
 AGENT_STANDARD_CONFIG, PUBLIC_PROMPT_PATH = _load_agent_config()
@@ -296,6 +352,105 @@ def _sha256(path: Path) -> str:
         raise ValueError(f"failed to hash {path.name}: {exc}") from exc
 
 
+def _package_file_paths(
+    root: Path,
+    project_dir: Path,
+    repository_root: Path,
+    bindings: Dict[str, AgentStandardBinding],
+    public_prompt_path: str,
+) -> dict[str, Path]:
+    paths: dict[str, Path] = {
+        _CONFIG_LOGICAL_PATH: repository_root / _CONFIG_LOGICAL_PATH,
+        public_prompt_path: repository_root / public_prompt_path,
+    }
+    paths.update({
+        binding.specialist_prompt: repository_root / binding.specialist_prompt
+        for binding in bindings.values()
+    })
+    paths.update({
+        f"data/standards/global/{filename}": root / "global" / filename
+        for filename in _CANONICAL_GLOBAL_FILES
+    })
+    for filename in (
+        "project.yaml", "approved_claims.yaml", "evidence_requirements.yaml",
+        "platform_requirements.yaml", "project_context.md",
+    ):
+        paths[f"data/standards/projects/{project_dir.name}/{filename}"] = project_dir / filename
+    for filename in ("deterministic_rules.json", "term_dictionary.json", "replacement_rules.json"):
+        paths[f"data/standards/rules/{filename}"] = root / "rules" / filename
+    for filename in ("review_result.schema.json", "project_standard.schema.json", "test_case.schema.json"):
+        paths[f"data/standards/schemas/{filename}"] = root / "schemas" / filename
+    return paths
+
+
+def _validate_standard_manifest(repository_root: Path, file_paths: dict[str, Path]) -> dict[str, str]:
+    manifest_path = repository_root / _MANIFEST_LOGICAL_PATH
+    try:
+        manifest = StandardManifest(**_read_json(manifest_path))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid standard manifest: {exc}") from exc
+    expected_paths = set(file_paths)
+    if set(manifest.file_hashes) != expected_paths:
+        raise ValueError("standard manifest path set does not match loaded package paths")
+    actual_hashes = {logical_path: _sha256(path) for logical_path, path in file_paths.items()}
+    for logical_path, expected_hash in manifest.file_hashes.items():
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ValueError(f"invalid SHA256 in standard manifest: {logical_path}")
+        if actual_hashes[logical_path] != expected_hash:
+            raise ValueError(f"standard manifest hash mismatch: {logical_path}")
+    return actual_hashes
+
+
+def regenerate_standard_manifest(
+    root: Path,
+    project_code: str,
+    package_version: str = "1.0",
+    *,
+    repository_root: Optional[Path] = None,
+) -> Path:
+    """Regenerate a manifest for an intentional package edit or isolated test fixture."""
+    repository_root = _repository_root_for(root, repository_root)
+    bindings, public_prompt_path = _load_agent_config(repository_root)
+    project_dir = _find_project_dir(root, project_code, package_version)
+    file_paths = _package_file_paths(root, project_dir, repository_root, bindings, public_prompt_path)
+    hashes = {logical_path: _sha256(path) for logical_path, path in sorted(file_paths.items())}
+    manifest_path = repository_root / _MANIFEST_LOGICAL_PATH
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps({"版本": "1.0", "文件SHA256": hashes}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def _validate_review_result_schema(root: Path) -> None:
+    schema = _read_json(root / "schemas" / "review_result.schema.json")
+    try:
+        Draft202012Validator.check_schema(schema)
+    except JsonSchemaError as exc:
+        raise ValueError(f"review result schema is invalid: {exc.message}") from exc
+    contract = agent_review_protocol_contract()
+    issue_schema = schema.get("$defs", {}).get("AgentIssue", {})
+    evidence_schema = schema.get("$defs", {}).get("EvidenceSpan", {})
+    checks = (
+        (schema.get("additionalProperties") is False, "top-level additionalProperties"),
+        (set(schema.get("required", [])) == set(contract["result_fields"]), "top-level required fields"),
+        (set(schema.get("properties", {})) == set(contract["result_fields"]), "top-level fields"),
+        (tuple(schema.get("properties", {}).get("agent_id", {}).get("enum", [])) == contract["agent_ids"], "agent_id enum"),
+        (tuple(schema.get("properties", {}).get("decision", {}).get("enum", [])) == contract["decisions"], "decision enum"),
+        (issue_schema.get("additionalProperties") is False, "issue additionalProperties"),
+        (set(issue_schema.get("required", [])) == set(contract["issue_fields"]), "issue required fields"),
+        (set(issue_schema.get("properties", {})) == set(contract["issue_fields"]), "issue fields"),
+        (tuple(issue_schema.get("properties", {}).get("severity", {}).get("enum", [])) == contract["severities"], "severity enum"),
+        (evidence_schema.get("additionalProperties") is False, "evidence additionalProperties"),
+        (set(evidence_schema.get("required", [])) == set(contract["evidence_required_fields"]), "evidence required fields"),
+        (set(evidence_schema.get("properties", {})) == set(contract["evidence_fields"]), "evidence fields"),
+    )
+    failed = next((label for valid, label in checks if not valid), None)
+    if failed:
+        raise ValueError(f"review result schema disagrees with runtime protocol: {failed}")
+
+
 def _validate_markdown_rule_ids(filename: str, content: str) -> None:
     for line in content.splitlines():
         if not line.startswith("## "):
@@ -303,7 +458,7 @@ def _validate_markdown_rule_ids(filename: str, content: str) -> None:
         heading = line[3:].strip()
         if re.match(r"^\[[A-Z]+(?:-[A-Z]+)*-\d{3}\] ", heading):
             continue
-        if re.match(r"^[一二三四五六七八九十]+、", heading) or heading in _NON_RULE_HEADINGS:
+        if heading in _NON_RULE_HEADINGS:
             continue
         raise ValueError(f"rule section without [RULE-ID] in {filename}: {heading}")
 
@@ -341,10 +496,21 @@ def _validate_project_schema(root: Path, project_data: Dict[str, Any]) -> None:
         raise ValueError(f"project standard schema validation failed for {field}: {exc.message}") from exc
 
 
-def load_standard_package(root: Path, project_code: str, package_version: str = "1.0") -> StandardPackage:
+def load_standard_package(
+    root: Path,
+    project_code: str,
+    package_version: str = "1.0",
+    *,
+    repository_root: Optional[Path] = None,
+) -> StandardPackage:
+    repository_root = _repository_root_for(root, repository_root)
+    bindings, public_prompt_path = _load_agent_config(repository_root)
     project_dir = _find_project_dir(root, project_code, package_version)
+    file_paths = _package_file_paths(root, project_dir, repository_root, bindings, public_prompt_path)
+    file_hashes = _validate_standard_manifest(repository_root, file_paths)
     project_data = _read_yaml(project_dir / "project.yaml")
     _validate_project_schema(root, project_data)
+    _validate_review_result_schema(root)
     metadata = StandardMetadata(**{key: project_data[key] for key in StandardMetadata.model_fields})
     if metadata.project_code != project_code or metadata.version != package_version:
         raise ValueError("requested project package identity does not match project.yaml")
@@ -355,36 +521,14 @@ def load_standard_package(root: Path, project_code: str, package_version: str = 
             content = (root / "global" / filename).read_text(encoding="utf-8")
             _validate_markdown_rule_ids(filename, content)
             global_standards[filename] = content
-        public_prompt = _repo_relative_path(PUBLIC_PROMPT_PATH).read_text(encoding="utf-8")
+        public_prompt = (repository_root / public_prompt_path).read_text(encoding="utf-8")
         agent_prompts = {
-            agent_id: _repo_relative_path(binding.specialist_prompt).read_text(encoding="utf-8")
-            for agent_id, binding in AGENT_STANDARD_CONFIG.items()
+            agent_id: (repository_root / binding.specialist_prompt).read_text(encoding="utf-8")
+            for agent_id, binding in bindings.items()
         }
-        hash_paths: dict[str, Path] = {
-            "config/审核Agent配置.json": _CONFIG_PATH,
-            PUBLIC_PROMPT_PATH: _repo_relative_path(PUBLIC_PROMPT_PATH),
-        }
-        hash_paths.update({
-            binding.specialist_prompt: _repo_relative_path(binding.specialist_prompt)
-            for binding in AGENT_STANDARD_CONFIG.values()
-        })
-        hash_paths.update({
-            f"data/standards/global/{filename}": root / "global" / filename
-            for filename in _CANONICAL_GLOBAL_FILES
-        })
-        for filename in (
-            "project.yaml", "approved_claims.yaml", "evidence_requirements.yaml",
-            "platform_requirements.yaml", "project_context.md",
-        ):
-            hash_paths[f"data/standards/projects/{project_dir.name}/{filename}"] = project_dir / filename
-        for filename in ("deterministic_rules.json", "term_dictionary.json", "replacement_rules.json"):
-            hash_paths[f"data/standards/rules/{filename}"] = root / "rules" / filename
-        for filename in ("review_result.schema.json", "project_standard.schema.json", "test_case.schema.json"):
-            hash_paths[f"data/standards/schemas/{filename}"] = root / "schemas" / filename
-        file_hashes = {logical_path: _sha256(path) for logical_path, path in hash_paths.items()}
         prompt_versions = {
             agent_id: file_hashes[binding.specialist_prompt]
-            for agent_id, binding in AGENT_STANDARD_CONFIG.items()
+            for agent_id, binding in bindings.items()
         }
 
         claims_data = ClaimsFile(**_read_yaml(project_dir / "approved_claims.yaml"))
@@ -406,7 +550,7 @@ def load_standard_package(root: Path, project_code: str, package_version: str = 
             global_standards=global_standards,
             public_prompt=public_prompt,
             agent_prompts=agent_prompts,
-            agent_standard_bindings=AGENT_STANDARD_CONFIG,
+            agent_standard_bindings=bindings,
             agent_prompt_versions=prompt_versions,
             file_hashes=file_hashes,
             term_dictionary=TermDictionary(**_read_json(root / "rules" / "term_dictionary.json")),
