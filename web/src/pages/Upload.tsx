@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api, saveBlob, type BatchDetail, type ImportPreview, type Project } from "../api";
 
 const initialManual = { external_id: "", platform: "微博", publish_time: "", title: "", body: "" };
@@ -6,6 +7,7 @@ const initialManual = { external_id: "", platform: "微博", publish_time: "", t
 type Message = { type: "ok" | "err"; text: string };
 
 export default function Upload() {
+  const navigate = useNavigate();
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState(0);
   const [supplierId, setSupplierId] = useState("");
@@ -16,6 +18,7 @@ export default function Upload() {
   const [result, setResult] = useState<BatchDetail | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [busy, setBusy] = useState("");
+  const [auditBusy, setAuditBusy] = useState(false);
   const [manual, setManual] = useState(initialManual);
   const [manualFile, setManualFile] = useState<File | null>(null);
 
@@ -73,6 +76,17 @@ export default function Upload() {
     catch (error) { setMessage({ type: "err", text: error instanceof Error ? error.message : "导出失败" }); }
     finally { setBusy(""); }
   };
+  const startAudit = async (batchId: number) => {
+    setAuditBusy(true); setMessage(null);
+    try {
+      await api.auditBatch(batchId);
+      navigate(`/review?batch_id=${batchId}`);
+    } catch (error) {
+      setMessage({ type: "err", text: `审核启动失败：${error instanceof Error ? error.message : "未知错误"}` });
+    } finally {
+      setAuditBusy(false);
+    }
+  };
   const submitManual = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!identityReady || !manual.external_id.trim() || !manual.title.trim() || !manual.body.trim() || !manualFile) {
@@ -105,7 +119,7 @@ export default function Upload() {
       </div>
       <div className="import-actions">
         <button type="button" className="btn btn-ghost" onClick={downloadTemplate} disabled={busy === "template"} title="下载标准 Excel 模板" aria-label="下载标准 Excel 模板">↓ {busy === "template" ? "下载中" : "下载模板"}</button>
-        <span className="small">模板包含内容与测试用例工作表；证据 ZIP 为可选文件。</span>
+        <span className="small">内容表使用“标题、内容、类型、目标平台、作者、发布日期、图片/视频”七列；测试场景表保持独立，媒体与证据 ZIP 可选。</span>
       </div>
       <div className="file-grid">
         <div className="file-field"><label htmlFor="excel-file">Excel 文件 *</label><input id="excel-file" type="file" accept=".xlsx" onChange={(event) => { setExcel(event.target.files?.[0] || null); invalidatePreview(); }} /><span>{excel?.name || "未选择 .xlsx 文件"}</span></div>
@@ -122,7 +136,7 @@ export default function Upload() {
       {previewTests.length === 0 ? <p className="empty">未提供测试用例；系统不会据此推断存在测试证据。</p> : <div className="table-wrap"><table><thead><tr><th>内容 / 用例</th><th>主张</th><th>操作与结果</th><th>证据文件</th></tr></thead><tbody>{previewTests.map((test) => <tr key={`${test.row}-${test.external_test_case_id}`}><td>{test.content_external_id}<div className="cell-subline">{test.external_test_case_id}</div></td><td>{test.claim || <span className="missing">缺失</span>}</td><td>{test.command || <span className="missing">缺失</span>}<div className="cell-subline">{test.observed_result || "未提供观察结果"}</div></td><td>{test.evidence_filenames.length ? test.evidence_filenames.join("、") : <span className="missing">无证据引用</span>}</td></tr>)}</tbody></table></div>}
     </section>}
 
-    {result && <section className="card"><div className="section-heading"><div><h3>批次已入库</h3><p className="small">#{result.id} · {result.name} · {result.content_count} 条</p></div><button className="btn btn-ghost" onClick={exportResult} disabled={!!busy} aria-label="导出当前批次">↓ {busy === "export" ? "导出中" : "导出批次"}</button></div></section>}
+    {result && <section className="card"><div className="section-heading"><div><h3>批次已入库</h3><p className="small">#{result.id} · {result.name} · {result.content_count} 条</p></div><div className="btn-row"><button className="btn btn-ghost" onClick={exportResult} disabled={!!busy || auditBusy} aria-label="导出当前批次">↓ {busy === "export" ? "导出中" : "导出批次"}</button><button className="btn btn-primary" onClick={() => startAudit(result.id)} disabled={auditBusy || !!busy} aria-label="开始审核本批次">{auditBusy ? "启动中..." : "开始审核本批次"}</button></div></div></section>}
 
     <details className="secondary-tool"><summary>手工录入单条内容</summary><form className="card" onSubmit={submitManual}><p className="small">沿用上方项目、供应商与批次信息。此入口仅用于临时补录。</p><div className="form-grid"><div className="field"><label htmlFor="manual-id">内容编号 *</label><input id="manual-id" value={manual.external_id} onChange={(e) => setManual({ ...manual, external_id: e.target.value })} /></div><div className="field"><label htmlFor="manual-platform">平台</label><select id="manual-platform" value={manual.platform} onChange={(e) => setManual({ ...manual, platform: e.target.value })}><option>微博</option><option>抖音</option><option>小红书</option><option>B站</option><option>其他</option></select></div><div className="field span-2"><label htmlFor="manual-title">标题 *</label><input id="manual-title" value={manual.title} onChange={(e) => setManual({ ...manual, title: e.target.value })} /></div><div className="field span-2"><label htmlFor="manual-body">正文 *</label><textarea id="manual-body" rows={5} value={manual.body} onChange={(e) => setManual({ ...manual, body: e.target.value })} /></div><div className="field span-2"><label htmlFor="manual-media">图片 *</label><input id="manual-media" type="file" accept=".jpg,.jpeg,.png,.webp" onChange={(e) => setManualFile(e.target.files?.[0] || null)} /></div></div><button className="btn btn-ghost" disabled={!!busy}>{busy === "manual" ? "提交中..." : "创建单条批次"}</button></form></details>
   </div>;
