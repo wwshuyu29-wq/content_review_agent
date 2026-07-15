@@ -313,6 +313,16 @@ export interface ReportData {
 }
 
 export interface Config { reviewer: string; model: string; key_set: boolean; }
+
+export interface AuthUser {
+  id: number;
+  username: string;
+  display_name: string;
+  role: string;
+  is_active: boolean;
+}
+export interface AuthResponse { user: AuthUser; csrf_token: string; }
+
 export interface BatchAuditResult { content_id: number; status: "success" | "error"; audit_run_id: number | null; error: string | null; }
 export interface ContentFilters { project_id?: number; batch_id?: number; format_status?: FormatStatus; review_status?: ReviewStatus; publish_status?: PublishStatus; }
 
@@ -323,9 +333,37 @@ function query(params: Record<string, string | number | undefined>): string {
   return encoded ? `?${encoded}` : "";
 }
 
+// CSRF token lives only in memory; never persisted to localStorage.
+let csrfToken: string | null = null;
+const unauthorizedHandlers = new Set<() => void>();
+
+export function setCsrfToken(token: string | null): void { csrfToken = token; }
+export function getCsrfToken(): string | null { return csrfToken; }
+export function onUnauthorized(handler: () => void): () => void {
+  unauthorizedHandlers.add(handler);
+  return () => { unauthorizedHandlers.delete(handler); };
+}
+function handleUnauthorized(): void {
+  csrfToken = null;
+  unauthorizedHandlers.forEach((handler) => handler());
+}
+
+function buildInit(init?: RequestInit): RequestInit {
+  const method = (init?.method || "GET").toUpperCase();
+  const headers = new Headers(init?.headers);
+  if ((method === "POST" || method === "PUT" || method === "DELETE") && csrfToken) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  return { ...init, headers, credentials: "include" as RequestCredentials };
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
-  if (response.ok) return response.json() as Promise<T>;
+  const response = await fetch(url, buildInit(init));
+  if (response.status === 401) { handleUnauthorized(); }
+  if (response.ok) {
+    if (response.status === 204) return undefined as T;
+    return response.json() as Promise<T>;
+  }
   let message = `HTTP ${response.status}`;
   try {
     const error = await response.json() as { detail?: string | Array<{ msg?: string }> };
@@ -334,8 +372,18 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   throw new Error(message);
 }
 
-async function requestBlob(url: string): Promise<Blob> {
-  const response = await fetch(url);
+async function requestVoid(url: string, init?: RequestInit): Promise<void> {
+  const response = await fetch(url, buildInit(init));
+  if (response.status === 401) { handleUnauthorized(); }
+  if (response.ok || response.status === 204) return;
+  let message = `HTTP ${response.status}`;
+  try { message = (await response.json() as { detail?: string }).detail || message; } catch { /* Keep fallback. */ }
+  throw new Error(message);
+}
+
+async function requestBlob(url: string, init?: RequestInit): Promise<Blob> {
+  const response = await fetch(url, buildInit(init));
+  if (response.status === 401) { handleUnauthorized(); }
   if (response.ok) return response.blob();
   let message = `HTTP ${response.status}`;
   try { message = (await response.json() as { detail?: string }).detail || message; } catch { /* Keep fallback. */ }
@@ -356,6 +404,10 @@ export function saveBlob(blob: Blob, filename: string): void {
 }
 
 export const api = {
+  me: (): Promise<AuthResponse> => request("/api/auth/me"),
+  login: (username: string, password: string): Promise<AuthResponse> =>
+    request("/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) }),
+  logout: (): Promise<void> => requestVoid("/api/auth/logout", { method: "POST" }),
   projects: (): Promise<Project[]> => request("/api/projects"),
   project: (id: number): Promise<ProjectDetail> => request(`/api/projects/${id}`),
   batches: (projectId?: number, signal?: AbortSignal): Promise<Batch[]> => request(`/api/batches${query({ project_id: projectId })}`, { signal }),
