@@ -358,7 +358,7 @@ export function saveBlob(blob: Blob, filename: string): void {
 export const api = {
   projects: (): Promise<Project[]> => request("/api/projects"),
   project: (id: number): Promise<ProjectDetail> => request(`/api/projects/${id}`),
-  batches: (projectId?: number): Promise<Batch[]> => request(`/api/batches${query({ project_id: projectId })}`),
+  batches: (projectId?: number, signal?: AbortSignal): Promise<Batch[]> => request(`/api/batches${query({ project_id: projectId })}`, { signal }),
   createBatch: (body: FormData): Promise<BatchDetail> => request("/api/batches", { method: "POST", body }),
   importTemplate: (): Promise<Blob> => requestBlob("/api/import-template"),
   previewImport: (body: FormData): Promise<ImportPreview> => request("/api/imports/preview", { method: "POST", body }),
@@ -367,9 +367,9 @@ export const api = {
   exportBatch: (batchId: number): Promise<Blob> => requestBlob(`/api/batches/${batchId}/export`),
   contents: (filters: Pick<ContentFilters, "project_id" | "batch_id" | "review_status">): Promise<ContentSummary[]> =>
     request(`/api/contents${query(filters)}`),
-  contentTable: (filters: ContentFilters): Promise<ContentTableRow[]> => request(`/api/contents/table${query({ project_id: filters.project_id, batch_id: filters.batch_id, format_status: filters.format_status, review_status: filters.review_status, publish_status: filters.publish_status })}`),
-  content: (id: number): Promise<ContentDetail> => request(`/api/contents/${id}`),
-  contentTestCases: (id: number): Promise<TestCase[]> => request(`/api/contents/${id}/test-cases`),
+  contentTable: (filters: ContentFilters, signal?: AbortSignal): Promise<ContentTableRow[]> => request(`/api/contents/table${query({ project_id: filters.project_id, batch_id: filters.batch_id, format_status: filters.format_status, review_status: filters.review_status, publish_status: filters.publish_status })}`, { signal }),
+  content: (id: number, signal?: AbortSignal): Promise<ContentDetail> => request(`/api/contents/${id}`, { signal }),
+  contentTestCases: (id: number, signal?: AbortSignal): Promise<TestCase[]> => request(`/api/contents/${id}/test-cases`, { signal }),
   auditContent: (id: number): Promise<AuditDetail> => request(`/api/contents/${id}/audit`, { method: "POST" }),
   auditBatch: (id: number): Promise<{ batch_id: number; audited: number; audit_run_ids: number[]; results: BatchAuditResult[] }> =>
     request(`/api/batches/${id}/audit`, { method: "POST" }),

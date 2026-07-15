@@ -699,12 +699,23 @@ def get_content(content_id: int, session: Session = Depends(get_session)):
 def get_content_test_cases(content_id: int, session: Session = Depends(get_session)):
     if session.get(ContentItem, content_id) is None:
         raise _not_found("ContentItem", content_id)
-    return list(session.scalars(
+    records = list(session.scalars(
         select(TestCase)
-        .where(TestCase.content_item_id == content_id)
-        .options(selectinload(TestCase.evidence).selectinload(TestEvidence.asset))
+        .join(ContentVersion, TestCase.content_version_id == ContentVersion.id)
+        .where(
+            TestCase.content_item_id == content_id,
+            ContentVersion.content_item_id == content_id,
+        )
+        .options(
+            selectinload(TestCase.content_version),
+            selectinload(TestCase.evidence).selectinload(TestEvidence.asset),
+        )
         .order_by(TestCase.id)
     ))
+    return [
+        record for record in records
+        if all(binding.asset.content_item_id == content_id for binding in record.evidence)
+    ]
 
 
 @app.post("/api/contents/{content_id}/audit", response_model=AuditDetail)

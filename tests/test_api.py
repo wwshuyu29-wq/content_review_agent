@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from server import main
 from server.db import create_db_engine
 from scripts.text_review.reviewers.tech_media import TechMediaReviewer
-from server.models import ContentItem, Project, ReviewStatus
+from server.models import Asset, ContentItem, Project, ReviewStatus, TestCase as EvidenceTestCase, TestEvidence as EvidenceBinding
 
 
 class FakeReviewer:
@@ -243,6 +243,40 @@ def test_content_test_cases_endpoint_returns_bound_evidence(api) -> None:
             },
         }],
     }]
+
+
+def test_content_test_cases_endpoint_excludes_cross_content_version_and_asset(api) -> None:
+    client, engine, _ = api
+    project = client.get("/api/projects").json()[0]
+    uploaded = []
+    for index in (1, 2):
+        response = client.post(
+            "/api/batches",
+            data={
+                "project_id": str(project["id"]),
+                "supplier_id": f"ownership-supplier-{index}",
+                "name": f"ownership-batch-{index}",
+                "contents": json.dumps([{"external_id": f"ownership-content-{index}", "title": "标题", "body": "正文"}]),
+            },
+            files=[("files", ("cover.png", b"png-content", "image/png"))],
+        )
+        uploaded.append(response.json()["contents"][0])
+    first, second = uploaded
+    with Session(engine) as session:
+        asset = Asset(content_item_id=second["id"], asset_id="foreign-asset", kind="SCREENSHOT", filename="foreign.png")
+        corrupt_case = EvidenceTestCase(
+            content_item_id=first["id"], content_version_id=second["versions"][0]["id"],
+            external_test_case_id="CORRUPT-1", claim="foreign", command="foreign", observed_result="foreign",
+        )
+        session.add_all([asset, corrupt_case])
+        session.flush()
+        session.add(EvidenceBinding(test_case=corrupt_case, asset=asset))
+        session.commit()
+
+    response = client.get(f"/api/contents/{first['id']}/test-cases")
+
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 def test_default_heuristic_audit_routes_to_human_review(api) -> None:
