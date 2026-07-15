@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import stat
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -20,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from server.models import AssetKind, Batch, FormatStatus
+from server.models import AssetKind, Batch, FormatStatus, Project
 from server.services.content_service import MAX_BODY_LENGTH, MAX_TITLE_LENGTH, submit_batch
 from server.services.evidence_service import attach_evidence, create_asset, create_test_case
 
@@ -48,8 +49,12 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_ZIP_BYTES = 200 * 1024 * 1024
 MAX_ZIP_ENTRIES = 1000
 MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+MAX_XLSX_ENTRIES = 2000
+MAX_XLSX_ENTRY_BYTES = 50 * 1024 * 1024
+MAX_XLSX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+DEFAULT_EVIDENCE_TRIGGER_TERMS = ("亲测", "实测", "自用")
 PREVIEW_TTL = timedelta(hours=2)
-PREVIEW_MANIFEST_VERSION = 2
+PREVIEW_MANIFEST_VERSION = 3
 PREVIEW_ROOT_REGISTRY_ENV = "CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY"
 DEFAULT_PREVIEW_ROOT_REGISTRY = Path(__file__).resolve().parents[2] / "data" / "preview-roots.json"
 ALLOWED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
@@ -79,10 +84,23 @@ _PREVIEW_KEYS = frozenset(
         "valid_count",
         "error_count",
         "test_cases",
+        "errors",
+        "project_id", "project_code", "content_type", "package_version",
+        "supplier_id", "batch_name",
     }
 )
 _ROW_KEYS = frozenset({"row_number", "normalized", "errors", "warnings", "valid", "tests"})
 _NORMALIZED_KEYS = frozenset(_COLUMN_KEYS.values())
+
+
+@dataclass(frozen=True)
+class PreviewIdentity:
+    project_id: int
+    project_code: str
+    content_type: str
+    package_version: str
+    supplier_id: str
+    batch_name: str
 
 
 @dataclass(frozen=True)
@@ -107,7 +125,7 @@ class ImportRowPreview:
     errors: List[str]
     warnings: List[str]
     valid: bool
-    tests: List[TestCasePreview] = None
+    tests: List[TestCasePreview] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -118,7 +136,9 @@ class ImportPreview:
     total_count: int
     valid_count: int
     error_count: int
-    test_cases: List[TestCasePreview] = None
+    test_cases: List[TestCasePreview] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    identity: Optional[PreviewIdentity] = None
 
     @property
     def test_count(self) -> int:
@@ -148,7 +168,14 @@ def build_import_template() -> bytes:
     return output.getvalue()
 
 
-def preview_import(xlsx_path: Path, zip_path: Optional[Path], temp_root: Path) -> ImportPreview:
+def preview_import(
+    xlsx_path: Path,
+    zip_path: Optional[Path],
+    temp_root: Path,
+    *,
+    trigger_terms: Tuple[str, ...] = DEFAULT_EVIDENCE_TRIGGER_TERMS,
+    identity: Optional[PreviewIdentity] = None,
+) -> ImportPreview:
     token = token_urlsafe(32)
     root = temp_root.resolve()
     preview_dir = root / token
@@ -165,8 +192,8 @@ def preview_import(xlsx_path: Path, zip_path: Optional[Path], temp_root: Path) -
             zip_entries, warnings = _inspect_zip(zip_path)
 
         rows, image_warnings = _validate_images(rows, zip_path, zip_entries)
-        rows, test_cases = _validate_test_cases(rows, test_cases)
-        rows, evidence_warnings = _validate_test_evidence(rows, test_cases, zip_entries)
+        rows, test_cases, preview_errors = _validate_test_cases(rows, test_cases, trigger_terms)
+        rows, evidence_warnings = _validate_test_evidence(rows, test_cases, zip_entries, trigger_terms)
         warnings.extend(image_warnings)
         warnings.extend(evidence_warnings)
         rows = _mark_duplicate_external_ids(rows)
@@ -182,8 +209,10 @@ def preview_import(xlsx_path: Path, zip_path: Optional[Path], temp_root: Path) -
             warnings=warnings,
             total_count=len(rows),
             valid_count=valid_count,
-            error_count=len(rows) - valid_count,
+            error_count=len(rows) - valid_count + len(preview_errors),
             test_cases=test_cases,
+            errors=preview_errors,
+            identity=identity,
         )
         expires_at = datetime.now(timezone.utc) + PREVIEW_TTL
         _write_preview(manifest, preview, expires_at)
@@ -245,6 +274,12 @@ def confirm_import(
 
     existing = session.scalar(select(Batch).where(Batch.import_token == token))
     if existing is not None:
+        identity_bound = any(
+            version.payload.get("preview_identity")
+            for item in existing.content_items for version in item.versions[:1]
+        )
+        if identity_bound and (existing.project_id, existing.supplier_id, existing.name) != (project_id, supplier_id, batch_name):
+            raise ValueError("导入确认信息与原批次身份不匹配")
         return existing
 
     location = _resolve_preview_location(token)
@@ -253,6 +288,19 @@ def confirm_import(
     except _ExpiredPreviewError as exc:
         _remove_preview(token, location)
         raise ValueError("导入预览已过期") from exc
+
+    if preview.errors:
+        raise ValueError("导入预览包含全局错误，无法确认")
+    if preview.identity is not None:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise ValueError(f"Project {project_id} does not exist")
+        expected = preview.identity
+        current_package = project.current_rule_version.package_version if project.current_rule_version else None
+        actual = (project_id, project.code, project.content_type, current_package, supplier_id, batch_name)
+        bound = (expected.project_id, expected.project_code, expected.content_type, expected.package_version, expected.supplier_id, expected.batch_name)
+        if actual != bound:
+            raise ValueError("导入确认信息与预览身份不匹配")
 
     saved_paths: List[Path] = []
     commit_completed = False
@@ -276,6 +324,8 @@ def confirm_import(
             _delete_saved_paths(saved_paths)
             existing = session.scalar(select(Batch).where(Batch.import_token == token))
             if existing is not None:
+                if preview.identity is not None and (existing.project_id, existing.supplier_id, existing.name) != (project_id, supplier_id, batch_name):
+                    raise ValueError("并发导入批次身份与预览不匹配")
                 return existing
         raise
     except Exception:
@@ -315,6 +365,8 @@ def _build_confirm_contents(
     for row in preview.rows:
         normalized = row.normalized
         payload = _payload_for_row(preview.token, row)
+        if preview.identity is not None:
+            payload["preview_identity"] = asdict(preview.identity)
         media = _copy_preview_image(location, normalized.get("image_filename"), saved_paths)
         if media is not None:
             payload["media"] = media
@@ -335,6 +387,8 @@ def _payload_for_row(token: str, row: ImportRowPreview) -> Dict[str, Any]:
     return {
         "supplier_external_id": normalized.get("external_id"),
         "campaign_theme": normalized.get("campaign_theme"),
+        "account_name": normalized.get("account_name"),
+        "account_type": normalized.get("account_type"),
         "platform": normalized.get("platform"),
         "title": normalized.get("title"),
         "body": normalized.get("body"),
@@ -370,23 +424,72 @@ def _format_status_for_row(row: ImportRowPreview) -> FormatStatus:
     return FormatStatus.INVALID
 
 
+def _evidence_kind_and_mime(filename: str) -> Tuple[AssetKind, str]:
+    suffix = Path(filename).suffix.lower()
+    mapping = {
+        ".png": (AssetKind.SCREENSHOT, "image/png"),
+        ".jpg": (AssetKind.SCREENSHOT, "image/jpeg"),
+        ".jpeg": (AssetKind.SCREENSHOT, "image/jpeg"),
+        ".webp": (AssetKind.SCREENSHOT, "image/webp"),
+        ".gif": (AssetKind.SCREENSHOT, "image/gif"),
+        ".mp4": (AssetKind.SCREEN_RECORDING, "video/mp4"),
+        ".mov": (AssetKind.SCREEN_RECORDING, "video/quicktime"),
+        ".webm": (AssetKind.SCREEN_RECORDING, "video/webm"),
+        ".txt": (AssetKind.TEST_LOG, "text/plain"),
+        ".log": (AssetKind.TEST_LOG, "text/plain"),
+        ".json": (AssetKind.TEST_LOG, "application/json"),
+    }
+    if suffix not in mapping:
+        raise ValueError(f"unsupported evidence suffix: {suffix}")
+    return mapping[suffix]
+
+
 def _create_confirmed_test_records(session, batch, preview, location, saved_paths) -> None:
     if not preview.test_cases:
         return
-    by_external = {item.external_id: item for item in batch.content_items}
+    by_external = {
+        item.versions[0].payload.get("supplier_external_id"): item
+        for item in batch.content_items
+        if item.versions and item.versions[0].payload.get("supplier_external_id")
+    }
+    valid_owners = {row.normalized.get("external_id") for row in preview.rows if row.valid}
+    assets: Dict[Tuple[int, str], Any] = {}
     for test in preview.test_cases:
+        if test.content_external_id not in valid_owners:
+            continue
         item = by_external.get(test.content_external_id)
         if item is None or not item.versions:
-            continue
-        record = create_test_case(session, item.id, item.versions[0].id, external_test_case_id=test.external_test_case_id, claim=test.claim or "测试结论", command=test.command, observed_result=test.observed_result, city=test.city, tested_at=test.tested_at, app_version=test.app_version, device=test.device, operating_system=test.operating_system, network_environment=test.network_environment)
+            raise ValueError(f"测试场景引用的内容编号不存在：{test.content_external_id}")
+        record = create_test_case(
+            session, item.id, item.versions[0].id,
+            external_test_case_id=test.external_test_case_id,
+            claim=test.claim or "测试结论", command=test.command,
+            observed_result=test.observed_result, city=test.city, tested_at=test.tested_at,
+            app_version=test.app_version, device=test.device,
+            operating_system=test.operating_system,
+            network_environment=test.network_environment,
+        )
         for filename in test.evidence_filenames:
-            source = location.preview_dir / "evidence" / filename
-            if not source.is_file():
-                continue
-            destination = _uploads_dir() / f"{uuid4().hex}{Path(filename).suffix.lower()}"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, destination); saved_paths.append(destination)
-            asset = create_asset(session, item.id, asset_id=f"evidence:{uuid4().hex}", external_id=filename, kind=AssetKind.SCREENSHOT, filename=filename, storage_key=destination.name, size_bytes=destination.stat().st_size)
+            cache_key = (item.id, filename)
+            asset = assets.get(cache_key)
+            if asset is None:
+                source = location.preview_dir / "evidence" / filename
+                if not source.is_file():
+                    raise ValueError(f"证据文件不存在：{filename}")
+                suffix = Path(filename).suffix.lower()
+                destination = _uploads_dir() / f"{uuid4().hex}{suffix}"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+                    shutil.copyfileobj(input_stream, output_stream)
+                saved_paths.append(destination)
+                kind, mime_type = _evidence_kind_and_mime(filename)
+                stable_id = "evidence:" + hashlib.sha256(filename.encode("utf-8")).hexdigest()[:32]
+                asset = create_asset(
+                    session, item.id, asset_id=stable_id, external_id=filename,
+                    kind=kind, filename=filename, storage_key=destination.name,
+                    mime_type=mime_type, size_bytes=destination.stat().st_size,
+                )
+                assets[cache_key] = asset
             attach_evidence(session, record.id, asset.id)
 
 
@@ -457,6 +560,7 @@ def _load_preview_manifest(
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         preview, expires_at = _preview_from_dict(payload)
+        _validate_preview_files(location, preview)
     except (OSError, TypeError, KeyError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("导入预览数据无效") from exc
     if preview.token != token:
@@ -464,6 +568,38 @@ def _load_preview_manifest(
     if expires_at <= datetime.now(timezone.utc):
         raise _ExpiredPreviewError("导入预览已过期")
     return preview, expires_at
+
+
+def _validate_preview_files(location: _PreviewLocation, preview: ImportPreview) -> None:
+    evidence_root = location.preview_dir / "evidence"
+    valid_owners = {row.normalized.get("external_id") for row in preview.rows if row.valid}
+    for test in preview.test_cases:
+        if test.content_external_id not in valid_owners:
+            continue
+        for filename in test.evidence_filenames:
+            path = evidence_root / filename
+            try:
+                root = evidence_root.resolve(strict=True)
+                resolved = path.resolve(strict=True)
+            except (FileNotFoundError, RuntimeError) as exc:
+                raise ValueError(f"预览证据文件不存在：{filename}") from exc
+            if resolved.parent != root or not resolved.is_file() or resolved.stat().st_size > MAX_EVIDENCE_BYTES:
+                raise ValueError(f"预览证据文件无效：{filename}")
+    image_root = location.preview_dir / "images"
+    for row in preview.rows:
+        if not row.valid:
+            continue
+        filename = row.normalized.get("image_filename")
+        if not filename:
+            continue
+        path = image_root / filename
+        try:
+            root = image_root.resolve(strict=True)
+            resolved = path.resolve(strict=True)
+        except (FileNotFoundError, RuntimeError) as exc:
+            raise ValueError(f"预览图片不存在：{filename}") from exc
+        if resolved.parent != root or not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_BYTES:
+            raise ValueError(f"预览图片无效：{filename}")
 
 
 def _remove_preview(token: str, location: _PreviewLocation) -> None:
@@ -509,45 +645,103 @@ def _load_preview_roots() -> List[Path]:
         raise ValueError("导入预览根目录配置无效") from exc
 
 
-def _read_workbook(xlsx_path: Path) -> Tuple[List[ImportRowPreview], List[TestCasePreview]]:
+def _validate_xlsx_archive(xlsx_path: Path) -> None:
+    required = {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml"}
+    total = 0
+    names = set()
     try:
+        with ZipFile(xlsx_path) as archive:
+            if len(archive.filelist) > MAX_XLSX_ENTRIES:
+                raise ValueError("XLSX 条目数量超过安全限制")
+            for info in archive.filelist:
+                _validate_zip_path(info.filename)
+                if info.flag_bits & 0x1:
+                    raise ValueError(f"XLSX 包含加密条目：{info.filename}")
+                if _is_zip_symlink(info):
+                    raise ValueError(f"XLSX 不允许符号链接：{info.filename}")
+                if info.filename in names:
+                    raise ValueError(f"XLSX 条目重复：{info.filename}")
+                if info.file_size > MAX_XLSX_ENTRY_BYTES:
+                    raise ValueError(f"XLSX 单条目超过安全限制：{info.filename}")
+                total += info.file_size
+                if total > MAX_XLSX_UNCOMPRESSED_BYTES:
+                    raise ValueError("XLSX 解压后内容超过安全限制")
+                names.add(info.filename)
+    except (BadZipFile, OSError) as exc:
+        raise ValueError("Excel 文件无法读取") from exc
+    missing = sorted(required - names)
+    if missing:
+        raise ValueError("XLSX 缺少必需 OOXML 部件：" + "、".join(missing))
+
+
+def _read_workbook(xlsx_path: Path) -> Tuple[List[ImportRowPreview], List[TestCasePreview]]:
+    workbook = None
+    try:
+        _validate_xlsx_archive(xlsx_path)
         workbook = load_workbook(xlsx_path, read_only=True, data_only=False)
-        if not hasattr(workbook, "sheetnames"):
-            raise ValueError("Excel 工作表解析失败")
-        named = "内容清单" in workbook.sheetnames
-        content_sheet = workbook["内容清单"] if named else workbook.worksheets[0]
-        rows = _read_sheet_rows(content_sheet, list(CONTENT_COLUMNS if named else IMPORT_COLUMNS), list(REQUIRED_CONTENT_COLUMNS if named else REQUIRED_COLUMNS), named)
+        if "内容清单" not in workbook.sheetnames:
+            raise ValueError("Excel 缺少命名工作表：内容清单")
+        rows = _read_sheet_rows(
+            workbook["内容清单"], list(REQUIRED_COLUMNS), named=True
+        )
         tests: List[TestCasePreview] = []
         if "测试场景" in workbook.sheetnames:
             sheet = workbook["测试场景"]
-            iterator = sheet.iter_rows(); header = next(iterator, None)
-            if header is None: raise ValueError("测试场景表头不能为空")
+            iterator = sheet.iter_rows()
+            header = next(iterator, None)
+            if header is None:
+                raise ValueError("测试场景表头不能为空")
+            if any(cell.data_type == "f" for cell in header):
+                raise ValueError("测试场景表头不允许公式")
             headers = tuple(str(cell.value).strip() if cell.value is not None else "" for cell in header)
-            if headers != TEST_CASE_COLUMNS: raise ValueError("测试场景表头必须严格匹配")
+            if headers != TEST_CASE_COLUMNS:
+                raise ValueError("测试场景表头必须严格匹配")
             for number, cells in enumerate(iterator, 2):
                 values = tuple(cell.value for cell in cells)
-                if _is_blank_row(values): continue
-                if len(tests) >= MAX_IMPORT_ROWS: raise ValueError("测试场景最多允许 500 条")
-                if any(cell.data_type == "f" for cell in cells): raise ValueError(f"测试场景第 {number} 行不允许公式")
-                vals = {key: _normalize_text(values[i] if i < len(values) else None) for i, key in enumerate(_TEST_COLUMN_KEYS)}
-                tests.append(TestCasePreview(vals["供应商内容编号"], vals["测试场景编号"], vals["测试结论"], vals["测试指令"], vals["实际返回结果"], vals["测试城市"], vals["测试时间"], vals["百度地图版本"], vals["设备"], vals["操作系统"], vals["网络环境"], _split_filenames(vals["证据文件名"])))
+                if _is_blank_row(values):
+                    continue
+                if len(tests) >= MAX_IMPORT_ROWS:
+                    raise ValueError("测试场景最多允许 500 条")
+                if any(cell.data_type == "f" for cell in cells):
+                    raise ValueError(f"测试场景第 {number} 行不允许公式")
+                values = tuple(_normalize_text(value) for value in values)
+                padded = values + (None,) * (len(TEST_CASE_COLUMNS) - len(values))
+                tests.append(TestCasePreview(
+                    content_external_id=padded[0], external_test_case_id=padded[1],
+                    claim=padded[2], command=padded[3], observed_result=padded[4],
+                    city=padded[5], tested_at=padded[6], app_version=padded[7],
+                    device=padded[8], operating_system=padded[9],
+                    network_environment=padded[10], evidence_filenames=_split_filenames(padded[11]),
+                ))
         return rows, tests
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Excel 工作表解析失败") from exc
     finally:
-        workbook.close()
+        if workbook is not None:
+            workbook.close()
 
 
-def _read_sheet_rows(sheet, expected: List[str], required: List[str], named: bool) -> List[ImportRowPreview]:
-    iterator = sheet.iter_rows(); header_cells = next(iterator, None)
-    if header_cells is None: raise ValueError("Excel 表头不能为空")
-    if any(cell.data_type == "f" for cell in header_cells): raise ValueError("Excel 表头不允许公式")
+def _read_sheet_rows(sheet, required: List[str], named: bool) -> List[ImportRowPreview]:
+    iterator = sheet.iter_rows()
+    header_cells = next(iterator, None)
+    if header_cells is None:
+        raise ValueError("Excel 表头不能为空")
+    if any(cell.data_type == "f" for cell in header_cells):
+        raise ValueError("Excel 表头不允许公式")
     headers = _validate_headers(tuple(cell.value for cell in header_cells), required)
-    indexes = {header: index for index, header in enumerate(headers)}; rows=[]
+    indexes = {header: index for index, header in enumerate(headers)}
+    use_new_columns = named and all(column in headers for column in ("账号名称", "账号类型"))
+    rows = []
     for row_number, cells in enumerate(iterator, 2):
-        values=tuple(cell.value for cell in cells)
-        if _is_blank_row(values): continue
-        if len(rows) >= MAX_IMPORT_ROWS: raise ValueError("Excel 最多允许 500 条内容")
-        formulas={i for i, cell in enumerate(cells) if cell.data_type == "f"}
-        rows.append(_normalize_row(row_number, values, indexes, headers, formulas, named=named))
+        values = tuple(cell.value for cell in cells)
+        if _is_blank_row(values):
+            continue
+        if len(rows) >= MAX_IMPORT_ROWS:
+            raise ValueError("Excel 最多允许 500 条内容")
+        formulas = {index for index, cell in enumerate(cells) if cell.data_type == "f"}
+        rows.append(_normalize_row(row_number, values, indexes, headers, formulas, named=use_new_columns))
     return rows
 
 
@@ -555,52 +749,99 @@ def _split_filenames(value: Optional[str]) -> List[str]:
     return [part.strip() for part in re.split(r"[,，;；]", value or "") if part.strip()]
 
 
-def _validate_test_cases(rows, tests):
-    ids={row.normalized.get("external_id") for row in rows if row.normalized.get("external_id")}
-    seen=set(); errors={}
+def _group_tests(tests: List[TestCasePreview]) -> Dict[str, List[TestCasePreview]]:
+    grouped: Dict[str, List[TestCasePreview]] = {}
     for test in tests:
-        if not test.content_external_id or test.content_external_id not in ids: errors.setdefault(test.content_external_id, []).append("测试场景引用的内容编号不存在")
-        if not test.external_test_case_id: errors.setdefault(test.content_external_id, []).append("测试场景编号不能为空")
-        if test.external_test_case_id in seen: errors.setdefault(test.content_external_id, []).append("测试场景编号在批次内重复")
+        grouped.setdefault(test.content_external_id or "", []).append(test)
+    return grouped
+
+
+def _validate_test_cases(rows, tests, trigger_terms):
+    content_ids = {row.normalized.get("external_id") for row in rows if row.normalized.get("external_id")}
+    grouped = _group_tests(tests)
+    preview_errors: List[str] = []
+    seen = set()
+    row_errors: Dict[str, List[str]] = {}
+    for test in tests:
+        owner = test.content_external_id or ""
+        if not owner or owner not in content_ids:
+            preview_errors.append(f"测试场景 {test.external_test_case_id or '<空>'} 引用的内容编号不存在：{owner or '<空>'}")
+        if not test.external_test_case_id:
+            row_errors.setdefault(owner, []).append("测试场景编号不能为空")
+        elif test.external_test_case_id in seen:
+            preview_errors.append(f"测试场景编号在批次内重复：{test.external_test_case_id}")
         seen.add(test.external_test_case_id)
-        if not test.command: errors.setdefault(test.content_external_id, []).append("测试指令不能为空")
-        if not test.observed_result: errors.setdefault(test.content_external_id, []).append("实际返回结果不能为空")
-    updated=[]
+        if not test.command:
+            row_errors.setdefault(owner, []).append(f"测试场景 {test.external_test_case_id or '<空>'} 的测试指令不能为空")
+        if not test.observed_result:
+            row_errors.setdefault(owner, []).append(f"测试场景 {test.external_test_case_id or '<空>'} 的实际返回结果不能为空")
+    owned_tests = [test for test in tests if test.content_external_id in content_ids]
+    grouped = _group_tests(owned_tests)
+    updated = []
     for row in rows:
-        extra=errors.get(row.normalized.get("external_id"), [])
-        trigger=any(word in " ".join(str(row.normalized.get(k) or "") for k in ("title","body")) for word in ("实测","亲测","自用"))
-        if trigger and not tests: extra.append("存在实测/亲测/自用触发词但缺少测试场景")
-        updated.append(_replace_row_errors(row, row.errors + extra))
-    by_id={row.normalized.get("external_id"): [] for row in rows}
-    for test in tests: by_id.setdefault(test.content_external_id, []).append(test)
-    updated = [ImportRowPreview(row.row_number, row.normalized, row.errors, row.warnings, row.valid, by_id.get(row.normalized.get("external_id"), [])) for row in updated]
-    return updated, tests
+        owner = row.normalized.get("external_id") or ""
+        bound = grouped.get(owner, [])
+        text = " ".join(str(row.normalized.get(key) or "") for key in ("title", "body"))
+        triggered = any(term and term in text for term in trigger_terms)
+        errors = list(row.errors) + row_errors.get(owner, [])
+        if triggered and not bound:
+            errors.append("存在实测证据触发词但该内容缺少测试场景")
+        updated.append(ImportRowPreview(row.row_number, row.normalized, errors, row.warnings, not errors, bound))
+    return updated, owned_tests, preview_errors
 
 
-def _validate_test_evidence(rows, tests, entries):
-    missing = {}
+def _valid_evidence_filename(filename: str, entries: Dict[str, ZipInfo]) -> bool:
+    return (
+        _is_safe_basename(filename)
+        and Path(filename).suffix.lower() in EVIDENCE_SUFFIXES
+        and filename in entries
+        and entries[filename].file_size <= MAX_EVIDENCE_BYTES
+    )
+
+
+def _validate_test_evidence(rows, tests, entries, trigger_terms):
+    errors: Dict[str, List[str]] = {}
     referenced = set()
+    grouped = _group_tests(tests)
     for test in tests:
+        valid_names = []
         for filename in test.evidence_filenames:
             referenced.add(filename)
-            if not _is_safe_basename(filename): missing.setdefault(test.content_external_id, []).append(f"证据文件名必须是不含路径的安全文件名：{filename}")
-            elif Path(filename).suffix.lower() not in EVIDENCE_SUFFIXES: missing.setdefault(test.content_external_id, []).append(f"证据文件格式不支持：{filename}")
-            elif filename not in entries: missing.setdefault(test.content_external_id, []).append(f"证据文件不存在：{filename}")
-            elif entries[filename].file_size > MAX_EVIDENCE_BYTES: missing.setdefault(test.content_external_id, []).append(f"证据文件不能超过 100 MiB：{filename}")
-    warnings=[]
-    for name in sorted(set(entries) - referenced):
-        if PurePosixPath(name).suffix.lower() in EVIDENCE_SUFFIXES: warnings.append(f"ZIP 中证据文件未被引用：{name}")
-    by_content = {}
-    for test in tests: by_content.setdefault(test.content_external_id, []).append(test)
+            if not _is_safe_basename(filename):
+                errors.setdefault(test.content_external_id, []).append(f"证据文件名必须是不含路径的安全文件名：{filename}")
+            elif Path(filename).suffix.lower() not in EVIDENCE_SUFFIXES:
+                errors.setdefault(test.content_external_id, []).append(f"证据文件格式不支持：{filename}")
+            elif filename not in entries:
+                errors.setdefault(test.content_external_id, []).append(f"证据文件不存在：{filename}")
+            elif entries[filename].file_size > MAX_EVIDENCE_BYTES:
+                errors.setdefault(test.content_external_id, []).append(f"证据文件不能超过 100 MiB：{filename}")
+            else:
+                valid_names.append(filename)
+        if not valid_names:
+            errors.setdefault(test.content_external_id, []).append(
+                f"测试场景 {test.external_test_case_id or '<空>'} 缺少有效证据文件"
+            )
+    warnings = [
+        f"ZIP 中证据文件未被引用：{name}"
+        for name in sorted(set(entries) - referenced)
+        if PurePosixPath(name).suffix.lower() in EVIDENCE_SUFFIXES
+    ]
+    updated = []
     for row in rows:
+        owner = row.normalized.get("external_id") or ""
         text = " ".join(str(row.normalized.get(key) or "") for key in ("title", "body"))
+        triggered = any(term and term in text for term in trigger_terms)
+        bound = grouped.get(owner, [])
+        row_extra = list(errors.get(owner, []))
+        if triggered and bound and not all(
+            test.command and test.observed_result and any(_valid_evidence_filename(name, entries) for name in test.evidence_filenames)
+            for test in bound
+        ):
+            row_extra.append("该内容的每个测试场景都必须包含指令、实际结果和 ZIP 中存在的有效证据")
         match = re.search(r"(\d+)\s*[个项]?测试", text)
-        if match:
-            declared = int(match.group(1)); actual = len(by_content.get(row.normalized.get("external_id"), []))
-            if actual != declared:
-                missing.setdefault(row.normalized.get("external_id"), []).append(f"声明 {declared} 个测试，但结构化测试场景为 {actual} 个")
-    updated=[]
-    for row in rows: updated.append(_replace_row_errors(row, row.errors + missing.get(row.normalized.get("external_id"), [])))
+        if match and len(bound) != int(match.group(1)):
+            row_extra.append(f"声明 {int(match.group(1))} 个测试，但结构化测试场景为 {len(bound)} 个")
+        updated.append(_replace_row_errors(row, list(row.errors) + row_extra))
     return updated, warnings
 
 
@@ -619,48 +860,6 @@ def _extract_referenced_evidence(zip_path, entries, tests, evidence_dir):
                     written += len(chunk)
                     if written > MAX_EVIDENCE_BYTES: raise ValueError(f"证据文件不能超过 100 MiB：{name}")
                     output.write(chunk)
-
-def _read_rows(xlsx_path: Path) -> List[ImportRowPreview]:
-    try:
-        workbook = load_workbook(xlsx_path, read_only=True, data_only=False)
-    except Exception as exc:
-        raise ValueError("Excel 文件无法读取") from exc
-
-    try:
-        try:
-            worksheet = workbook.worksheets[0]
-            iterator = worksheet.iter_rows()
-            try:
-                header_cells = next(iterator)
-            except StopIteration as exc:
-                raise ValueError("Excel 表头不能为空") from exc
-            for cell in header_cells:
-                if cell.data_type == "f":
-                    raise ValueError(f"Excel 表头不允许公式：{cell.coordinate}")
-            headers = _validate_headers(tuple(cell.value for cell in header_cells))
-            indexes = {header: index for index, header in enumerate(headers)}
-
-            rows: List[ImportRowPreview] = []
-            for row_number, cells in enumerate(iterator, start=2):
-                values = tuple(cell.value for cell in cells)
-                if _is_blank_row(values):
-                    continue
-                if len(rows) >= MAX_IMPORT_ROWS:
-                    raise ValueError("Excel 最多允许 500 条内容")
-                formula_indexes = {
-                    index for index, cell in enumerate(cells) if cell.data_type == "f"
-                }
-                rows.append(
-                    _normalize_row(row_number, values, indexes, headers, formula_indexes)
-                )
-            return rows
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError("Excel 工作表解析失败") from exc
-    finally:
-        workbook.close()
-
 
 def _validate_headers(raw_headers: Tuple[Any, ...], required_columns=None) -> Tuple[str, ...]:
     headers: List[str] = []
@@ -913,6 +1112,9 @@ def _write_preview(path: Path, preview: ImportPreview, expires_at: datetime) -> 
     payload["version"] = PREVIEW_MANIFEST_VERSION
     payload["expires_at"] = expires_at.isoformat()
     payload["test_cases"] = [_test_to_dict(test) for test in (preview.test_cases or [])]
+    identity = preview.identity
+    for key in ("project_id", "project_code", "content_type", "package_version", "supplier_id", "batch_name"):
+        payload[key] = getattr(identity, key) if identity is not None else None
     _write_json_atomic(path, payload)
 
 
@@ -929,7 +1131,9 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _preview_to_dict(preview: ImportPreview) -> Dict[str, Any]:
-    return asdict(preview)
+    payload = asdict(preview)
+    payload.pop("identity", None)
+    return payload
 
 
 def _test_to_dict(test: TestCasePreview) -> Dict[str, Any]:
@@ -939,6 +1143,18 @@ def _test_from_dict(value: Any) -> TestCasePreview:
     if not isinstance(value, dict) or set(value) != {"content_external_id", "external_test_case_id", "claim", "command", "observed_result", "city", "tested_at", "app_version", "device", "operating_system", "network_environment", "evidence_filenames"} or not _is_string_list(value["evidence_filenames"]):
         raise ValueError("测试场景字段无效")
     return TestCasePreview(**value)
+
+def _preview_identity_from_dict(payload: Dict[str, Any]) -> Optional[PreviewIdentity]:
+    keys = ("project_id", "project_code", "content_type", "package_version", "supplier_id", "batch_name")
+    values = [payload[key] for key in keys]
+    if all(value is None for value in values):
+        return None
+    if type(payload["project_id"]) is not int or payload["project_id"] <= 0:
+        raise ValueError("预览项目身份无效")
+    if not all(isinstance(payload[key], str) and payload[key].strip() for key in keys[1:]):
+        raise ValueError("预览项目身份无效")
+    return PreviewIdentity(**{key: payload[key] for key in keys})
+
 
 def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime]:
     if not isinstance(payload, dict) or set(payload) != _PREVIEW_KEYS:
@@ -950,38 +1166,53 @@ def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime
     expires_at = _parse_manifest_expiry(payload["expires_at"])
     if not isinstance(payload["rows"], list) or len(payload["rows"]) > MAX_IMPORT_ROWS:
         raise ValueError("预览行数无效")
-    if not _is_string_list(payload["warnings"]):
-        raise ValueError("预览警告无效")
+    if not isinstance(payload["test_cases"], list) or len(payload["test_cases"]) > MAX_IMPORT_ROWS:
+        raise ValueError("预览测试场景数量无效")
+    if not _is_string_list(payload["warnings"]) or not _is_string_list(payload["errors"]):
+        raise ValueError("预览消息无效")
 
     rows = [_row_from_dict(row) for row in payload["rows"]]
+    tests = [_test_from_dict(item) for item in payload["test_cases"]]
     row_numbers = [row.row_number for row in rows]
     if row_numbers != sorted(set(row_numbers)):
         raise ValueError("预览行号无效")
+    content_ids = [row.normalized.get("external_id") for row in rows]
+    if any(not value for value in content_ids):
+        raise ValueError("预览内容编号无效")
+    duplicate_ids = {value for value in content_ids if content_ids.count(value) > 1}
+    for duplicate in duplicate_ids:
+        affected = [row for row in rows if row.normalized.get("external_id") == duplicate]
+        if any(row.valid or not any("重复" in error for error in row.errors) for row in affected):
+            raise ValueError("预览内容编号重复")
+    test_ids = [test.external_test_case_id for test in tests]
+    if any(not value for value in test_ids) or len(test_ids) != len(set(test_ids)):
+        raise ValueError("预览测试场景编号无效或重复")
+    if any(test.content_external_id not in set(content_ids) for test in tests):
+        raise ValueError("预览测试场景引用不存在内容")
+    for test in tests:
+        if any(not _is_safe_basename(name) or Path(name).suffix.lower() not in EVIDENCE_SUFFIXES for name in test.evidence_filenames):
+            raise ValueError("预览证据文件名无效")
+    grouped = _group_tests(tests)
+    for row in rows:
+        expected = [_test_to_dict(test) for test in grouped.get(row.normalized["external_id"], [])]
+        actual = [_test_to_dict(test) for test in row.tests]
+        if actual != expected:
+            raise ValueError("预览行测试场景绑定不匹配")
 
     valid_count = sum(row.valid for row in rows)
-    expected_counts = (len(rows), valid_count, len(rows) - valid_count)
-    stored_counts = (
-        payload["total_count"],
-        payload["valid_count"],
-        payload["error_count"],
-    )
+    expected_counts = (len(rows), valid_count, len(rows) - valid_count + len(payload["errors"]))
+    stored_counts = (payload["total_count"], payload["valid_count"], payload["error_count"])
     if any(type(value) is not int or value < 0 for value in stored_counts):
         raise ValueError("预览计数类型无效")
     if stored_counts != expected_counts:
         raise ValueError("预览计数不匹配")
 
-    return (
-        ImportPreview(
-            token=payload["token"],
-            rows=rows,
-            warnings=list(payload["warnings"]),
-            total_count=expected_counts[0],
-            valid_count=expected_counts[1],
-            error_count=expected_counts[2],
-            test_cases=[_test_from_dict(item) for item in payload["test_cases"]],
-        ),
-        expires_at,
-    )
+    return ImportPreview(
+        token=payload["token"], rows=rows, warnings=list(payload["warnings"]),
+        total_count=expected_counts[0], valid_count=expected_counts[1],
+        error_count=expected_counts[2], test_cases=tests,
+        errors=list(payload["errors"]), identity=_preview_identity_from_dict(payload),
+    ), expires_at
 
 
 def _row_from_dict(payload: Any) -> ImportRowPreview:
@@ -999,7 +1230,9 @@ def _row_from_dict(payload: Any) -> ImportRowPreview:
         raise ValueError("预览行消息无效")
     if type(payload["valid"]) is not bool or payload["valid"] != (not payload["errors"]):
         raise ValueError("预览行状态无效")
-    tests = None if payload["tests"] is None else [_test_from_dict(item) for item in payload["tests"]]
+    if not isinstance(payload["tests"], list):
+        raise ValueError("预览行测试场景无效")
+    tests = [_test_from_dict(item) for item in payload["tests"]]
     return ImportRowPreview(
         row_number=payload["row_number"],
         normalized=dict(normalized),

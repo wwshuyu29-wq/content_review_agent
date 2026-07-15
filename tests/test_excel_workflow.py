@@ -88,6 +88,7 @@ def make_session(tmp_path: Path) -> Session:
 def write_workbook(path: Path, rows: list[list[object]]) -> Path:
     workbook = Workbook()
     worksheet = workbook.active
+    worksheet.title = "内容清单"
     worksheet.append(list(IMPORT_COLUMNS))
     for row in rows:
         worksheet.append(row)
@@ -264,8 +265,8 @@ def test_confirm_import_keeps_committed_media_when_refresh_fails_after_commit(
             session,
             preview.token,
             project_id=project.id,
-            supplier_id="ignored",
-            batch_name="重复确认不应新建",
+            supplier_id="supplier-images",
+            batch_name="图片导入",
         )
 
         assert retry.id == committed.id
@@ -293,8 +294,8 @@ def test_confirm_import_is_idempotent_for_same_token_without_duplicate_content(t
             session,
             preview.token,
             project_id=project.id,
-            supplier_id="ignored",
-            batch_name="重复确认不应新建",
+            supplier_id="supplier-a",
+            batch_name="首次确认",
         )
 
         assert second.id == first_id
@@ -494,7 +495,7 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
         assert values["审核状态"] == "PASSED"
         assert values["发布状态"] == "READY"
         assert values["问题数量"] == 2
-        assert values["最高风险等级"] == "high"
+        assert values["最高风险等级"] == "HIGH"
         assert values["问题分类"] == "quality\nexternal"
         assert values["命中规则"] == "QUALITY-1\nRISK-1"
         assert values["问题原因"] == "原因一\n原因二"
@@ -614,3 +615,56 @@ def test_export_batch_raises_for_missing_batch(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         with pytest.raises(ValueError, match="Batch 999 does not exist"):
             export_batch(session, 999)
+
+
+
+def _named_shared_evidence_workbook(path: Path, filenames: list[str]) -> Path:
+    workbook = Workbook()
+    content = workbook.active
+    content.title = "内容清单"
+    content.append(list(excel_import_service.CONTENT_COLUMNS))
+    content.append(["content-1", "活动", "账号", "媒体", "小红书", "标题", "普通正文", None, None, None])
+    tests = workbook.create_sheet("测试场景")
+    tests.append(list(excel_import_service.TEST_CASE_COLUMNS))
+    for index, filename in enumerate(filenames, 1):
+        tests.append(["content-1", f"case-{index}", "通过", "指令", "结果", None, None, None, None, None, None, filename])
+    workbook.create_sheet("字段说明")
+    workbook.save(path)
+    return path
+
+
+def test_confirm_reuses_shared_evidence_asset_and_copies_once(tmp_path: Path) -> None:
+    xlsx = _named_shared_evidence_workbook(tmp_path / "shared.xlsx", ["proof.png", "proof.png"])
+    archive = write_zip(tmp_path / "shared.zip", [("proof.png", b"shared")])
+    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = confirm_import(session, preview.token, project.id, "supplier", "batch")
+        item = batch.content_items[0]
+        assert len(item.assets) == 1
+        assert len(item.test_cases) == 2
+        assert {binding.asset_id for test in item.test_cases for binding in test.evidence} == {item.assets[0].id}
+        assert len(list((tmp_path / "data" / "uploads").iterdir())) == 1
+
+
+@pytest.mark.parametrize(
+    ("filename", "kind", "mime"),
+    [("proof.gif", "SCREENSHOT", "image/gif"), ("proof.webm", "SCREEN_RECORDING", "video/webm"), ("proof.json", "TEST_LOG", "application/json")],
+)
+def test_confirm_maps_evidence_asset_kind_and_mime(tmp_path: Path, filename: str, kind: str, mime: str) -> None:
+    xlsx = _named_shared_evidence_workbook(tmp_path / f"{kind}.xlsx", [filename])
+    archive = write_zip(tmp_path / f"{kind}.zip", [(filename, b"evidence")])
+    preview = preview_import(xlsx, archive, tmp_path / f"previews-{kind}")
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = confirm_import(session, preview.token, project.id, "supplier", kind)
+        asset = batch.content_items[0].assets[0]
+        assert asset.kind.value == kind
+        assert asset.mime_type == mime
+
+
+def test_shared_severity_helper_ranks_critical_and_unknown_safely() -> None:
+    module = importlib.import_module("server.services.severity_service")
+    assert module.highest_severity(["LOW", "CRITICAL"]) == "CRITICAL"
+    assert module.highest_severity(["MEDIUM", "HIGH"]) == "HIGH"
+    assert module.severity_rank("UNKNOWN") == module.severity_rank("HIGH")

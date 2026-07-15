@@ -335,20 +335,102 @@ class TestEvidenceCreate(BaseModel):
 
 
 class ImportConfirm(BaseModel):
-    project_id: int
+    project_id: int = Field(gt=0)
     supplier_id: str = Field(min_length=1, max_length=200)
     batch_name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("supplier_id", "batch_name")
+    @classmethod
+    def strip_import_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("import identity cannot be blank")
+        return value
+
+
+class ImportTestPreviewRead(BaseModel):
+    content_external_id: str
+    external_test_case_id: str
+    claim: Optional[str]
+    command: Optional[str]
+    observed_result: Optional[str]
+    city: Optional[str]
+    tested_at: Optional[str]
+    app_version: Optional[str]
+    device: Optional[str]
+    operating_system: Optional[str]
+    network_environment: Optional[str]
+    evidence_filenames: List[str] = Field(default_factory=list)
+
+
+class ImportRowPreviewRead(BaseModel):
+    row_number: int
+    normalized: Dict[str, Any]
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    valid: bool
+    tests: List[ImportTestPreviewRead] = Field(default_factory=list)
 
 
 class ImportPreviewRead(BaseModel):
     token: str
-    rows: List[Dict[str, Any]]
-    tests: List[Dict[str, Any]] = Field(default_factory=list)
+    rows: List[ImportRowPreviewRead]
+    tests: List[ImportTestPreviewRead] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     total_count: int
     valid_count: int
     error_count: int
     test_count: int
     project_id: int
+    project_code: str
+    content_type: str
+    package_version: str
     supplier_id: str
     batch_name: str
+
+
+class ContentTableAgent(BaseModel):
+    agent_id: str
+    agent_name: str
+    agent_version: Optional[str] = None
+    decision: Optional[str] = None
+    summary: Optional[str] = None
+    score: Optional[int] = None
+    status: str
+
+
+class ContentTableRow(BaseModel):
+    id: int
+    project_id: int
+    batch_id: int
+    supplier_external_id: str
+    campaign_theme: Optional[str]
+    account_name: Optional[str]
+    account_type: Optional[str]
+    platform: Optional[str]
+    original_title: str
+    original_body: str
+    final_title: str
+    final_body: str
+    body_summary: str
+    image_filename: Optional[str]
+    publish_time: Optional[str]
+    note: Optional[str]
+    row_number: Optional[int]
+    format_status: FormatStatus
+    review_status: ReviewStatus
+    publish_status: PublishStatus
+    issues: List[IssueRead] = Field(default_factory=list)
+    issue_count: int
+    highest_severity: Optional[str]
+    categories: List[str] = Field(default_factory=list)
+    suggestions: List[str] = Field(default_factory=list)
+    open_task_count: int
+    open_task_types: List[str] = Field(default_factory=list)
+    latest_audit_id: Optional[int]
+    agents: List[ContentTableAgent] = Field(default_factory=list)
+    media_url: Optional[str]
+    test_count: int
+    evidence_count: int
+    evidence_status: str

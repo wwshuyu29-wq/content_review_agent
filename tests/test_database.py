@@ -202,6 +202,7 @@ def test_schema_upgrade_adds_import_token_to_legacy_batches_and_confirm_import_w
     excel_import_service._preview_locations.clear()
     workbook = Workbook()
     worksheet = workbook.active
+    worksheet.title = "内容清单"
     worksheet.append(list(IMPORT_COLUMNS))
     worksheet.append(["legacy-row", "活动主题", "小红书", "标题", "正文", None, "2026-08-01", "备注"])
     xlsx = tmp_path / "legacy-import.xlsx"

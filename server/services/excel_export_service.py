@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from server.models import AuditRun, Batch, ContentItem, ContentVersion, Issue, ReviewTask, TestCase, TestEvidence
 from server.services.excel_import_service import IMPORT_COLUMNS
+from server.services.severity_service import highest_severity
 
 EXPORT_COLUMNS = (
     "系统内容编号",
@@ -43,15 +44,7 @@ EXPORT_COLUMNS = (
     "传播效果 Agent 决策", "传播效果 Agent 分数", "传播效果 Agent 摘要",
 )
 
-_SEVERITY_RANK = {
-    "none": 0,
-    "low": 1,
-    "mid": 2,
-    "medium": 2,
-    "unknown": 3,
-    "high": 4,
-}
-_MANUAL_SEVERITIES = {"mid", "medium", "high", "unknown"}
+_MANUAL_SEVERITIES = {"mid", "medium", "high", "unknown", "critical"}
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 _LONG_TEXT_COLUMNS = {
     "正文",
@@ -144,7 +137,7 @@ def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
         latest_audit.model if latest_audit is not None else "",
         latest_audit.rule_version.version if latest_audit is not None and latest_audit.rule_version is not None else "",
         _excel_datetime(latest_audit.completed_at if latest_audit is not None else None),
-        len(item.test_cases), sum(len(test.evidence) for test in item.test_cases),
+        len(item.test_cases), len({binding.asset_id for test in item.test_cases for binding in test.evidence}),
         "PRESENT" if item.test_cases and all(test.evidence for test in item.test_cases) else ("MISSING" if item.test_cases else "NONE"),
         "\n".join(f"{test.external_test_case_id}: {test.observed_result}" for test in item.test_cases),
         *sum(([result.decision or "", result.score, result.summary or ""] for result in _agent_results(latest_audit)), []),
@@ -208,9 +201,7 @@ def _join_issue_field(issues: list[Issue], field: str) -> str:
 
 
 def _highest_severity(issues: list[Issue]) -> str:
-    if not issues:
-        return ""
-    return max(issues, key=lambda issue: _SEVERITY_RANK.get(issue.severity.lower(), 0)).severity
+    return highest_severity((issue.severity for issue in issues), empty="") or ""
 
 
 def _needs_human(issues: list[Issue], tasks: list[ReviewTask]) -> bool:

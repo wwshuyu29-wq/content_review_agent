@@ -34,6 +34,7 @@ def write_workbook(
 ) -> Path:
     workbook = Workbook()
     worksheet = workbook.active
+    worksheet.title = "内容清单"
     worksheet.append(list(headers))
     for row in rows:
         worksheet.append(row)
@@ -551,8 +552,129 @@ def test_lazy_workbook_iteration_error_is_wrapped_and_preview_is_cleaned_up(
 ) -> None:
     monkeypatch.setattr(excel_import_service, "load_workbook", lambda *args, **kwargs: _LazyWorkbook())
     temp_root = tmp_path / "imports"
+    xlsx = tmp_path / "lazy.xlsx"
+    xlsx.write_bytes(build_import_template())
 
     with pytest.raises(ValueError, match="Excel.*解析"):
-        preview_import(tmp_path / "lazy.xlsx", None, temp_root)
+        preview_import(xlsx, None, temp_root)
 
     assert list(temp_root.iterdir()) == []
+
+
+
+def write_named_workbook(path: Path, content_rows: list[list[object]], test_rows: list[list[object]] | None = None) -> Path:
+    workbook = Workbook()
+    content = workbook.active
+    content.title = "内容清单"
+    content.append(list(excel_import_service.CONTENT_COLUMNS))
+    for row in content_rows:
+        content.append(row)
+    if test_rows is not None:
+        tests = workbook.create_sheet("测试场景")
+        tests.append(list(excel_import_service.TEST_CASE_COLUMNS))
+        for row in test_rows:
+            tests.append(row)
+    workbook.create_sheet("字段说明")
+    workbook.save(path)
+    return path
+
+
+def tech_row(external_id: str, body: str = "普通正文") -> list[object]:
+    return [external_id, "活动", "账号", "媒体", "小红书", "标题", body, None, None, None]
+
+
+def test_trigger_evidence_is_validated_per_content_not_globally(tmp_path: Path) -> None:
+    xlsx = write_named_workbook(
+        tmp_path / "per-content.xlsx",
+        [tech_row("triggered", "这是亲测内容"), tech_row("other")],
+        [["other", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, "other.png"]],
+    )
+    archive = write_zip(tmp_path / "evidence.zip", [("other.png", b"png")])
+
+    preview = preview_import(xlsx, archive, tmp_path / "previews")
+
+    assert preview.rows[0].valid is False
+    assert any("证据" in error or "测试场景" in error for error in preview.rows[0].errors)
+    assert preview.rows[1].valid is True
+
+
+def test_orphan_test_row_is_global_preview_error(tmp_path: Path) -> None:
+    xlsx = write_named_workbook(
+        tmp_path / "orphan.xlsx",
+        [tech_row("content-1")],
+        [["missing", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, "proof.png"]],
+    )
+    archive = write_zip(tmp_path / "proof.zip", [("proof.png", b"png")])
+
+    preview = preview_import(xlsx, archive, tmp_path / "previews")
+
+    assert preview.error_count > 0
+    assert any("不存在" in error for error in preview.errors)
+
+
+def test_preview_requires_named_content_sheet(tmp_path: Path) -> None:
+    xlsx = tmp_path / "legacy.xlsx"
+    workbook = Workbook()
+    workbook.active.append(list(IMPORT_COLUMNS))
+    workbook.active.append(valid_row())
+    workbook.save(xlsx)
+    with pytest.raises(ValueError, match="内容清单"):
+        preview_import(xlsx, None, tmp_path / "previews")
+
+
+def test_malformed_xlsx_and_arbitrary_zip_have_stable_errors(tmp_path: Path) -> None:
+    malformed = tmp_path / "malformed.xlsx"
+    malformed.write_bytes(b"not an xlsx")
+    with pytest.raises(ValueError, match="Excel|XLSX"):
+        preview_import(malformed, None, tmp_path / "malformed-previews")
+
+    arbitrary = tmp_path / "arbitrary.xlsx"
+    write_zip(arbitrary, [("random.txt", b"not OOXML")])
+    with pytest.raises(ValueError, match="Excel|XLSX"):
+        preview_import(arbitrary, None, tmp_path / "arbitrary-previews")
+
+
+
+def test_manifest_rejects_orphan_and_row_test_binding_tampering(tmp_path: Path) -> None:
+    xlsx = write_named_workbook(
+        tmp_path / "manifest.xlsx", [tech_row("content-1")],
+        [["content-1", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, "proof.png"]],
+    )
+    archive = write_zip(tmp_path / "proof.zip", [("proof.png", b"png")])
+    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    manifest = _preview_manifest(tmp_path / "previews", preview.token)
+    original = json.loads(manifest.read_text(encoding="utf-8"))
+
+    orphan = json.loads(json.dumps(original))
+    orphan["test_cases"][0]["content_external_id"] = "missing"
+    manifest.write_text(json.dumps(orphan, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="预览数据无效"):
+        load_preview(preview.token)
+
+    manifest.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+    mismatch = json.loads(json.dumps(original))
+    mismatch["rows"][0]["tests"] = []
+    manifest.write_text(json.dumps(mismatch, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="预览数据无效"):
+        load_preview(preview.token)
+
+
+def test_preview_identity_round_trips_and_is_strict(tmp_path: Path) -> None:
+    identity_type = getattr(excel_import_service, "PreviewIdentity", None)
+    assert identity_type is not None, "PreviewIdentity is missing"
+    identity = identity_type(
+        project_id=1, project_code="tech", content_type="TECH_MEDIA_REVIEW",
+        package_version="0.9", supplier_id="supplier", batch_name="batch",
+    )
+    xlsx = write_named_workbook(tmp_path / "identity.xlsx", [tech_row("content-1")], [])
+    preview = preview_import(xlsx, None, tmp_path / "previews", identity=identity)
+    loaded = load_preview(preview.token)
+    assert loaded.identity == identity
+
+
+def test_xlsx_uncompressed_expansion_limit_is_enforced(tmp_path: Path, monkeypatch) -> None:
+    xlsx = tmp_path / "large.xlsx"
+    xlsx.write_bytes(build_import_template())
+    monkeypatch.setattr(excel_import_service, "MAX_XLSX_UNCOMPRESSED_BYTES", 1)
+    with pytest.raises(ValueError, match="XLSX.*安全限制"):
+        preview_import(xlsx, None, tmp_path / "previews")

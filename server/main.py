@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -24,6 +25,11 @@ from server.db import Base, ensure_schema_upgrades, get_db_engine, get_session
 from server.models import (
     AgentResult,
     AuditRun,
+    FormatStatus,
+    PublishStatus,
+    ReviewStatus,
+    TestCase,
+    TestEvidence,
     Batch,
     ContentItem,
     ContentVersion,
@@ -36,6 +42,10 @@ from server.models import (
 from server.schemas import (
     AgentResultRead,
     AuditRunRead,
+    ContentTableAgent,
+    ContentTableRow,
+    ImportConfirm,
+    ImportPreviewRead,
     BatchRead,
     ContentItemRead,
     ContentVersionRead,
@@ -48,11 +58,12 @@ from server.schemas import (
 )
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
-from server.services.excel_import_service import build_import_template, preview_import, confirm_import as confirm_excel_import
+from server.services.excel_import_service import PreviewIdentity, build_import_template, preview_import, confirm_import as confirm_excel_import
 from server.services.excel_export_service import export_batch
 from server.services.report_service import build_report
 from server.services.review_service import resolve_task, run_audit
 from server.services.standard_package_service import load_standard_package, publish_standard_package
+from server.services.severity_service import highest_severity
 
 
 REPO_DIR = Path(__file__).resolve().parents[1]
@@ -63,6 +74,9 @@ ALLOWED_IMAGE_TYPES = {
     ".webp": {"image/webp"},
 }
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_EXCEL_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_EVIDENCE_ZIP_UPLOAD_BYTES = 200 * 1024 * 1024
+AGENT_ORDER = ("COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS")
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 DEFAULT_CONFIG = {"reviewer": "heuristic", "model": ""}
 SUPPORTED_REVIEWERS = {"heuristic", "oneapi", "ernie"}
@@ -263,6 +277,7 @@ def _content_query():
         selectinload(ContentItem.review_tasks),
         selectinload(ContentItem.audit_runs).selectinload(AuditRun.agent_results),
         selectinload(ContentItem.audit_runs).selectinload(AuditRun.issues),
+        selectinload(ContentItem.test_cases).selectinload(TestCase.evidence).selectinload(TestEvidence.asset),
     )
 
 
@@ -400,7 +415,11 @@ async def _save_uploads(rows: List[Dict[str, Any]], files: Optional[List[UploadF
 
 @app.get("/api/import-template")
 def download_import_template():
-    return Response(build_import_template(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=tech-media-import-template.xlsx"})
+    return Response(
+        build_import_template(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=tech-media-import-template.xlsx"},
+    )
 
 
 async def _save_excel_upload(upload: UploadFile, directory: Path, allowed: set[str], limit: int) -> Path:
@@ -412,7 +431,10 @@ async def _save_excel_upload(upload: UploadFile, directory: Path, allowed: set[s
     size = 0
     try:
         with path.open("xb") as stream:
-            while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
                 size += len(chunk)
                 if size > limit:
                     raise HTTPException(status_code=413, detail="Upload exceeds size limit")
@@ -423,50 +445,108 @@ async def _save_excel_upload(upload: UploadFile, directory: Path, allowed: set[s
     return path
 
 
-@app.post("/api/imports/preview")
+def _evidence_trigger_terms(project: Project) -> tuple[str, ...]:
+    structured = project.current_rule_version.structured_rules if project.current_rule_version else {}
+    evidence = structured.get("evidence_requirements", {}).get("evidence_requirements", [])
+    configured = tuple(
+        term.strip() for requirement in evidence
+        for term in requirement.get("trigger_terms", [])
+        if isinstance(term, str) and term.strip()
+    )
+    if configured:
+        return configured
+    for rule in structured.get("rules", []):
+        if rule.get("matcher") == "evidence_required":
+            terms = tuple(term.strip() for term in rule.get("trigger_terms", []) if isinstance(term, str) and term.strip())
+            if terms:
+                return terms
+    return ("亲测", "实测", "自用")
+
+
+def _validated_tech_project(session: Session, project_id: int) -> Project:
+    project = session.get(Project, project_id)
+    if project is None:
+        raise _not_found("Project", project_id)
+    if project.content_type != "TECH_MEDIA_REVIEW":
+        raise HTTPException(status_code=422, detail="Project content_type must be TECH_MEDIA_REVIEW")
+    rule = project.current_rule_version
+    if (
+        rule is None or rule.project_id != project.id
+        or rule.project_code != project.code
+        or rule.content_type != project.content_type
+        or not rule.package_version or not rule.package_digest
+    ):
+        raise HTTPException(status_code=422, detail="Project has no valid current rule snapshot")
+    return project
+
+
+@app.post("/api/imports/preview", response_model=ImportPreviewRead)
 async def preview_excel_import(
     project_id: int = Form(...), supplier_id: str = Form(...), batch_name: str = Form(...),
     excel_file: UploadFile = File(...), evidence_zip: Optional[UploadFile] = File(None),
     session: Session = Depends(get_session),
 ):
-    if session.get(Project, project_id) is None:
-        raise _not_found("Project", project_id)
-    if not supplier_id.strip() or not batch_name.strip():
+    project = _validated_tech_project(session, project_id)
+    supplier_id = supplier_id.strip()
+    batch_name = batch_name.strip()
+    if not supplier_id or not batch_name:
         raise HTTPException(status_code=422, detail="supplier_id and batch_name are required")
-    root = _data_dir() / "import-previews"; temp = root / uuid.uuid4().hex
-    xlsx = zip_path = None
+    identity = PreviewIdentity(
+        project_id=project.id, project_code=project.code, content_type=project.content_type,
+        package_version=project.current_rule_version.package_version,
+        supplier_id=supplier_id, batch_name=batch_name,
+    )
+    root = _data_dir() / "import-previews"
+    temp = root / f"upload-{uuid.uuid4().hex}"
     try:
-        xlsx = await _save_excel_upload(excel_file, temp, {".xlsx"}, MAX_UPLOAD_BYTES)
+        xlsx = await _save_excel_upload(excel_file, temp, {".xlsx"}, MAX_EXCEL_UPLOAD_BYTES)
+        zip_path = None
         if evidence_zip is not None:
-            zip_path = await _save_excel_upload(evidence_zip, temp, {".zip"}, 200 * 1024 * 1024)
-        result = preview_import(xlsx, zip_path, root)
-        return {"token": result.token, "rows": [row.__dict__ for row in result.rows], "tests": [test.__dict__ for test in (result.test_cases or [])], "warnings": result.warnings, "total_count": result.total_count, "valid_count": result.valid_count, "error_count": result.error_count, "test_count": result.test_count, "project_id": project_id, "supplier_id": supplier_id, "batch_name": batch_name}
+            zip_path = await _save_excel_upload(evidence_zip, temp, {".zip"}, MAX_EVIDENCE_ZIP_UPLOAD_BYTES)
+        result = preview_import(
+            xlsx, zip_path, root, identity=identity,
+            trigger_terms=_evidence_trigger_terms(project),
+        )
+        return ImportPreviewRead(
+            token=result.token,
+            rows=[{**row.__dict__, "tests": [test.__dict__ for test in row.tests]} for row in result.rows],
+            tests=[test.__dict__ for test in result.test_cases], errors=result.errors,
+            warnings=result.warnings, total_count=result.total_count,
+            valid_count=result.valid_count, error_count=result.error_count,
+            test_count=result.test_count, **identity.__dict__,
+        )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     finally:
-        if temp.exists():
-            import shutil
-            shutil.rmtree(temp, ignore_errors=True)
+        shutil.rmtree(temp, ignore_errors=True)
 
 
 @app.post("/api/imports/{token}/confirm", response_model=BatchDetail)
-def confirm_excel_import_endpoint(token: str, payload: Dict[str, Any], session: Session = Depends(get_session)):
-    project_id = payload.get("project_id"); supplier_id = payload.get("supplier_id"); batch_name = payload.get("batch_name")
-    if not isinstance(project_id, int) or not isinstance(supplier_id, str) or not isinstance(batch_name, str):
-        raise HTTPException(status_code=422, detail="Invalid confirmation payload")
-    if session.get(Project, project_id) is None: raise _not_found("Project", project_id)
+def confirm_excel_import_endpoint(token: str, payload: ImportConfirm, session: Session = Depends(get_session)):
+    _validated_tech_project(session, payload.project_id)
     try:
-        batch = confirm_excel_import(session, token, project_id, supplier_id, batch_name)
-        return BatchDetail(**BatchRead.model_validate(batch).model_dump(), content_count=len(batch.content_items), contents=[_content_summary(item) for item in batch.content_items])
+        batch = confirm_excel_import(
+            session, token, payload.project_id, payload.supplier_id, payload.batch_name
+        )
+        return BatchDetail(
+            **BatchRead.model_validate(batch).model_dump(), content_count=len(batch.content_items),
+            contents=[_content_summary(item) for item in batch.content_items],
+        )
     except ValueError as error:
-        session.rollback(); raise HTTPException(status_code=422, detail=str(error)) from error
+        session.rollback()
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.get("/api/batches/{batch_id}/export")
 def export_excel_batch(batch_id: int, session: Session = Depends(get_session)):
-    try: data = export_batch(session, batch_id)
-    except ValueError: raise _not_found("Batch", batch_id)
-    return Response(data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=batch-{batch_id}.xlsx"})
+    try:
+        data = export_batch(session, batch_id)
+    except ValueError as error:
+        raise _not_found("Batch", batch_id) from error
+    return Response(
+        data, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=batch-{batch_id}.xlsx"},
+    )
 
 @app.get("/api/batches", response_model=List[BatchRead])
 def list_batches(
@@ -522,20 +602,72 @@ async def create_batch(
 
 
 
-@app.get("/api/contents/table")
-def contents_table(project_id: Optional[int] = None, batch_id: Optional[int] = None, format_status: Optional[str] = None, review_status: Optional[str] = None, publish_status: Optional[str] = None, session: Session = Depends(get_session)):
+@app.get("/api/contents/table", response_model=List[ContentTableRow])
+def contents_table(
+    project_id: Optional[int] = None,
+    batch_id: Optional[int] = None,
+    format_status: Optional[FormatStatus] = None,
+    review_status: Optional[ReviewStatus] = None,
+    publish_status: Optional[PublishStatus] = None,
+    session: Session = Depends(get_session),
+):
     query = _content_query().order_by(ContentItem.id.desc())
-    if project_id is not None: query = query.where(ContentItem.project_id == project_id)
-    if batch_id is not None: query = query.where(ContentItem.batch_id == batch_id)
-    if format_status is not None: query = query.where(ContentItem.format_status == format_status)
-    if review_status is not None: query = query.where(ContentItem.review_status == review_status)
-    if publish_status is not None: query = query.where(ContentItem.publish_status == publish_status)
-    result=[]
+    if project_id is not None:
+        query = query.where(ContentItem.project_id == project_id)
+    if batch_id is not None:
+        query = query.where(ContentItem.batch_id == batch_id)
+    if format_status is not None:
+        query = query.where(ContentItem.format_status == format_status)
+    if review_status is not None:
+        query = query.where(ContentItem.review_status == review_status)
+    if publish_status is not None:
+        query = query.where(ContentItem.publish_status == publish_status)
+    rows = []
     for item in session.scalars(query):
-        latest = max(item.versions, key=lambda v: v.version) if item.versions else None
-        tests = getattr(item, "test_cases", [])
-        result.append({"id": item.id, "project_id": item.project_id, "batch_id": item.batch_id, "external_id": item.external_id, "format_status": item.format_status, "review_status": item.review_status, "publish_status": item.publish_status, "title": latest.title if latest else item.title, "body": latest.body if latest else "", "media_url": f"/api/media/{item.id}", "test_count": len(tests), "evidence_count": sum(len(test.evidence) for test in tests), "evidence_status": "PRESENT" if tests and all(test.evidence for test in tests) else ("MISSING" if tests else "NONE"), "open_task_count": sum(task.status == "OPEN" for task in item.review_tasks), "issue_count": len(latest_audit.issues) if (latest_audit := (max(item.audit_runs, key=lambda a: a.id) if item.audit_runs else None)) else 0, "highest_severity": max((issue.severity for issue in latest_audit.issues), default=None) if latest_audit else None, "issue_categories": sorted({issue.category for issue in latest_audit.issues}) if latest_audit else [], "suggestions": [issue.suggestion for issue in latest_audit.issues] if latest_audit else [], "latest_agents": [AgentResultRead.model_validate(result).model_dump() for result in latest_audit.agent_results] if latest_audit else []})
-    return result
+        supplier = min(item.versions, key=lambda version: version.version)
+        latest = max(item.versions, key=lambda version: version.version)
+        payload = dict(supplier.payload or {})
+        latest_payload = dict(latest.payload or {})
+        audit = max(item.audit_runs, key=lambda value: value.id or 0) if item.audit_runs else None
+        issues = list(audit.issues) if audit else []
+        open_tasks = [task for task in item.review_tasks if task.status == "OPEN"]
+        agent_map = {result.agent_id or result.agent_name: result for result in (audit.agent_results if audit else [])}
+        agents = []
+        for agent_id in AGENT_ORDER:
+            result = agent_map.get(agent_id)
+            agents.append(ContentTableAgent(
+                agent_id=agent_id, agent_name=result.agent_name if result else agent_id,
+                agent_version=result.agent_version if result else None,
+                decision=result.decision if result else None,
+                summary=result.summary if result else None,
+                score=result.score if result else None,
+                status=result.status if result else "NOT_RUN",
+            ))
+        media = latest_payload.get("media", payload.get("media"))
+        evidence_count = len({binding.asset_id for test in item.test_cases for binding in test.evidence})
+        rows.append(ContentTableRow(
+            id=item.id, project_id=item.project_id, batch_id=item.batch_id,
+            supplier_external_id=payload.get("supplier_external_id") or item.external_id,
+            campaign_theme=payload.get("campaign_theme"), account_name=payload.get("account_name"),
+            account_type=payload.get("account_type"), platform=payload.get("platform"),
+            original_title=supplier.title, original_body=supplier.body,
+            final_title=latest.title, final_body=latest.body,
+            body_summary=latest.body[:200], image_filename=payload.get("image_filename"),
+            publish_time=payload.get("publish_time"), note=payload.get("note"),
+            row_number=payload.get("row_number"), format_status=item.format_status,
+            review_status=item.review_status, publish_status=item.publish_status,
+            issues=[IssueRead.model_validate(issue) for issue in issues], issue_count=len(issues),
+            highest_severity=highest_severity((issue.severity for issue in issues)),
+            categories=sorted({issue.category for issue in issues}),
+            suggestions=[issue.suggestion for issue in issues],
+            open_task_count=len(open_tasks), open_task_types=sorted({task.task_type for task in open_tasks}),
+            latest_audit_id=audit.id if audit else None,
+            agents=agents,
+            media_url=f"/api/media/{item.id}" if media else None,
+            test_count=len(item.test_cases), evidence_count=evidence_count,
+            evidence_status="PRESENT" if item.test_cases and all(test.evidence for test in item.test_cases) else ("MISSING" if item.test_cases else "NONE"),
+        ))
+    return rows
 
 @app.get("/api/contents", response_model=List[ContentSummary])
 def list_contents(
