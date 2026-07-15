@@ -21,9 +21,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from server.models import AssetKind, Batch, FormatStatus, Project
+from server.models import Asset, AssetKind, Batch, FormatStatus, Project
 from server.services.content_service import MAX_BODY_LENGTH, MAX_TITLE_LENGTH, submit_batch
 from server.services.evidence_service import attach_evidence, create_asset, create_test_case
+from server.services.image_evidence_service import analyze_image_evidence, unavailable_image_analysis
 
 
 IMPORT_COLUMNS = (
@@ -37,6 +38,7 @@ IMPORT_COLUMNS = (
     "备注",
 )
 CONTENT_COLUMNS = ("供应商内容编号", "活动主题", "账号名称", "账号类型", "平台", "标题", "正文", "图片文件名", "计划发布时间", "备注")
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
 TEST_CASE_COLUMNS = ("供应商内容编号", "测试场景编号", "测试结论", "测试指令", "实际返回结果", "测试城市", "测试时间", "百度地图版本", "设备", "操作系统", "网络环境", "证据文件名")
 REQUIRED_CONTENT_COLUMNS = CONTENT_COLUMNS[:7]
 EVIDENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".webm", ".txt", ".log", ".json"})
@@ -58,6 +60,7 @@ PREVIEW_MANIFEST_VERSION = 3
 PREVIEW_ROOT_REGISTRY_ENV = "CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY"
 DEFAULT_PREVIEW_ROOT_REGISTRY = Path(__file__).resolve().parents[2] / "data" / "preview-roots.json"
 ALLOWED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+ALLOWED_MEDIA_SUFFIXES = ALLOWED_IMAGE_SUFFIXES | frozenset({".mp4", ".mov", ".webm"})
 _COLUMN_KEYS = {
     "供应商内容编号": "external_id",
     "活动主题": "campaign_theme",
@@ -69,6 +72,12 @@ _COLUMN_KEYS = {
     "备注": "note",
     "账号名称": "account_name",
     "账号类型": "account_type",
+    "内容": "body",
+    "类型": "account_type",
+    "目标平台": "platform",
+    "作者": "account_name",
+    "发布日期": "publish_time",
+    "图片/视频": "image_filename",
 }
 _TEST_COLUMN_KEYS = {"供应商内容编号": "供应商内容编号", "测试场景编号": "测试场景编号", "测试结论": "测试结论", "测试指令": "测试指令", "实际返回结果": "实际返回结果", "测试城市": "测试城市", "测试时间": "测试时间", "百度地图版本": "百度地图版本", "设备": "设备", "操作系统": "操作系统", "网络环境": "网络环境", "证据文件名": "证据文件名"}
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
@@ -89,7 +98,7 @@ _PREVIEW_KEYS = frozenset(
         "supplier_id", "batch_name",
     }
 )
-_ROW_KEYS = frozenset({"row_number", "normalized", "errors", "warnings", "valid", "tests"})
+_ROW_KEYS = frozenset({"manuscript_index", "row_number", "normalized", "errors", "warnings", "valid", "tests"})
 _NORMALIZED_KEYS = frozenset(_COLUMN_KEYS.values())
 
 
@@ -120,6 +129,7 @@ class TestCasePreview:
 
 @dataclass(frozen=True)
 class ImportRowPreview:
+    manuscript_index: int
     row_number: int
     normalized: Dict[str, Any]
     errors: List[str]
@@ -160,7 +170,7 @@ def build_import_template() -> bytes:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "内容清单"
-    worksheet.append(list(CONTENT_COLUMNS))
+    worksheet.append(list(NEW_CONTENT_COLUMNS))
     workbook.create_sheet("测试场景").append(list(TEST_CASE_COLUMNS))
     workbook.create_sheet("字段说明").append(["本表仅用于说明字段，导入时忽略"])
     output = BytesIO()
@@ -268,6 +278,8 @@ def confirm_import(
     project_id: int,
     supplier_id: str,
     batch_name: str,
+    *,
+    image_llm: Any = None,
 ) -> Batch:
     if not isinstance(token, str) or not _TOKEN_PATTERN.fullmatch(token):
         raise ValueError("无效的导入 token")
@@ -395,6 +407,7 @@ def _payload_for_row(token: str, row: ImportRowPreview) -> Dict[str, Any]:
         "image_filename": normalized.get("image_filename"),
         "publish_time": normalized.get("publish_time"),
         "note": normalized.get("note"),
+        "manuscript_index": row.manuscript_index,
         "row_number": row.row_number,
         "preview_errors": list(row.errors),
         "preview_warnings": list(row.warnings),
@@ -681,9 +694,7 @@ def _read_workbook(xlsx_path: Path) -> Tuple[List[ImportRowPreview], List[TestCa
         workbook = load_workbook(xlsx_path, read_only=True, data_only=False)
         if "内容清单" not in workbook.sheetnames:
             raise ValueError("Excel 缺少命名工作表：内容清单")
-        rows = _read_sheet_rows(
-            workbook["内容清单"], list(REQUIRED_COLUMNS), named=True
-        )
+        rows = _read_sheet_rows(workbook["内容清单"])
         tests: List[TestCasePreview] = []
         if "测试场景" in workbook.sheetnames:
             sheet = workbook["测试场景"]
@@ -723,16 +734,23 @@ def _read_workbook(xlsx_path: Path) -> Tuple[List[ImportRowPreview], List[TestCa
             workbook.close()
 
 
-def _read_sheet_rows(sheet, required: List[str], named: bool) -> List[ImportRowPreview]:
+def _read_sheet_rows(sheet) -> List[ImportRowPreview]:
     iterator = sheet.iter_rows()
     header_cells = next(iterator, None)
     if header_cells is None:
         raise ValueError("Excel 表头不能为空")
     if any(cell.data_type == "f" for cell in header_cells):
         raise ValueError("Excel 表头不允许公式")
-    headers = _validate_headers(tuple(cell.value for cell in header_cells), required)
+    headers = _validate_headers(tuple(cell.value for cell in header_cells), ())
+    if headers == NEW_CONTENT_COLUMNS:
+        format_name = "new"
+    elif any(column in headers for column in NEW_CONTENT_COLUMNS[1:]):
+        raise ValueError("Excel 新模板表头必须严格匹配：" + "、".join(NEW_CONTENT_COLUMNS))
+    else:
+        required = REQUIRED_CONTENT_COLUMNS if all(column in headers for column in ("账号名称", "账号类型")) else REQUIRED_COLUMNS
+        _validate_headers(headers, required)
+        format_name = "named_legacy" if required == REQUIRED_CONTENT_COLUMNS else "legacy"
     indexes = {header: index for index, header in enumerate(headers)}
-    use_new_columns = named and all(column in headers for column in ("账号名称", "账号类型"))
     rows = []
     for row_number, cells in enumerate(iterator, 2):
         values = tuple(cell.value for cell in cells)
@@ -741,7 +759,7 @@ def _read_sheet_rows(sheet, required: List[str], named: bool) -> List[ImportRowP
         if len(rows) >= MAX_IMPORT_ROWS:
             raise ValueError("Excel 最多允许 500 条内容")
         formulas = {index for index, cell in enumerate(cells) if cell.data_type == "f"}
-        rows.append(_normalize_row(row_number, values, indexes, headers, formulas, named=use_new_columns))
+        rows.append(_normalize_row(len(rows) + 1, row_number, values, indexes, headers, formulas, format_name=format_name))
     return rows
 
 
@@ -781,12 +799,8 @@ def _validate_test_cases(rows, tests, trigger_terms):
     for row in rows:
         owner = row.normalized.get("external_id") or ""
         bound = grouped.get(owner, [])
-        text = " ".join(str(row.normalized.get(key) or "") for key in ("title", "body"))
-        triggered = any(term and term in text for term in trigger_terms)
         errors = list(row.errors) + row_errors.get(owner, [])
-        if triggered and not bound:
-            errors.append("存在实测证据触发词但该内容缺少测试场景")
-        updated.append(ImportRowPreview(row.row_number, row.normalized, errors, row.warnings, not errors, bound))
+        updated.append(ImportRowPreview(row.manuscript_index, row.row_number, row.normalized, errors, row.warnings, not errors, bound))
     return updated, owned_tests, preview_errors
 
 
@@ -800,27 +814,32 @@ def _valid_evidence_filename(filename: str, entries: Dict[str, ZipInfo]) -> bool
 
 
 def _validate_test_evidence(rows, tests, entries, trigger_terms):
+    # Precheck only validates that referenced evidence filenames are safe and
+    # exist in the ZIP (when a ZIP was provided). It does NOT require evidence to
+    # be present, does NOT check trigger words, and does NOT check count
+    # consistency. Those checks belong to the six-Agent semantic review after
+    # import (run_audit), not to precheck.
     errors: Dict[str, List[str]] = {}
     referenced = set()
-    grouped = _group_tests(tests)
     for test in tests:
-        valid_names = []
         for filename in test.evidence_filenames:
             referenced.add(filename)
             if not _is_safe_basename(filename):
-                errors.setdefault(test.content_external_id, []).append(f"证据文件名必须是不含路径的安全文件名：{filename}")
+                errors.setdefault(test.content_external_id, []).append(
+                    f"证据文件名必须是不含路径的安全文件名：{filename}"
+                )
             elif Path(filename).suffix.lower() not in EVIDENCE_SUFFIXES:
-                errors.setdefault(test.content_external_id, []).append(f"证据文件格式不支持：{filename}")
-            elif filename not in entries:
-                errors.setdefault(test.content_external_id, []).append(f"证据文件不存在：{filename}")
-            elif entries[filename].file_size > MAX_EVIDENCE_BYTES:
-                errors.setdefault(test.content_external_id, []).append(f"证据文件不能超过 100 MiB：{filename}")
-            else:
-                valid_names.append(filename)
-        if not valid_names:
-            errors.setdefault(test.content_external_id, []).append(
-                f"测试场景 {test.external_test_case_id or '<空>'} 缺少有效证据文件"
-            )
+                errors.setdefault(test.content_external_id, []).append(
+                    f"证据文件格式不支持：{filename}"
+                )
+            elif entries and filename not in entries:
+                errors.setdefault(test.content_external_id, []).append(
+                    f"证据文件不存在：{filename}"
+                )
+            elif entries and entries[filename].file_size > MAX_EVIDENCE_BYTES:
+                errors.setdefault(test.content_external_id, []).append(
+                    f"证据文件不能超过 100 MiB：{filename}"
+                )
     warnings = [
         f"ZIP 中证据文件未被引用：{name}"
         for name in sorted(set(entries) - referenced)
@@ -829,18 +848,7 @@ def _validate_test_evidence(rows, tests, entries, trigger_terms):
     updated = []
     for row in rows:
         owner = row.normalized.get("external_id") or ""
-        text = " ".join(str(row.normalized.get(key) or "") for key in ("title", "body"))
-        triggered = any(term and term in text for term in trigger_terms)
-        bound = grouped.get(owner, [])
         row_extra = list(errors.get(owner, []))
-        if triggered and bound and not all(
-            test.command and test.observed_result and any(_valid_evidence_filename(name, entries) for name in test.evidence_filenames)
-            for test in bound
-        ):
-            row_extra.append("该内容的每个测试场景都必须包含指令、实际结果和 ZIP 中存在的有效证据")
-        match = re.search(r"(\d+)\s*[个项]?测试", text)
-        if match and len(bound) != int(match.group(1)):
-            row_extra.append(f"声明 {int(match.group(1))} 个测试，但结构化测试场景为 {len(bound)} 个")
         updated.append(_replace_row_errors(row, list(row.errors) + row_extra))
     return updated, warnings
 
@@ -872,7 +880,8 @@ def _validate_headers(raw_headers: Tuple[Any, ...], required_columns=None) -> Tu
     if duplicates:
         raise ValueError("Excel 表头重复：" + "、".join(duplicates))
 
-    missing = [column for column in (required_columns or REQUIRED_COLUMNS) if column not in headers]
+    required = REQUIRED_COLUMNS if required_columns is None else required_columns
+    missing = [column for column in required if column not in headers]
     if missing:
         raise ValueError("Excel 缺少必需表头：" + "、".join(missing))
     return tuple(headers)
@@ -883,12 +892,13 @@ def _is_blank_row(values: Tuple[Any, ...]) -> bool:
 
 
 def _normalize_row(
+    manuscript_index: int,
     row_number: int,
     values: Tuple[Any, ...],
     indexes: Dict[str, int],
     headers: Tuple[str, ...],
     formula_indexes: set[int],
-    named: bool = False,
+    format_name: str = "legacy",
 ) -> ImportRowPreview:
     normalized: Dict[str, Any] = {}
     errors = [
@@ -897,7 +907,9 @@ def _normalize_row(
         if index < len(headers)
     ]
 
-    for column in (CONTENT_COLUMNS if named else IMPORT_COLUMNS):
+    columns = NEW_CONTENT_COLUMNS if format_name == "new" else (CONTENT_COLUMNS if format_name == "named_legacy" else IMPORT_COLUMNS)
+    normalized = {key: None for key in _NORMALIZED_KEYS} if format_name == "new" else {}
+    for column in columns:
         index = indexes.get(column)
         raw_value = (
             values[index]
@@ -905,16 +917,20 @@ def _normalize_row(
             else None
         )
         key = _COLUMN_KEYS[column]
-        if column == "计划发布时间":
-            normalized[key], date_error = _normalize_date(raw_value)
+        if column in {"计划发布时间", "发布日期"}:
+            normalized[key], date_error = _normalize_date(raw_value, column)
             if date_error:
                 errors.append(date_error)
         else:
             normalized[key] = _normalize_text(raw_value)
 
-    for column in (REQUIRED_CONTENT_COLUMNS if named else REQUIRED_COLUMNS):
+    required_columns = ("标题", "内容", "目标平台") if format_name == "new" else (REQUIRED_CONTENT_COLUMNS if format_name == "named_legacy" else REQUIRED_COLUMNS)
+    for column in required_columns:
         if not normalized[_COLUMN_KEYS[column]]:
             errors.append(f"{column}不能为空")
+
+    if format_name == "new":
+        normalized["external_id"] = _derive_external_id(row_number, normalized["title"], normalized["account_name"])
 
     external_id = normalized["external_id"]
     if external_id and len(external_id) > 200:
@@ -934,10 +950,10 @@ def _normalize_row(
             errors.append("第一版每条内容最多只能引用一张图片")
         elif not _is_safe_basename(image_filename):
             errors.append("图片文件名必须是不含路径的安全文件名")
-        elif Path(image_filename).suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
-            errors.append("图片文件名必须使用 JPG、JPEG、PNG 或 WEBP 格式")
+        elif Path(image_filename).suffix.lower() not in ALLOWED_MEDIA_SUFFIXES:
+            errors.append("图片/视频文件名必须使用 JPG、JPEG、PNG、WEBP、MP4、MOV 或 WEBM 格式")
 
-    return ImportRowPreview(row_number, normalized, errors, [], not errors, [])
+    return ImportRowPreview(manuscript_index, row_number, normalized, errors, [], not errors, [])
 
 
 def _normalize_text(value: Any) -> Optional[str]:
@@ -947,7 +963,13 @@ def _normalize_text(value: Any) -> Optional[str]:
     return text or None
 
 
-def _normalize_date(value: Any) -> Tuple[Optional[str], Optional[str]]:
+def _derive_external_id(row_number: int, title: Optional[str], author: Optional[str]) -> str:
+    source = json.dumps([title or "", author or ""], ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+    return f"excel:{row_number}:{digest}"
+
+
+def _normalize_date(value: Any, column: str = "计划发布时间") -> Tuple[Optional[str], Optional[str]]:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, None
     if isinstance(value, datetime):
@@ -958,7 +980,7 @@ def _normalize_date(value: Any) -> Tuple[Optional[str], Optional[str]]:
     try:
         return date.fromisoformat(text).isoformat(), None
     except ValueError:
-        return text, "计划发布时间必须为 YYYY-MM-DD 或 Excel 日期"
+        return text, f"{column}必须为 YYYY-MM-DD 或 Excel 日期"
 
 
 def _inspect_zip(zip_path: Path) -> Tuple[Dict[str, ZipInfo], List[str]]:
@@ -1067,13 +1089,13 @@ def _mark_duplicate_external_ids(rows: List[ImportRowPreview]) -> List[ImportRow
         errors = list(row.errors)
         external_id = row.normalized["external_id"]
         if external_id and counts[external_id] > 1:
-            errors.append(f"供应商内容编号在批次内重复：{external_id}")
+            errors.append(f"内容编号在批次内重复：{external_id}")
         updated.append(_replace_row_errors(row, errors))
     return updated
 
 
 def _replace_row_errors(row: ImportRowPreview, errors: List[str]) -> ImportRowPreview:
-    return ImportRowPreview(row.row_number, row.normalized, errors, row.warnings, not errors, row.tests)
+    return ImportRowPreview(row.manuscript_index, row.row_number, row.normalized, errors, row.warnings, not errors, row.tests)
 
 
 def _extract_referenced_images(
@@ -1219,6 +1241,8 @@ def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime
 def _row_from_dict(payload: Any) -> ImportRowPreview:
     if not isinstance(payload, dict) or set(payload) != _ROW_KEYS:
         raise ValueError("预览行字段无效")
+    if type(payload["manuscript_index"]) is not int or payload["manuscript_index"] < 1:
+        raise ValueError("预览稿件序号无效")
     if type(payload["row_number"]) is not int or payload["row_number"] < 2:
         raise ValueError("预览行号无效")
     normalized = payload["normalized"]
@@ -1235,6 +1259,7 @@ def _row_from_dict(payload: Any) -> ImportRowPreview:
         raise ValueError("预览行测试场景无效")
     tests = [_test_from_dict(item) for item in payload["tests"]]
     return ImportRowPreview(
+        manuscript_index=payload["manuscript_index"],
         row_number=payload["row_number"],
         normalized=dict(normalized),
         errors=list(payload["errors"]),

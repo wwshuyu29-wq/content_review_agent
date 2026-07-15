@@ -23,6 +23,7 @@ from server.services.excel_import_service import (
 
 
 REQUIRED_COLUMNS = ("供应商内容编号", "活动主题", "平台", "标题", "正文")
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
 
 
 def write_workbook(
@@ -97,12 +98,71 @@ def test_build_import_template_has_exact_chinese_columns() -> None:
     workbook = load_workbook(BytesIO(build_import_template()), read_only=True)
 
     assert workbook.sheetnames == ["内容清单", "测试场景", "字段说明"]
-    assert tuple(cell.value for cell in next(workbook["内容清单"].iter_rows())) == (
-        "供应商内容编号", "活动主题", "账号名称", "账号类型", "平台", "标题", "正文", "图片文件名", "计划发布时间", "备注",
-    )
+    assert tuple(cell.value for cell in next(workbook["内容清单"].iter_rows())) == NEW_CONTENT_COLUMNS
     assert tuple(cell.value for cell in next(workbook["测试场景"].iter_rows())) == (
         "供应商内容编号", "测试场景编号", "测试结论", "测试指令", "实际返回结果", "测试城市", "测试时间", "百度地图版本", "设备", "操作系统", "网络环境", "证据文件名",
     )
+
+
+def test_preview_accepts_exact_new_headers_maps_fields_and_derives_stable_id(tmp_path: Path) -> None:
+    xlsx = write_workbook(
+        tmp_path / "new-template.xlsx",
+        [[" 新标题 ", " 新内容 ", " 图文 ", " 小红书 ", " 地图作者 ", date(2026, 7, 20), " cover.png "]],
+        NEW_CONTENT_COLUMNS,
+    )
+    archive = write_zip(tmp_path / "media.zip", [("cover.png", b"image")])
+
+    first = preview_import(xlsx, archive, tmp_path / "first")
+    second = preview_import(xlsx, archive, tmp_path / "second")
+
+    assert first.valid_count == 1
+    assert first.error_count == 0
+    assert first.rows[0].normalized == {
+        "external_id": second.rows[0].normalized["external_id"],
+        "campaign_theme": None,
+        "account_name": "地图作者",
+        "account_type": "图文",
+        "platform": "小红书",
+        "title": "新标题",
+        "body": "新内容",
+        "image_filename": "cover.png",
+        "publish_time": "2026-07-20",
+        "note": None,
+    }
+    assert first.rows[0].normalized["external_id"].startswith("excel:")
+
+
+def test_new_format_identical_title_and_author_rows_receive_distinct_ids(tmp_path: Path) -> None:
+    xlsx = write_workbook(
+        tmp_path / "new-duplicate-input.xlsx",
+        [
+            ["同标题", "内容一", "图文", "微博", "同作者", None, None],
+            ["同标题", "内容二", "图文", "微博", "同作者", None, None],
+        ],
+        NEW_CONTENT_COLUMNS,
+    )
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+
+    assert preview.valid_count == 2
+    assert len({row.normalized["external_id"] for row in preview.rows}) == 2
+
+
+def test_preview_rejects_duplicate_derived_ids_within_batch(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(excel_import_service, "_derive_external_id", lambda *_: "excel:collision")
+    xlsx = write_workbook(
+        tmp_path / "derived-collision.xlsx",
+        [
+            ["标题一", "内容一", "图文", "微博", "作者一", None, None],
+            ["标题二", "内容二", "图文", "微博", "作者二", None, None],
+        ],
+        NEW_CONTENT_COLUMNS,
+    )
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+
+    assert preview.valid_count == 0
+    assert all(any("内容编号在批次内重复" in error for error in row.errors) for row in preview.rows)
 
 
 def test_preview_parses_only_first_worksheet_and_trims_required_values(tmp_path: Path) -> None:
@@ -610,7 +670,10 @@ def tech_row(external_id: str, body: str = "普通正文") -> list[object]:
     return [external_id, "活动", "账号", "媒体", "小红书", "标题", body, None, None, None]
 
 
-def test_trigger_evidence_is_validated_per_content_not_globally(tmp_path: Path) -> None:
+def test_trigger_evidence_is_not_required_by_precheck(tmp_path: Path) -> None:
+    # Precheck must NOT reject rows that contain trigger words (亲测/实测) but have
+    # no test cases. Evidence-related validation belongs to the six-Agent semantic
+    # review (run_audit), not to precheck. Both rows should pass precheck.
     xlsx = write_named_workbook(
         tmp_path / "per-content.xlsx",
         [tech_row("triggered", "这是亲测内容"), tech_row("other")],
@@ -620,8 +683,9 @@ def test_trigger_evidence_is_validated_per_content_not_globally(tmp_path: Path) 
 
     preview = preview_import(xlsx, archive, tmp_path / "previews")
 
-    assert preview.rows[0].valid is False
-    assert any("证据" in error or "测试场景" in error for error in preview.rows[0].errors)
+    # Row with 亲测 trigger word but no test cases must still pass precheck
+    assert preview.rows[0].valid is True
+    assert not any("证据" in error or "测试场景" in error for error in preview.rows[0].errors)
     assert preview.rows[1].valid is True
 
 

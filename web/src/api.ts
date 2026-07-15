@@ -229,6 +229,7 @@ export interface ImportTestPreview {
 }
 
 export interface ImportRowPreview {
+  manuscript_index: number;
   row_number: number;
   normalized: JsonObject;
   errors: string[];
