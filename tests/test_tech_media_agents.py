@@ -152,12 +152,30 @@ def test_clean_text_without_structured_media_does_not_load_authorization(
 @pytest.mark.parametrize(
     "context_update",
     [
-        {"evidence": [{"asset_id": "asset-1"}]},
-        {"evidence_assets": [{"asset_id": "asset-1", "license": "unknown"}]},
-        {"evidence_assets": [{"asset_id": "asset-1", "third_party": True}]},
+        {"evidence": [{"asset_id": "log-1", "kind": "test_log", "status": "approved"}]},
+        {"evidence_assets": [{"asset_id": "screenshot-1", "source": "first_party", "license_status": "approved"}]},
     ],
 )
-def test_structured_evidence_or_asset_loads_authorization_for_compliance_and_brand(
+def test_ordinary_bound_logs_and_approved_first_party_screenshots_do_not_load_authorization(
+    representative_context_and_profile,
+    context_update,
+):
+    _, profile = representative_context_and_profile
+    context = ReviewContext(title="路线规划体验", body="路线结构清晰。", **context_update)
+    prompts = TechMediaReviewer().build_prompts(context, profile)
+
+    assert all("[AUTH-" not in prompt for prompt in prompts.values())
+
+
+@pytest.mark.parametrize(
+    "context_update",
+    [
+        {"evidence_assets": [{"asset_id": "asset-1", "source": "external", "license_status": "unknown"}]},
+        {"evidence_assets": [{"asset_id": "asset-2", "privacy_sensitive": True}]},
+        {"evidence_assets": [{"asset_id": "asset-3", "person_detected": True}]},
+    ],
+)
+def test_authorization_relevance_metadata_loads_supplement_for_compliance_and_brand(
     representative_context_and_profile,
     context_update,
 ):

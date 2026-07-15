@@ -133,6 +133,30 @@ def test_loader_rejects_invalid_review_result_schema(standards_root: Path) -> No
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda schema: schema["properties"]["score"].update({"type": "number"}),
+        lambda schema: schema["properties"]["score"].update({"minimum": 1}),
+        lambda schema: schema["properties"]["issues"].update({"type": "object"}),
+        lambda schema: schema["$defs"]["AgentIssue"]["properties"]["source_reference"].update({"type": "string"}),
+        lambda schema: schema["$defs"]["AgentIssue"]["properties"]["source_reference"]["items"].update({"type": "integer"}),
+        lambda schema: schema["properties"]["confidence"].update({"maximum": 0.5}),
+        lambda schema: schema["$defs"]["AgentIssue"]["properties"]["confidence"].update({"minimum": 0.1}),
+        lambda schema: schema["$defs"]["EvidenceSpan"]["properties"]["start"].update({"type": "integer"}),
+    ],
+)
+def test_loader_rejects_runtime_significant_schema_mutations(standards_root: Path, mutation) -> None:
+    schema_path = standards_root / "schemas" / "review_result.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    mutation(schema)
+    schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+    refresh_manifest(standards_root)
+
+    with pytest.raises(ValueError, match="runtime protocol|schema"):
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+
+
 def test_agent_standard_config_has_exact_six_unique_global_bindings() -> None:
     bindings = standard_package_service.AGENT_STANDARD_CONFIG
 

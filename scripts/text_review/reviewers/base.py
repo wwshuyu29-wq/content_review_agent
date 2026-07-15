@@ -66,6 +66,11 @@ def agent_review_protocol_contract() -> dict[str, Any]:
     }
 
 
+def agent_review_protocol_schema() -> dict[str, Any]:
+    """Return Pydantic's complete JSON Schema for runtime-significant comparison."""
+    return AgentReviewResult.model_json_schema()
+
+
 @dataclass
 class StructuredIssue:
     rule_id: str

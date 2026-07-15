@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from scripts.text_review.reviewers.base import agent_review_protocol_contract
+from scripts.text_review.reviewers.base import agent_review_protocol_schema
 
 from ..models import Project, RuleVersion
 
@@ -423,32 +423,52 @@ def regenerate_standard_manifest(
     return manifest_path
 
 
+_SCHEMA_COMPATIBILITY_KEYS = {
+    "$defs", "$ref", "additionalProperties", "anyOf", "enum", "items", "maximum",
+    "minimum", "properties", "required", "type",
+}
+
+
+def _normalize_schema_contract(node: Any) -> Any:
+    if isinstance(node, dict):
+        if "anyOf" in node and all(
+            isinstance(branch, dict) and set(branch) == {"type"}
+            for branch in node["anyOf"]
+        ):
+            return {"type": sorted(branch["type"] for branch in node["anyOf"])}
+        normalized = {}
+        for key, value in node.items():
+            if key not in _SCHEMA_COMPATIBILITY_KEYS:
+                continue
+            if key in {"properties", "$defs"} and isinstance(value, dict):
+                normalized[key] = {
+                    name: _normalize_schema_contract(child)
+                    for name, child in value.items()
+                }
+            else:
+                normalized[key] = _normalize_schema_contract(value)
+        if "required" in normalized:
+            normalized["required"] = sorted(normalized["required"])
+        if "enum" in normalized:
+            normalized["enum"] = sorted(normalized["enum"])
+        if "type" in normalized and isinstance(normalized["type"], list):
+            normalized["type"] = sorted(normalized["type"])
+        return normalized
+    if isinstance(node, list):
+        return [_normalize_schema_contract(item) for item in node]
+    return node
+
+
 def _validate_review_result_schema(root: Path) -> None:
     schema = _read_json(root / "schemas" / "review_result.schema.json")
     try:
         Draft202012Validator.check_schema(schema)
     except JsonSchemaError as exc:
         raise ValueError(f"review result schema is invalid: {exc.message}") from exc
-    contract = agent_review_protocol_contract()
-    issue_schema = schema.get("$defs", {}).get("AgentIssue", {})
-    evidence_schema = schema.get("$defs", {}).get("EvidenceSpan", {})
-    checks = (
-        (schema.get("additionalProperties") is False, "top-level additionalProperties"),
-        (set(schema.get("required", [])) == set(contract["result_fields"]), "top-level required fields"),
-        (set(schema.get("properties", {})) == set(contract["result_fields"]), "top-level fields"),
-        (tuple(schema.get("properties", {}).get("agent_id", {}).get("enum", [])) == contract["agent_ids"], "agent_id enum"),
-        (tuple(schema.get("properties", {}).get("decision", {}).get("enum", [])) == contract["decisions"], "decision enum"),
-        (issue_schema.get("additionalProperties") is False, "issue additionalProperties"),
-        (set(issue_schema.get("required", [])) == set(contract["issue_fields"]), "issue required fields"),
-        (set(issue_schema.get("properties", {})) == set(contract["issue_fields"]), "issue fields"),
-        (tuple(issue_schema.get("properties", {}).get("severity", {}).get("enum", [])) == contract["severities"], "severity enum"),
-        (evidence_schema.get("additionalProperties") is False, "evidence additionalProperties"),
-        (set(evidence_schema.get("required", [])) == set(contract["evidence_required_fields"]), "evidence required fields"),
-        (set(evidence_schema.get("properties", {})) == set(contract["evidence_fields"]), "evidence fields"),
-    )
-    failed = next((label for valid, label in checks if not valid), None)
-    if failed:
-        raise ValueError(f"review result schema disagrees with runtime protocol: {failed}")
+    committed = _normalize_schema_contract(schema)
+    runtime = _normalize_schema_contract(agent_review_protocol_schema())
+    if committed != runtime:
+        raise ValueError("review result schema disagrees with runtime protocol")
 
 
 def _validate_markdown_rule_ids(filename: str, content: str) -> None:

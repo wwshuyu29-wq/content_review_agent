@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Mapping, Optional, TYPE_CHECKING
 
 from .base import AgentIssue, AgentReviewResult, EvidenceSpan
 
@@ -144,15 +144,50 @@ class TechMediaReviewer:
         return [rule.model_dump(mode="json") for rule in profile.rules if rule.rule_id.upper().startswith(prefixes)]
 
     @staticmethod
-    def _needs_authorization_standard(context: ReviewContext) -> bool:
+    def _metadata_flag(record: Mapping[str, Any], *keys: str) -> bool:
+        true_values = {"true", "yes", "1", "detected", "sensitive", "external", "third_party"}
+        for key in keys:
+            value = record.get(key)
+            if value is True:
+                return True
+            if isinstance(value, str) and value.strip().lower() in true_values:
+                return True
+        return False
+
+    @classmethod
+    def _authorization_metadata_relevant(cls, record: Mapping[str, Any]) -> bool:
+        source = str(record.get("source", record.get("source_type", record.get("origin", "")))).strip().lower()
+        external = source in {"external", "third_party", "third-party", "outside"} or cls._metadata_flag(
+            record, "third_party", "external_source"
+        )
+        license_status = str(record.get("license_status", record.get("license", ""))).strip().lower()
+        if external and license_status in {"unknown", "denied", "rejected", "unverified"}:
+            return True
+        if cls._metadata_flag(
+            record,
+            "privacy_sensitive", "privacy_flag", "contains_pii", "ocr_sensitive",
+            "sensitive_data", "person_detected", "public_figure", "face_detected",
+            "competitor", "third_party_brand", "synthetic", "ai_generated",
+            "face_swap", "voice_clone", "social_event",
+        ):
+            return True
+        classification = str(record.get("classification", record.get("event_type", ""))).strip().lower()
+        return classification in {"social_event", "public_event", "sensitive_event"}
+
+    @classmethod
+    def _needs_authorization_standard(cls, context: ReviewContext) -> bool:
         content = f"{context.title}\n{context.body}".lower()
         if any(term in content for term in (
             "授权", "版权", "第三方素材", "素材来源", "隐私", "个人信息",
             "公众人物", "竞品", "社会事件", "截图来源",
         )):
             return True
-        structured_assets = list(context.evidence or []) + list(context.evidence_assets or [])
-        return bool(structured_assets)
+        structured_records = list(context.evidence or []) + list(context.evidence_assets or [])
+        return any(
+            cls._authorization_metadata_relevant(record)
+            for record in structured_records
+            if isinstance(record, Mapping)
+        )
 
     @staticmethod
     def _is_v1(profile: ReviewProfile) -> bool:
