@@ -75,6 +75,9 @@ dist/
 .vite/
 *.tsbuildinfo
 
+# 隔离开发工作区
+.worktrees/
+
 # 编辑器 / 系统
 .DS_Store
 .idea/
