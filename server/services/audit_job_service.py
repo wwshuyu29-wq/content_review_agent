@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -22,6 +23,12 @@ from server.schemas import AuditJobProgressRead
 ACTIVE_JOB_STATUSES = ("QUEUED", "RUNNING")
 
 
+@dataclass(frozen=True)
+class ActiveJobResult:
+    job: BatchAuditJob
+    created: bool
+
+
 def _active_key(batch_id: int) -> str:
     return f"batch:{batch_id}"
 
@@ -36,7 +43,7 @@ def _load_job(session: Session, job_id: int) -> Optional[BatchAuditJob]:
     )
 
 
-def create_or_get_active_job(session: Session, batch_id: int, model: str) -> BatchAuditJob:
+def create_or_get_active_job(session: Session, batch_id: int, model: str) -> ActiveJobResult:
     """Create a complete progress tree or return the batch's existing active job.
 
     ``active_key`` is non-null only for non-terminal jobs. Its database uniqueness
@@ -52,7 +59,7 @@ def create_or_get_active_job(session: Session, batch_id: int, model: str) -> Bat
         )
     )
     if existing is not None:
-        return existing
+        return ActiveJobResult(job=existing, created=False)
 
     batch = session.get(Batch, batch_id)
     if batch is None:
@@ -98,8 +105,8 @@ def create_or_get_active_job(session: Session, batch_id: int, model: str) -> Bat
         )
         if winner is None:
             raise
-        return winner
-    return job
+        return ActiveJobResult(job=winner, created=False)
+    return ActiveJobResult(job=job, created=True)
 
 
 def get_job_progress(session: Session, job_id: int) -> AuditJobProgressRead:

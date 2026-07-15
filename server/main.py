@@ -821,19 +821,17 @@ def start_audit_job(batch_id: int, session: Session = Depends(get_session)):
     batch = _batch_with_project(session, batch_id)
     if batch is None:
         raise _not_found("Batch", batch_id)
-    existing = session.scalar(
-        select(BatchAuditJob).where(BatchAuditJob.active_key == f"batch:{batch_id}")
-    )
     config = _validated_config(_load_config())
     try:
-        job = create_or_get_active_job(session, batch.id, config["model"] or config["reviewer"])
+        result = create_or_get_active_job(session, batch.id, config["model"] or config["reviewer"])
         session.commit()
+        job, created = result.job, result.created
         job_id, status = job.id, job.status
     except ValueError as error:
         session.rollback()
         raise _service_error(error) from error
 
-    if existing is None:
+    if created:
         try:
             submit_audit_job(job_id)
         except Exception:

@@ -326,18 +326,22 @@ export interface AuthResponse { user: AuthUser; csrf_token: string; }
 
 export interface BatchAuditResult { content_id: number; status: "success" | "error"; audit_run_id: number | null; error: string | null; }
 
+export type AuditJobStatus = "QUEUED" | "RUNNING" | "COMPLETED" | "COMPLETED_WITH_ERRORS" | "FAILED" | "INTERRUPTED";
+export type ManuscriptProgressStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "SKIPPED";
+export type AgentProgressStatus = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
+
 export interface AuditJobStart {
   job_id: number;
   batch_id: number;
-  status: string;
+  status: AuditJobStatus;
 }
 
 export interface AgentProgress {
   id: number;
   manuscript_job_id: number;
-  agent_id: AgentId | string;
+  agent_id: AgentId;
   position: number;
-  status: string;
+  status: AgentProgressStatus;
   attempt_count: number;
   started_at: string | null;
   completed_at: string | null;
@@ -352,7 +356,7 @@ export interface ManuscriptProgress {
   audit_job_id: number;
   content_item_id: number;
   position: number;
-  status: string;
+  status: ManuscriptProgressStatus;
   started_at: string | null;
   completed_at: string | null;
   error_summary: string | null;
@@ -363,7 +367,7 @@ export interface AuditJobProgress {
   id: number;
   batch_id: number;
   model: string;
-  status: string;
+  status: AuditJobStatus;
   total_count: number;
   completed_count: number;
   failed_count: number;
@@ -371,7 +375,7 @@ export interface AuditJobProgress {
   running_count: number;
   pending_count: number;
   current_content_item_id: number | null;
-  current_agent_id: string | null;
+  current_agent_id: AgentId | null;
   heartbeat_at: string;
   started_at: string | null;
   completed_at: string | null;

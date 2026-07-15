@@ -703,3 +703,43 @@ def test_audit_job_reads_enforce_batch_relationship_and_hide_raw_errors(api, mon
     assert payload["error_summary"] == "审核过程中出现异常，请稍后重试或联系管理员。"
     for secret in ("https://", "sk-secret", "raw response", "Traceback", "RuntimeError"):
         assert secret not in serialized
+
+
+def test_concurrent_audit_job_starts_submit_only_the_created_job(api, monkeypatch) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    client, engine, _ = api
+    batch = _create_audit_job_batch(client, "concurrent")
+    enter_service = Barrier(2)
+    submission_lock = Lock()
+    submissions = []
+    create_job = main.create_or_get_active_job
+
+    def synchronized_create_job(session, batch_id, model):
+        enter_service.wait(timeout=5)
+        return create_job(session, batch_id, model)
+
+    def capture_submission(job_id: int) -> None:
+        with submission_lock:
+            if submissions:
+                raise RuntimeError("duplicate submission must not reach recovery")
+            submissions.append(job_id)
+
+    monkeypatch.setattr(main, "create_or_get_active_job", synchronized_create_job)
+    monkeypatch.setattr(main, "submit_audit_job", capture_submission)
+
+    def start_job(_index: int):
+        return client.post(f"/api/batches/{batch['id']}/audit-jobs")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(start_job, range(2)))
+
+    assert [response.status_code for response in responses] == [202, 202]
+    job_ids = {response.json()["job_id"] for response in responses}
+    assert len(job_ids) == 1
+    assert submissions == [job_ids.pop()]
+    with Session(engine) as session:
+        jobs = list(session.scalars(select(BatchAuditJob).where(BatchAuditJob.batch_id == batch["id"])))
+        assert len(jobs) == 1
+        assert jobs[0].status == "QUEUED"

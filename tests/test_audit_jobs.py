@@ -26,10 +26,14 @@ from server.models import (
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
 from server.services.audit_job_service import (
-    create_or_get_active_job,
+    create_or_get_active_job as create_or_get_active_job_result,
     get_job_progress,
     interrupt_stale_jobs,
 )
+
+
+def create_or_get_active_job(session: Session, batch_id: int, model: str) -> BatchAuditJob:
+    return create_or_get_active_job_result(session, batch_id, model).job
 
 
 def make_engine(tmp_path: Path):
@@ -98,17 +102,19 @@ def test_create_or_get_active_job_reuses_one_job_across_concurrent_sessions(tmp_
 
     barrier = Barrier(2)
 
-    def create_job() -> int:
+    def create_job() -> tuple[int, bool]:
         with Session(engine) as session:
             barrier.wait()
-            job = create_or_get_active_job(session, batch_id, "gpt-5.6-sol")
+            result = create_or_get_active_job_result(session, batch_id, "gpt-5.6-sol")
             session.commit()
-            return job.id
+            return result.job.id, result.created
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        job_ids = list(executor.map(lambda _index: create_job(), range(2)))
+        results = list(executor.map(lambda _index: create_job(), range(2)))
 
+    job_ids = [job_id for job_id, _created in results]
     assert len(set(job_ids)) == 1
+    assert sorted(created for _job_id, created in results) == [False, True]
     with Session(engine) as session:
         assert len(list(session.scalars(select(BatchAuditJob)))) == 1
         assert len(list(session.scalars(select(ManuscriptAuditJob)))) == 2
