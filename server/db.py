@@ -125,6 +125,12 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_results_audit_agent_version "
                 "ON agent_results (audit_run_id, agent_id, agent_version)"
             )
+        if "batch_audit_jobs" in table_names:
+            _raise_duplicate_groups(connection, "batch_audit_jobs", ("active_key",))
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_batch_audit_jobs_active_key "
+                "ON batch_audit_jobs (active_key)"
+            )
         if "audit_runs" in table_names:
             audit_columns = {column["name"] for column in database_inspector.get_columns("audit_runs")}
             if "review_key" not in audit_columns:

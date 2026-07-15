@@ -159,6 +159,9 @@ class Batch(TimestampMixin, Base):
     content_items: Mapped[List["ContentItem"]] = relationship(
         back_populates="batch", cascade="all, delete-orphan"
     )
+    audit_jobs: Mapped[List["BatchAuditJob"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan"
+    )
 
 
 class ContentItem(TimestampMixin, Base):
@@ -187,6 +190,9 @@ class ContentItem(TimestampMixin, Base):
     test_cases: Mapped[List["TestCase"]] = relationship(
         back_populates="content_item", cascade="all, delete-orphan", order_by="TestCase.id"
     )
+    manuscript_audit_jobs: Mapped[List["ManuscriptAuditJob"]] = relationship(
+        back_populates="content_item"
+    )
 
 
 class ContentVersion(TimestampMixin, Base):
@@ -205,6 +211,89 @@ class ContentVersion(TimestampMixin, Base):
     audit_runs: Mapped[List["AuditRun"]] = relationship(back_populates="content_version")
     review_tasks: Mapped[List["ReviewTask"]] = relationship(back_populates="target_content_version")
     test_cases: Mapped[List["TestCase"]] = relationship(back_populates="content_version")
+
+
+class BatchAuditJob(TimestampMixin, Base):
+    __tablename__ = "batch_audit_jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True, nullable=False)
+    active_key: Mapped[Optional[str]] = mapped_column(String(200), unique=True)
+    model: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="QUEUED", index=True, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_content_item_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("content_items.id"), index=True
+    )
+    current_agent_id: Mapped[Optional[str]] = mapped_column(String(100))
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    error_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    batch: Mapped[Batch] = relationship(back_populates="audit_jobs")
+    manuscripts: Mapped[List["ManuscriptAuditJob"]] = relationship(
+        back_populates="audit_job",
+        cascade="all, delete-orphan",
+        order_by="ManuscriptAuditJob.position",
+    )
+
+
+class ManuscriptAuditJob(TimestampMixin, Base):
+    __tablename__ = "manuscript_audit_jobs"
+    __table_args__ = (
+        UniqueConstraint("audit_job_id", "content_item_id"),
+        UniqueConstraint("audit_job_id", "position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    audit_job_id: Mapped[int] = mapped_column(
+        ForeignKey("batch_audit_jobs.id"), index=True, nullable=False
+    )
+    content_item_id: Mapped[int] = mapped_column(
+        ForeignKey("content_items.id"), index=True, nullable=False
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="PENDING", index=True, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    error_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    audit_job: Mapped[BatchAuditJob] = relationship(back_populates="manuscripts")
+    content_item: Mapped[ContentItem] = relationship(back_populates="manuscript_audit_jobs")
+    agents: Mapped[List["AgentAuditProgress"]] = relationship(
+        back_populates="manuscript_job",
+        cascade="all, delete-orphan",
+        order_by="AgentAuditProgress.position",
+    )
+
+
+class AgentAuditProgress(TimestampMixin, Base):
+    __tablename__ = "agent_audit_progress"
+    __table_args__ = (
+        UniqueConstraint("manuscript_job_id", "agent_id"),
+        UniqueConstraint("manuscript_job_id", "position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    manuscript_job_id: Mapped[int] = mapped_column(
+        ForeignKey("manuscript_audit_jobs.id"), index=True, nullable=False
+    )
+    agent_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="PENDING", index=True, nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    decision: Mapped[Optional[str]] = mapped_column(String(50))
+    score: Mapped[Optional[int]] = mapped_column(Integer)
+    error_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    manuscript_job: Mapped[ManuscriptAuditJob] = relationship(back_populates="agents")
 
 
 class Asset(TimestampMixin, Base):

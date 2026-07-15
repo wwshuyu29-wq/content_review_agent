@@ -151,14 +151,17 @@ def test_create_all_defines_every_workflow_table(tmp_path: Path) -> None:
     Base.metadata.create_all(engine)
 
     assert set(inspect(engine).get_table_names()) == {
+        "agent_audit_progress",
         "agent_results",
         "assets",
         "audit_runs",
+        "batch_audit_jobs",
         "batches",
         "content_items",
         "content_versions",
         "human_decisions",
         "issues",
+        "manuscript_audit_jobs",
         "projects",
         "review_tasks",
         "review_task_issues",
@@ -621,6 +624,9 @@ def test_foreign_keys_used_by_workflow_queries_are_indexed(tmp_path: Path) -> No
         "assets": {"content_item_id"},
         "test_cases": {"content_item_id", "content_version_id"},
         "test_evidence": {"test_case_id", "asset_id"},
+        "batch_audit_jobs": {"batch_id", "current_content_item_id"},
+        "manuscript_audit_jobs": {"audit_job_id", "content_item_id"},
+        "agent_audit_progress": {"manuscript_job_id"},
     }
 
     for table_name, expected_columns in expected_indexed_foreign_keys.items():
@@ -656,6 +662,15 @@ def test_workflow_identity_constraints_are_unique(tmp_path: Path) -> None:
         "assets": {("content_item_id", "asset_id"), ("content_item_id", "external_id")},
         "test_cases": {("content_item_id", "external_test_case_id")},
         "test_evidence": {("test_case_id", "asset_id")},
+        "batch_audit_jobs": {("active_key",)},
+        "manuscript_audit_jobs": {
+            ("audit_job_id", "content_item_id"),
+            ("audit_job_id", "position"),
+        },
+        "agent_audit_progress": {
+            ("manuscript_job_id", "agent_id"),
+            ("manuscript_job_id", "position"),
+        },
     }
 
     for table_name, expected_constraints in expected_unique_constraints.items():

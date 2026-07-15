@@ -87,6 +87,56 @@ class BatchRead(OrmSchema):
     created_at: datetime
 
 
+class AgentAuditProgressRead(OrmSchema):
+    id: int
+    manuscript_job_id: int
+    agent_id: str
+    position: int
+    status: str
+    attempt_count: int
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    duration_ms: Optional[int]
+    decision: Optional[str]
+    score: Optional[int]
+    error_summary: Optional[str]
+
+
+class ManuscriptAuditProgressRead(OrmSchema):
+    id: int
+    audit_job_id: int
+    content_item_id: int
+    position: int
+    status: str
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    error_summary: Optional[str]
+    agents: List[AgentAuditProgressRead] = Field(default_factory=list)
+
+
+class AuditJobProgressRead(OrmSchema):
+    id: int
+    batch_id: int
+    model: str
+    status: str
+    total_count: int
+    completed_count: int
+    failed_count: int
+    skipped_count: int
+    running_count: int
+    pending_count: int
+    current_content_item_id: Optional[int]
+    current_agent_id: Optional[str]
+    heartbeat_at: datetime
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    error_summary: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    manuscripts: List[ManuscriptAuditProgressRead] = Field(default_factory=list)
+    current_agents: List[AgentAuditProgressRead] = Field(default_factory=list)
+
+
 class ContentItemCreate(BaseModel):
     project_id: int
     batch_id: int

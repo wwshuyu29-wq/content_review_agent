@@ -7,7 +7,7 @@ import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +23,7 @@ from scripts.text_review.reviewer import get_reviewer
 from scripts.text_review.reviewers.llm import get_llm
 from scripts.text_review.reviewers.tech_media import TechMediaReviewer
 from server.db import Base, ensure_schema_upgrades, get_db_engine, get_session
+from server.services.audit_job_service import interrupt_stale_jobs
 from server.models import (
     AgentResult,
     AuditRun,
@@ -164,6 +165,8 @@ async def lifespan(_app: FastAPI):
     with Session(engine) as session:
         ensure_initial_admin(session)
         seed_default_project(session)
+        stale_seconds = max(1, int(os.environ.get("AUDIT_JOB_STALE_SECONDS", "300")))
+        interrupt_stale_jobs(session, datetime.utcnow() - timedelta(seconds=stale_seconds))
         session.commit()
     yield
 
