@@ -87,7 +87,23 @@ class BatchRead(OrmSchema):
     created_at: datetime
 
 
-class AgentAuditProgressRead(OrmSchema):
+BUSINESS_SAFE_AUDIT_ERROR_MESSAGE = "审核过程中出现异常，请稍后重试或联系管理员。"
+
+
+def business_safe_audit_error(error_summary: Optional[str]) -> Optional[str]:
+    return BUSINESS_SAFE_AUDIT_ERROR_MESSAGE if error_summary else None
+
+
+class BusinessSafeAuditErrorSchema(OrmSchema):
+    error_summary: Optional[str]
+
+    @field_validator("error_summary", mode="before")
+    @classmethod
+    def replace_technical_error(cls, value: Optional[str]) -> Optional[str]:
+        return business_safe_audit_error(value)
+
+
+class AgentAuditProgressRead(BusinessSafeAuditErrorSchema):
     id: int
     manuscript_job_id: int
     agent_id: str
@@ -99,10 +115,9 @@ class AgentAuditProgressRead(OrmSchema):
     duration_ms: Optional[int]
     decision: Optional[str]
     score: Optional[int]
-    error_summary: Optional[str]
 
 
-class ManuscriptAuditProgressRead(OrmSchema):
+class ManuscriptAuditProgressRead(BusinessSafeAuditErrorSchema):
     id: int
     audit_job_id: int
     content_item_id: int
@@ -110,11 +125,10 @@ class ManuscriptAuditProgressRead(OrmSchema):
     status: str
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
-    error_summary: Optional[str]
     agents: List[AgentAuditProgressRead] = Field(default_factory=list)
 
 
-class AuditJobProgressRead(OrmSchema):
+class AuditJobProgressRead(BusinessSafeAuditErrorSchema):
     id: int
     batch_id: int
     model: str
@@ -130,7 +144,6 @@ class AuditJobProgressRead(OrmSchema):
     heartbeat_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
-    error_summary: Optional[str]
     created_at: datetime
     updated_at: datetime
     manuscripts: List[ManuscriptAuditProgressRead] = Field(default_factory=list)

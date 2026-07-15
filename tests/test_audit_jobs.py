@@ -141,6 +141,59 @@ def test_get_job_progress_calculates_counters_from_manuscript_rows(tmp_path: Pat
     assert len(payload["current_agents"]) == len(AGENT_ORDER)
 
 
+def test_get_job_progress_replaces_technical_errors_without_mutating_persisted_diagnostics(
+    tmp_path: Path,
+) -> None:
+    engine = make_engine(tmp_path)
+    def technical_error(level: str) -> str:
+        return (
+            f"{level}: POST https://oneapi.example.internal/v1/chat/completions failed; "
+            f"Authorization: Bearer sk-fake-{level}-key; "
+            'raw response={"error":{"message":"upstream body","code":500}}; '
+            "Traceback (most recent call last): worker.py line 42 RuntimeError"
+        )
+
+    batch_error = technical_error("batch")
+    manuscript_error = technical_error("manuscript")
+    agent_error = technical_error("agent")
+    safe_message = "审核过程中出现异常，请稍后重试或联系管理员。"
+
+    with Session(engine) as session:
+        batch = create_batch(session, item_count=1)
+        job = create_or_get_active_job(session, batch.id, "model")
+        manuscript = job.manuscripts[0]
+        agent = manuscript.agents[0]
+        job.error_summary = batch_error
+        manuscript.error_summary = manuscript_error
+        agent.error_summary = agent_error
+        job.current_content_item_id = manuscript.content_item_id
+        session.commit()
+        job_id = job.id
+        manuscript_id = manuscript.id
+        agent_id = agent.id
+
+        payload = get_job_progress(session, job_id).model_dump(mode="json")
+
+        assert payload["error_summary"] == safe_message
+        assert payload["manuscripts"][0]["error_summary"] == safe_message
+        assert payload["manuscripts"][0]["agents"][0]["error_summary"] == safe_message
+        assert payload["current_agents"][0]["error_summary"] == safe_message
+        serialized = str(payload)
+        for technical_fragment in (
+            "https://",
+            "sk-fake",
+            "raw upstream response body",
+            "Traceback",
+            "worker.py",
+            "RuntimeError",
+        ):
+            assert technical_fragment not in serialized
+
+        assert session.get(BatchAuditJob, job_id).error_summary == batch_error
+        assert session.get(ManuscriptAuditJob, manuscript_id).error_summary == manuscript_error
+        assert session.get(AgentAuditProgress, agent_id).error_summary == agent_error
+
+
 def test_interrupt_stale_jobs_releases_active_key_for_a_new_job(tmp_path: Path) -> None:
     engine = make_engine(tmp_path)
     now = datetime.utcnow()
