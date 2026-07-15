@@ -140,6 +140,32 @@ def test_unsupported_claim_composition_matches_reusable_claims_and_guards_contex
     assert matched is should_match
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "它不但支持所有复杂路线，还能自动筛选酒店",
+        "没有限制，所有路线都能处理",
+        "官方声称它行业第一",
+    ],
+)
+def test_guarded_claim_uses_local_predicate_context_for_mixed_clauses(v09_profile, body):
+    issues = evaluate_rules(v09_profile, ReviewContext(body=body))
+    assert any(issue.rule_id == "CLAIM-UNSUPPORTED-ABSOLUTE-001" for issue in issues)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "它不支持所有复杂路线",
+        "所谓行业第一缺少依据",
+        "它并不能处理任何复杂行程",
+    ],
+)
+def test_guarded_claim_keeps_genuine_predicate_negation_and_criticism_negative(v09_profile, body):
+    issues = evaluate_rules(v09_profile, ReviewContext(body=body))
+    assert not any(issue.rule_id == "CLAIM-UNSUPPORTED-ABSOLUTE-001" for issue in issues)
+
+
 def test_evidenced_percentage_observation_is_not_treated_as_unsupported_absolute(v09_profile):
     context = ReviewContext(
         body="亲测路线规划准确率100%",
@@ -161,11 +187,15 @@ def test_evidenced_percentage_observation_is_not_treated_as_unsupported_absolute
 @pytest.mark.parametrize(
     ("body", "should_match"),
     [
-        ("它可以直接预订酒店", True),
-        ("能自动筛选性价比更高的住宿", True),
-        ("会比较酒店价格并推荐更划算的一家", True),
+        ("小度想想可以预订酒店", True),
+        ("它会自动比较住宿价格", True),
+        ("不用自己比较酒店，它会推荐最划算的一家", True),
         ("支持酒店智能比价", True),
-        ("导航到酒店后结束行程", False),
+        ("我预订酒店后继续导航", False),
+        ("我会预订酒店并比较价格", False),
+        ("朋友推荐了这家住宿", False),
+        ("酒店按价格排序展示", False),
+        ("今天讨论酒店价格变化", False),
         ("它没有订酒店功能", False),
         ("不能自动比较酒店价格", False),
     ],

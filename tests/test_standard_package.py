@@ -5,6 +5,8 @@ import shutil
 from pathlib import Path
 
 import pytest
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema import validate as validate_json_schema
 from sqlalchemy.orm import Session
 
 from server.db import Base, create_db_engine
@@ -40,6 +42,57 @@ def test_loads_only_matching_tech_media_package(standards_root: Path) -> None:
     assert "代言" not in serialized
     assert "deny_words" not in serialized
     assert "must_human_keywords" not in serialized
+
+
+def test_evidence_requirement_declares_claim(standards_root: Path) -> None:
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
+    requirement = next(
+        item for item in package.evidence_requirements.evidence_requirements
+        if item.requirement_id == "EVIDENCE-001"
+    )
+    assert "claim" in requirement.required_fields
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("test_case_id", ""),
+        ("claim", ""),
+        ("command", ""),
+        ("observed_result", ""),
+        ("app_version", ""),
+        ("tested_at", ""),
+        ("device", ""),
+        ("operating_system", ""),
+        ("network_environment", ""),
+        ("evidence_asset_ids", []),
+        ("evidence_asset_ids", [""]),
+        ("evidence_asset_ids", ["   "]),
+        ("evidence_asset_ids", ["asset-1", "asset-1"]),
+    ],
+)
+def test_test_case_schema_rejects_blank_required_values_and_invalid_evidence_ids(field, value) -> None:
+    schema = json.loads((REPO_ROOT / "data" / "standards" / "schemas" / "test_case.schema.json").read_text(encoding="utf-8"))
+    record = {
+        "test_case_id": "T1", "claim": "路线规划", "command": "规划路线",
+        "observed_result": "返回路线", "evidence_asset_ids": ["asset-1"],
+        "app_version": "1.0", "tested_at": "2026-07-15", "device": "phone",
+        "operating_system": "iOS", "network_environment": "wifi",
+    }
+    record[field] = value
+    with pytest.raises(JsonSchemaValidationError):
+        validate_json_schema(record, schema)
+
+
+def test_test_case_schema_accepts_nonblank_bound_record() -> None:
+    schema = json.loads((REPO_ROOT / "data" / "standards" / "schemas" / "test_case.schema.json").read_text(encoding="utf-8"))
+    record = {
+        "test_case_id": "T1", "claim": "路线规划", "command": "规划路线",
+        "observed_result": "返回路线", "evidence_asset_ids": ["asset-1"],
+        "app_version": "1.0", "tested_at": "2026-07-15", "device": "phone",
+        "operating_system": "iOS", "network_environment": "wifi",
+    }
+    validate_json_schema(record, schema)
 
 
 def test_rejects_cross_domain_or_unresolved_rule_reference(standards_root: Path) -> None:

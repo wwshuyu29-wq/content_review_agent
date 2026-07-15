@@ -119,6 +119,10 @@ def _segments(text: str) -> list[str]:
     return [segment.strip() for segment in re.split(r"[。！？!?；;\n]+", text) if segment.strip()]
 
 
+def _predicates(segment: str) -> list[str]:
+    return [predicate.strip() for predicate in re.split(r"[,，]+", segment) if predicate.strip()]
+
+
 def _contains_any(text: str, terms: list[str]) -> bool:
     return any(term and term in text for term in terms)
 
@@ -148,19 +152,37 @@ def _guarded_claim_issues(rule: RuleSpec, context: ReviewContext) -> list[Struct
         if not _scoped(rule, context, field):
             continue
         for segment in _segments(text):
-            if _is_guarded_context(segment, rule) or _is_bound_observation(context, segment):
-                continue
-            direct = next((phrase for phrase in phrases if phrase in segment), "")
-            composition = (
-                _contains_any(segment, subjects)
-                and _contains_any(segment, quantifiers)
-                and _contains_any(segment, capabilities)
-            )
-            percentage = bool(re.search(r"(?<!\d)100\s*%", segment)) and _contains_any(segment, percentage_contexts)
-            if direct or composition or percentage:
-                evidence = direct or segment
+            predicates = [predicate.replace("不但", "").replace("不仅", "") for predicate in _predicates(segment)]
+            local_match = False
+            for local in predicates:
+                if _is_guarded_context(local, rule) or _is_bound_observation(context, local):
+                    continue
+                direct = next((phrase for phrase in phrases if phrase in local), "")
+                composition = (
+                    _contains_any(local, subjects)
+                    and _contains_any(local, quantifiers)
+                    and _contains_any(local, capabilities)
+                )
+                percentage = bool(re.search(r"(?<!\d)100\s*%", local)) and _contains_any(local, percentage_contexts)
+                if direct or composition or percentage:
+                    local_match = True
+                    issues.append(_issue(
+                        rule, field=field, evidence=direct or local,
+                        reason="命中缺少所提供依据的绝对、保证或能力比较表述",
+                        suggestion="改为有边界的观察或补充可追溯依据",
+                    ))
+            combined = "，".join(predicates)
+            if (
+                len(predicates) > 1
+                and not local_match
+                and not _is_guarded_context(combined, rule)
+                and not _is_bound_observation(context, combined)
+                and _contains_any(combined, subjects)
+                and _contains_any(combined, quantifiers)
+                and _contains_any(combined, capabilities)
+            ):
                 issues.append(_issue(
-                    rule, field=field, evidence=evidence,
+                    rule, field=field, evidence=segment,
                     reason="命中缺少所提供依据的绝对、保证或能力比较表述",
                     suggestion="改为有边界的观察或补充可追溯依据",
                 ))
@@ -170,19 +192,28 @@ def _guarded_claim_issues(rule: RuleSpec, context: ReviewContext) -> list[Struct
 def _hotel_capability_issues(rule: RuleSpec, context: ReviewContext) -> list[StructuredIssue]:
     hotel_terms = _values(rule.model_extra.get("hotel_terms", []))
     capability_terms = _values(rule.model_extra.get("capability_terms", []))
+    unambiguous_terms = _values(rule.model_extra.get("unambiguous_capability_terms", []))
+    product_terms = _values(rule.model_extra.get("product_terms", []))
+    assertion_terms = _values(rule.model_extra.get("assertion_terms", []))
     issues = []
     for field, text in _text_fields(rule, context):
         if not _scoped(rule, context, field):
             continue
         for segment in _segments(text):
-            if _is_guarded_context(segment, rule):
+            if not _contains_any(segment, hotel_terms):
                 continue
-            if _contains_any(segment, hotel_terms) and _contains_any(segment, capability_terms):
-                issues.append(_issue(
-                    rule, field=field, evidence=segment,
-                    reason="命中待确认的酒店预订、自动筛选、比较或价值排序能力",
-                    suggestion="保留为待确认产品能力并转人工核验",
-                ))
+            for predicate in _predicates(segment):
+                local = predicate.replace("不但", "").replace("不仅", "")
+                if _is_guarded_context(local, rule) or not _contains_any(local, capability_terms):
+                    continue
+                product_assertion = _contains_any(local, product_terms) and _contains_any(local, assertion_terms)
+                unambiguous_assertion = _contains_any(local, unambiguous_terms) and _contains_any(local, assertion_terms)
+                if product_assertion or unambiguous_assertion:
+                    issues.append(_issue(
+                        rule, field=field, evidence=local,
+                        reason="命中待确认的酒店预订、自动筛选、比较或价值排序能力",
+                        suggestion="保留为待确认产品能力并转人工核验",
+                    ))
     return issues
 
 
