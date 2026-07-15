@@ -169,13 +169,6 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="内容审核后端", version="2.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=trusted_public_origin_values(),
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
 
 PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc"}
 SAFE_METHODS = {"GET", "HEAD"}
@@ -194,6 +187,15 @@ async def enforce_api_authentication(request: Request, call_next):
     except HTTPException as error:
         return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
     return await call_next(request)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=trusted_public_origin_values(),
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 
 class OrmResponse(BaseModel):

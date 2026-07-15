@@ -26,7 +26,10 @@ def auth_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("SESSION_SECRET", "test-session-secret-with-at-least-32-bytes")
     monkeypatch.setenv("SESSION_COOKIE_SECURE", "false")
     monkeypatch.setenv("ENVIRONMENT", "test")
-    monkeypatch.setenv("TRUSTED_PUBLIC_ORIGINS", "http://testserver")
+    monkeypatch.setenv(
+        "TRUSTED_PUBLIC_ORIGINS",
+        "http://testserver,http://localhost:5173",
+    )
     reset_db_resources()
     with TestClient(main.app) as client:
         yield client, create_db_engine(database_url)
@@ -66,6 +69,40 @@ def test_only_health_and_login_are_public_business_surfaces(auth_api) -> None:
     for path, params in representative_reads:
         response = client.get(path, params=params)
         assert response.status_code == 401, path
+
+
+def test_unauthenticated_response_exposes_cors_to_trusted_origin(auth_api) -> None:
+    client, _ = auth_api
+
+    response = client.get("/api/projects", headers={"Origin": "http://localhost:5173"})
+
+    assert response.status_code == 401
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert response.headers["access-control-allow-credentials"] == "true"
+
+
+def test_csrf_rejection_exposes_cors_to_trusted_origin(auth_api) -> None:
+    client, _ = auth_api
+    login(client)
+
+    response = client.post(
+        "/api/projects",
+        headers={"Origin": "http://localhost:5173"},
+        json={"name": "missing-csrf"},
+    )
+
+    assert response.status_code == 403
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert response.headers["access-control-allow-credentials"] == "true"
+
+
+def test_auth_rejection_does_not_expose_cors_to_untrusted_origin(auth_api) -> None:
+    client, _ = auth_api
+
+    response = client.get("/api/projects", headers={"Origin": "https://evil.example"})
+
+    assert response.status_code == 401
+    assert "access-control-allow-origin" not in response.headers
 
 
 def test_every_business_mutation_category_requires_authentication(auth_api) -> None:
