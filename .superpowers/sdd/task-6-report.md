@@ -28,3 +28,17 @@ Implemented and verified.
 
 - The frontend package has no unit-test runner, so frontend behavior is covered by TypeScript production build verification and existing backend API contract/full-suite tests rather than component-level timer/interaction tests.
 - The full suite warning is the existing urllib3 `NotOpenSSLWarning` caused by the local Python build using LibreSSL 2.8.3; it did not fail tests.
+
+
+## Minor review fix
+
+- Wrapped the progress summary and counters in an `aria-live="polite"` region so periodic updates and terminal state are announced to screen readers.
+- Added `test_audit_progress_summary_announces_updates_to_screen_readers` to the existing source-level frontend presentation tests.
+
+## Fix verification
+
+- Regression test first failed because the live region was absent, then passed after the implementation.
+- `python3 -m pytest -q tests/test_web_presentation.py`: 5 passed.
+- `python3 -m pytest -q`: 386 passed, 1 environment warning.
+- `npm run build`: passed.
+- `git diff --check`: passed.

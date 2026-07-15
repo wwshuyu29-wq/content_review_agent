@@ -36,3 +36,10 @@ def test_evidence_and_report_use_the_central_label_adapters() -> None:
     assert '<Distribution title="Agent 决策分布"' in report
     assert "label={decisionLabel}" in report
     assert "label={categoryLabel}" in report
+
+
+def test_audit_progress_summary_announces_updates_to_screen_readers() -> None:
+    progress = (WEB / "components" / "AuditProgressPanel.tsx").read_text(encoding="utf-8")
+    assert 'aria-live="polite"' in progress
+    assert "audit-progress-summary-line" in progress
+    assert "audit-progress-counts" in progress
