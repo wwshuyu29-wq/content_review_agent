@@ -111,6 +111,29 @@ Poll every two seconds while a job is non-terminal. Stop polling on terminal sta
 
 When a non-terminal job exists, the start button becomes `查看审核进度`. When no concrete batch is selected, the disabled button must visibly explain that a batch is required.
 
+## Chinese Review Presentation
+
+The review desk is for Chinese-speaking business reviewers. Internal enum values, rule IDs, HTTP errors, URLs, stack traces, and raw JSON must not be the primary presentation.
+
+- Translate Agent decisions to `通过`, `通过但有建议`, `需要修改`, `需要人工确认`, and `阻断`.
+- Translate severity, field, category, review status, publish status, and task type values to Chinese.
+- Show a score only when the model successfully returns a valid score. Unavailable model output displays `未评分`, never a synthetic `0 分`.
+- Replace `查看原始结果` with `查看审核详情` containing Chinese summary, quoted evidence, reason, suggestion, confidence, and source description.
+- Hide internal rule IDs and raw JSON from the normal review desk. Preserve them in the database for audit and engineering diagnosis.
+- Convert technical failures into a stable Chinese business message. Never expose gateway URLs, API keys, raw response bodies, or stack traces.
+- Apply the same translations to structured findings, six-Agent cards, task actions, and report distributions.
+
+## OneAPI Structured Output Compatibility
+
+The configured `gpt-5.6-sol` model supports semantic analysis and strict JSON Schema, but strict mode requires every property to appear in `required`; optional values must be required and nullable. The runtime schema adapter must transform Pydantic output accordingly without weakening Pydantic validation after the response returns.
+
+- Recursively require every object property.
+- Represent optional fields as nullable types while preserving constraints.
+- Preserve `additionalProperties: false` for strict objects.
+- Keep final validation through `AgentReviewResult.model_validate`.
+- Capture a sanitized OneAPI error message for engineering logs and progress state.
+- Existing failed audits with unavailable fallback results are not valid semantic reviews and must be rerun after the compatibility fix.
+
 ## Failure and Recovery
 
 - OneAPI timeout or invalid JSON follows the existing retry policy and updates the attempt count.
@@ -141,3 +164,6 @@ When a non-terminal job exists, the start button becomes `查看审核进度`. W
 - A failed manuscript does not stop the remaining batch.
 - Duplicate active jobs for one batch are impossible.
 - Completion refreshes six-Agent findings and human tasks automatically.
+- `gpt-5.6-sol` completes the strict structured semantic review without a Schema `400` response.
+- Failed model calls display `未评分` rather than `0 分`.
+- Normal business-facing pages contain no untranslated enum labels, internal rule codes, raw JSON, gateway URLs, or English fallback instructions.
