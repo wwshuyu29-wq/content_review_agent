@@ -503,7 +503,7 @@ def test_rejected_content_audit_returns_conflict_without_reviving_content(api) -
     response = client.post(f"/api/contents/{content_id}/audit")
 
     assert response.status_code == 409
-    assert "terminal" in response.json()["detail"]
+    assert response.json()["detail"] == "当前内容状态不允许重复审核，请刷新后重试。"
     detail = client.get(f"/api/contents/{content_id}").json()
     assert detail["review_status"] == "REJECTED"
     assert detail["latest_audit"] is None
@@ -703,6 +703,24 @@ def test_audit_job_reads_enforce_batch_relationship_and_hide_raw_errors(api, mon
     assert payload["error_summary"] == "审核过程中出现异常，请稍后重试或联系管理员。"
     for secret in ("https://", "sk-secret", "raw response", "Traceback", "RuntimeError"):
         assert secret not in serialized
+
+
+def test_service_error_response_hides_raw_value_error_details(api, monkeypatch) -> None:
+    client, _, _ = api
+    batch = _create_audit_job_batch(client, "service-error")
+    technical_error = "invalid content 987654 at https://gateway.internal/v1; raw body=secret; Traceback RuntimeError"
+
+    def raise_technical_error(*_args, **_kwargs):
+        raise ValueError(technical_error)
+
+    monkeypatch.setattr(main, "create_or_get_active_job", raise_technical_error)
+    response = client.post(f"/api/batches/{batch['id']}/audit-jobs")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "提交信息有误，请检查后重试。"
+    assert technical_error not in response.text
+    for secret in ("987654", "https://gateway.internal", "secret", "Traceback", "RuntimeError"):
+        assert secret not in response.text
 
 
 def test_concurrent_audit_job_starts_submit_only_the_created_job(api, monkeypatch) -> None:

@@ -35,3 +35,15 @@ Implemented Chinese presentation adapter and business-safe audit detail presenta
 - `python3 -m pytest -q tests/test_web_presentation.py`: 4 passed.
 - `npm run build`: passed.
 - `git diff --check`: passed.
+
+
+## Remaining P1 fix
+- Sanitized `server/main.py` `_service_error` so ValueError text, URLs, raw bodies, stack traces, and internal IDs are never returned in JSON. Errors are classified into stable 404/409/422 Chinese business messages.
+- Added server logging of the original exception for diagnostics and removed internal entity IDs from `_not_found` responses as defense in depth.
+- Added an API regression test using a ValueError containing a URL, internal ID, raw body, and traceback text; the response contains only the stable Chinese validation message.
+
+## Final verification
+- `python3 -m pytest -q tests/test_api.py`: 21 passed.
+- `python3 -m pytest -q`: 385 passed, 1 existing LibreSSL/urllib3 warning.
+- `npm run build`: passed.
+- `git diff --check`: passed.

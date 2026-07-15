@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import time
@@ -29,6 +30,8 @@ from server.services.audit_job_service import (
     get_job_progress,
     interrupt_stale_jobs,
 )
+logger = logging.getLogger(__name__)
+
 from server.models import (
     AgentResult,
     AuditRun,
@@ -347,18 +350,28 @@ class BatchAuditResponse(BaseModel):
     results: List[BatchAuditItemResult]
 
 
+SAFE_SERVICE_MESSAGES = {
+    "审核任务暂时无法启动，请稍后重试。",
+    "提交信息有误，请检查后重试。",
+    "当前内容状态不允许重复审核，请刷新后重试。",
+}
+
+
 def _not_found(entity: str, entity_id: int) -> HTTPException:
-    return HTTPException(status_code=404, detail=f"{entity} {entity_id} not found")
+    return HTTPException(status_code=404, detail="请求的数据不存在，请刷新后重试。")
 
 
 def _service_error(error: ValueError) -> HTTPException:
-    message = str(error)
-    if "does not exist" in message or "does not belong" in message:
-        status = 404
-    elif "open review tasks" in message or "terminal" in message or "already been audited" in message:
-        status = 409
+    raw_message = str(error)
+    logger.warning("service operation failed: %s", raw_message, exc_info=True)
+    if raw_message in SAFE_SERVICE_MESSAGES:
+        status, message = 422, raw_message
+    elif "does not exist" in raw_message or "does not belong" in raw_message:
+        status, message = 404, "请求的数据不存在，请刷新后重试。"
+    elif "open review tasks" in raw_message or "terminal" in raw_message or "already been audited" in raw_message:
+        status, message = 409, "当前内容状态不允许重复审核，请刷新后重试。"
     else:
-        status = 422
+        status, message = 422, "提交信息有误，请检查后重试。"
     return HTTPException(status_code=status, detail=message)
 
 
