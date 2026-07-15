@@ -110,13 +110,16 @@ def arbitrate_review(
         )
 
     human = [issue for issue in issues if _needs_human(issue, safe_auto_fix_rule_ids)]
+    medium = [issue for issue in issues if str(_value(issue, "severity", "")).upper() in {"MEDIUM", "MID"}]
     if human or any(decision == "HUMAN_REVIEW" for decision in decisions):
+        tasks = [_task("HUMAN_REVIEW", human or issues)]
+        if medium:
+            tasks.append(_task("SUPPLIER_REVISION", medium))
         return ArbitrationResult(
             ReviewStatus.HUMAN_REVIEW_REQUIRED, PublishStatus.NOT_READY,
-            (_task("HUMAN_REVIEW", human or issues),), reason="human verification required",
+            tuple(tasks), reason="human verification required; supplier revision also required" if medium else "human verification required",
         )
 
-    medium = [issue for issue in issues if str(_value(issue, "severity", "")).upper() in {"MEDIUM", "MID"}]
     if medium or "NEED_TEXT_FIX" in decisions:
         return ArbitrationResult(
             ReviewStatus.SUPPLIER_REVISION_REQUIRED, PublishStatus.NOT_READY,

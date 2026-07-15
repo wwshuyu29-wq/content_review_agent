@@ -157,18 +157,29 @@ def _evidence_issue(rule: RuleSpec, context: ReviewContext) -> list[StructuredIs
         return []
     required = _values(rule.model_extra.get("required_fields", []))
     missing = []
+    valid_test_cases = _valid_test_cases(context)
     for field in required:
         if field == "test_cases":
-            value = _valid_test_cases(context)
+            value = valid_test_cases
         elif field in {"evidence", "evidence_assets"}:
             value = _valid_evidence(context)
         else:
             value = getattr(context, field, None)
         if not value:
             missing.append(field)
+    required_test_case_fields = _values(rule.model_extra.get("required_test_case_fields", []))
+    for field in required_test_case_fields:
+        if valid_test_cases and any(not str(record.get(field, "")).strip() for record in valid_test_cases):
+            missing.append(f"test_cases.{field}")
     if not missing:
         return []
-    return [_issue(rule, field="body", evidence=trigger, reason=f"出现实测触发词，但缺少结构化证据字段：{', '.join(missing)}", suggestion="补充可追溯的测试场景和证据")]
+    return [_issue(
+        rule,
+        field="body",
+        evidence=trigger,
+        reason=f"出现实测触发词，但缺少结构化证据字段或测试条件：{', '.join(missing)}",
+        suggestion="补充与当前内容版本绑定的测试场景、测试条件、适用边界和证据",
+    )]
 
 
 def _required_term_issue(rule: RuleSpec, context: ReviewContext, profile: ReviewProfile) -> list[StructuredIssue]:

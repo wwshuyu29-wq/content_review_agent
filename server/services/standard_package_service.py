@@ -117,6 +117,7 @@ class DeterministicRule(StrictModel):
     title_pattern: Optional[str] = None
     trigger_terms: List[str] = Field(default_factory=list)
     required_fields: List[str] = Field(default_factory=list)
+    required_test_case_fields: List[str] = Field(default_factory=list)
     required_terms: List[str] = Field(default_factory=list)
     replacement_map: Dict[str, str] = Field(default_factory=dict)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -8,8 +10,11 @@ from pydantic import ValidationError
 from scripts.text_review.reviewers.base import AgentIssue, AgentReviewResult, EvidenceSpan
 from scripts.text_review.reviewers.llm import OpenAICompatLLM
 from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer
-from server.services.deterministic_rule_service import ReviewContext
-from server.services.review_profile_service import ReviewProfile
+from server.models import PublishStatus, ReviewStatus
+from server.services.deterministic_rule_service import ReviewContext, evaluate_rules
+from server.services.review_arbiter_service import arbitrate_review
+from server.services.review_profile_service import ReviewProfile, get_review_profile
+from server.services.standard_package_service import compile_standard_package, compute_package_digest, load_standard_package
 
 
 PROFILE = ReviewProfile(
@@ -42,6 +47,30 @@ CONTEXT = ReviewContext(
     test_cases=[{"test_case_id": "T1", "command": "打开应用", "observed_result": "成功"}],
     evidence=[{"asset_id": "asset-1", "timestamp": "00:01", "quote": "成功"}],
 )
+
+
+@pytest.fixture
+def representative_context_and_profile():
+    root = Path(__file__).resolve().parents[1]
+    draft = json.loads((root / "tests" / "fixtures" / "representative_tech_media_review.json").read_text(encoding="utf-8"))
+    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "0.9"))
+    version = SimpleNamespace(
+        business_domain=compiled["metadata"]["business_domain"],
+        document_type=compiled["metadata"]["document_type"],
+        project_code=compiled["metadata"]["project_code"],
+        content_type=compiled["metadata"]["content_type"],
+        package_version=compiled["metadata"]["version"],
+        package_digest=compute_package_digest(compiled),
+        dimension_standards=compiled["dimension_standards"],
+        project_facts=compiled["project_facts"],
+        structured_rules=compiled["structured_rules"],
+    )
+    context = ReviewContext(
+        title=draft["title"], body=draft["body"], platform=draft["payload"]["platform"],
+        project_code=compiled["metadata"]["project_code"], test_cases=draft["test_cases"],
+        evidence=draft["evidence"], evidence_assets=draft["evidence_assets"],
+    )
+    return context, get_review_profile(version)
 
 
 def test_all_six_agents_return_strict_results_in_fixed_order():
@@ -80,6 +109,75 @@ def test_specialist_prompts_slice_standards_and_never_include_artist_rules():
         assert "actual test observations" in prompt
         assert "subjective opinion" in prompt
         assert "unsupported industry conclusions" in prompt
+
+
+def test_representative_prompts_encode_non_overlapping_role_boundaries(representative_context_and_profile):
+    context, profile = representative_context_and_profile
+    prompts = TechMediaReviewer().build_prompts(context, profile)
+
+    assert "unsupported absolute or superlative claims require NEED_TEXT_FIX" in prompts["COMPLIANCE"]
+    assert "tone or editorial-independence concerns alone use PASS_WITH_SUGGESTIONS" in prompts["BRAND"]
+    assert "pending hotel capabilities or comparisons require HUMAN_REVIEW" in prompts["PRODUCT_ACCURACY"]
+    assert "unbound 亲测/实测 claims and missing test conditions or boundaries require HUMAN_REVIEW" in prompts["TEST_CREDIBILITY"]
+    assert "ad-like unsupported conclusions may require NEED_TEXT_FIX" in prompts["CONTENT_QUALITY"]
+    assert "suggestions-only and cannot independently block" in prompts["CAMPAIGN_EFFECTIVENESS"]
+
+
+def test_representative_valid_protocol_preserves_revision_and_human_review(representative_context_and_profile):
+    context, profile = representative_context_and_profile
+
+    def result(agent_id, decision, issues):
+        return AgentReviewResult(
+            agent_id=agent_id,
+            agent_version=AGENT_VERSION,
+            decision=decision,
+            summary="deterministic calibration output",
+            score=70,
+            confidence=0.95,
+            issues=issues,
+        ).model_dump_json()
+
+    def finding(rule_id, severity, reference, *, human_required=False):
+        return AgentIssue(
+            rule_id=rule_id,
+            category="calibration",
+            severity=severity,
+            field="body",
+            evidence=EvidenceSpan(quote=rule_id),
+            reason="representative calibration finding",
+            suggestion="revise or verify the claim",
+            source_reference=[reference],
+            auto_fixable=False,
+            human_required=human_required,
+            confidence=0.95,
+        )
+
+    outputs = {
+        "COMPLIANCE": result("COMPLIANCE", "NEED_TEXT_FIX", [finding("COMPLIANCE-ABSOLUTE", "MEDIUM", "compliance.md")]),
+        "BRAND": result("BRAND", "PASS_WITH_SUGGESTIONS", [finding("BRAND-TONE", "LOW", "brand_consistency.md")]),
+        "PRODUCT_ACCURACY": result("PRODUCT_ACCURACY", "HUMAN_REVIEW", [finding("PENDING-HOTEL", "HIGH", "PENDING-002", human_required=True)]),
+        "TEST_CREDIBILITY": result("TEST_CREDIBILITY", "HUMAN_REVIEW", [finding("EVIDENCE-UNBOUND", "HIGH", "test_credibility.md", human_required=True)]),
+        "CONTENT_QUALITY": result("CONTENT_QUALITY", "NEED_TEXT_FIX", [finding("QUALITY-ADLIKE", "MEDIUM", "content_quality.md")]),
+        "CAMPAIGN_EFFECTIVENESS": result("CAMPAIGN_EFFECTIVENESS", "PASS_WITH_SUGGESTIONS", [finding("CAMPAIGN-HOOK", "LOW", "campaign_effectiveness.md")]),
+    }
+
+    class LLM:
+        def chat_json(self, prompt, schema):
+            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
+            return outputs[agent_id]
+
+    agent_results = TechMediaReviewer(llm=LLM()).review_structured(context, profile)
+    deterministic = evaluate_rules(profile, context)
+    arbitration = arbitrate_review(agent_results, deterministic, safe_auto_fix_rule_ids=set(profile.safe_replacement_map))
+
+    assert [item.agent_id for item in agent_results] == list(AGENT_ORDER)
+    assert [item.decision for item in agent_results] == [
+        "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS", "HUMAN_REVIEW",
+        "HUMAN_REVIEW", "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS",
+    ]
+    assert arbitration.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+    assert arbitration.publish_status is PublishStatus.NOT_READY
+    assert {task.task_type for task in arbitration.task_specs} == {"HUMAN_REVIEW", "SUPPLIER_REVISION"}
 
 
 def test_heuristic_mode_returns_six_human_review_results_without_semantic_findings():

@@ -1,0 +1,11 @@
+{
+  "external_id": "representative-tech-review-v09",
+  "title": "亲测：5个测试它全赢了，AI导航天花板",
+  "body": "这是我自用实测后的结论：小度想想就是AI导航天花板，也是复杂出行的最优解。\n\n1. 多点路线规划\n越复杂的需求，它越能扛。\n\n2. 往返行程安排\n输入往返要求后给出了一条路线。\n\n3. 沿途信息查询\n行程中继续询问沿途信息。\n\n4. 酒店选择\n它能AI订酒店，自动比出哪家更划算。",
+  "payload": {
+    "platform": "xiaohongshu"
+  },
+  "test_cases": [],
+  "evidence": [],
+  "evidence_assets": []
+}

@@ -1,1 +1,28 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["test_case_id","claim","command","observed_result"],"properties":{"test_case_id":{"type":"string"},"claim":{"type":"string"},"command":{"type":"string"},"observed_result":{"type":"string"},"evidence_asset_ids":{"type":"array","items":{"type":"string"}}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "test_case_id",
+    "claim",
+    "command",
+    "observed_result",
+    "evidence_asset_ids",
+    "app_version",
+    "tested_at",
+    "device",
+    "operating_system",
+    "network_environment"
+  ],
+  "properties": {
+    "test_case_id": {"type": "string"},
+    "claim": {"type": "string"},
+    "command": {"type": "string"},
+    "observed_result": {"type": "string"},
+    "evidence_asset_ids": {"type": "array", "items": {"type": "string"}},
+    "app_version": {"type": "string"},
+    "tested_at": {"type": "string"},
+    "device": {"type": "string"},
+    "operating_system": {"type": "string"},
+    "network_environment": {"type": "string"}
+  }
+}

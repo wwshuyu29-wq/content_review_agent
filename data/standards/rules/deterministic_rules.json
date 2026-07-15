@@ -8,28 +8,53 @@
       "severity": "HIGH",
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
-      "source_reference": ["CLAIM-001"]
+      "source_reference": ["test_credibility.md"]
     },
     {
       "rule_id": "TEST-EVIDENCE-001",
-      "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]},
       "matcher": "evidence_required",
       "trigger_terms": ["亲测", "实测", "自用"],
       "required_fields": ["test_cases", "evidence"],
+      "required_test_case_fields": ["evidence_asset_ids", "app_version", "tested_at", "device", "operating_system", "network_environment"],
       "severity": "HIGH",
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
-      "source_reference": ["CLAIM-001"]
+      "source_reference": ["test_credibility.md"]
+    },
+    {
+      "rule_id": "CLAIM-UNSUPPORTED-ABSOLUTE-001",
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]},
+      "matcher": "phrase_list",
+      "phrases": [
+        "全赢",
+        "天花板",
+        "越复杂的需求，它越能扛",
+        "行业第一",
+        "全网第一",
+        "唯一选择",
+        "绝对领先",
+        "100%",
+        "所有城市、设备和网络环境均支持全部能力"
+      ],
+      "severity": "MEDIUM",
+      "action": "REQUIRE_TEXT_FIX",
+      "auto_fixable": false,
+      "source_reference": ["compliance.md", "content_quality.md"]
     },
     {
       "rule_id": "CLAIM-PENDING-001",
-      "scope": {"content_type": "TECH_MEDIA_REVIEW", "field": "body"},
-      "matcher": "exact_phrase",
-      "phrases": ["可以自动筛选、比较酒店并判断最划算"],
+      "scope": {"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]},
+      "matcher": "phrase_list",
+      "phrases": [
+        "AI订酒店",
+        "自动比出哪家更划算",
+        "可以自动筛选、比较酒店并判断最划算"
+      ],
       "severity": "HIGH",
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
-      "source_reference": ["PENDING-002"]
+      "source_reference": ["PENDING-002", "PENDING-004", "PENDING-005"]
     }
   ]
 }

@@ -34,12 +34,30 @@ Each issue must contain only the fields defined by the issue schema, including a
 """
 
 _AGENT_INSTRUCTIONS = {
-    "COMPLIANCE": "Check legal/safety/compliance wording and unsupported claims; ignore unrelated external identity or endorsement policy.",
-    "BRAND": "Check supplied product and brand naming, positioning, and tone against relevant supplied facts; ignore unrelated external identity or endorsement policy.",
-    "PRODUCT_ACCURACY": "Check product features and capabilities only against supplied official product facts; missing support requires HUMAN_REVIEW.",
-    "TEST_CREDIBILITY": "Check whether test methodology, observed results, and evidence assets support every test claim. Use the full test/evidence context.",
-    "CONTENT_QUALITY": "Check clarity, structure, completeness, and readable expression without inventing factual or semantic findings.",
-    "CAMPAIGN_EFFECTIVENESS": "Check whether the content communicates the supplied campaign objective and platform requirements; a low score alone must not block factual compliance.",
+    "COMPLIANCE": (
+        "Check legal/safety/compliance wording and unsupported claims; unsupported absolute or superlative claims "
+        "require NEED_TEXT_FIX. Do not decide unknown product capabilities and ignore unrelated external identity or endorsement policy."
+    ),
+    "BRAND": (
+        "Check supplied product and brand naming, positioning, and verified brand facts; tone or editorial-independence concerns alone "
+        "use PASS_WITH_SUGGESTIONS; only a true conflict with a supplied brand fact may escalate. Ignore unrelated external identity or endorsement policy."
+    ),
+    "PRODUCT_ACCURACY": (
+        "Check product features and capabilities only against supplied official product facts; pending hotel capabilities or comparisons "
+        "require HUMAN_REVIEW. Never infer or invent unknown product behavior."
+    ),
+    "TEST_CREDIBILITY": (
+        "Check whether test methodology, observed results, and evidence assets support every test claim; unbound 亲测/实测 claims and "
+        "missing test conditions or boundaries require HUMAN_REVIEW. Use the full version-specific test/evidence context."
+    ),
+    "CONTENT_QUALITY": (
+        "Check clarity, structure, completeness, title/body consistency, and readable expression; ad-like unsupported conclusions may "
+        "require NEED_TEXT_FIX. Do not invent factual or semantic findings."
+    ),
+    "CAMPAIGN_EFFECTIVENESS": (
+        "Check whether the content communicates the supplied campaign objective and platform requirements. This role is suggestions-only "
+        "and cannot independently block; return only PASS or PASS_WITH_SUGGESTIONS and never override factual, compliance, or evidence findings."
+    ),
 }
 
 
@@ -172,9 +190,12 @@ class TechMediaReviewer:
                 raise ValueError("issue source_reference is missing or unknown")
         if result.decision == "PASS" and result.issues:
             raise ValueError("PASS cannot contain issues")
-        if result.decision in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}:
+        if result.decision in {"HUMAN_REVIEW", "BLOCK"}:
             if not any(issue.human_required or issue.severity in {"HIGH", "CRITICAL"} for issue in result.issues):
                 raise ValueError("blocking decision requires a blocking issue")
+        if result.decision == "NEED_TEXT_FIX":
+            if not any(issue.severity == "MEDIUM" and not issue.human_required for issue in result.issues):
+                raise ValueError("NEED_TEXT_FIX requires a non-human MEDIUM issue")
         if result.decision == "PASS_WITH_SUGGESTIONS":
             if any(issue.human_required or issue.severity != "LOW" for issue in result.issues):
                 raise ValueError("suggestions must be non-human LOW issues")

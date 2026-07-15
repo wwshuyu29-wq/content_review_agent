@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -338,6 +339,55 @@ def test_deterministic_issue_is_persisted_in_audit_before_reviewer_results(tmp_p
         assert audit.issues[0].agent_result_id is None
         assert audit.issues[0].human_required is True
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+
+
+def test_representative_fixture_audit_keeps_revision_and_human_tasks_open(tmp_path: Path) -> None:
+    fixture_path = Path(__file__).parent / "fixtures" / "representative_tech_media_review.json"
+    draft = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    def protocol_issue(rule_id, severity, *, human_required=False):
+        return issue(
+            severity.lower(), rule_id=rule_id, category="calibration", evidence_quote=rule_id,
+            reason="representative calibration finding", suggestion="revise or verify",
+            auto_fixable=False, human_required=human_required,
+        )
+
+    decisions_and_issues = [
+        ("COMPLIANCE", "NEED_TEXT_FIX", [protocol_issue("COMPLIANCE-ABSOLUTE", "MEDIUM")]),
+        ("BRAND", "PASS_WITH_SUGGESTIONS", [protocol_issue("BRAND-TONE", "LOW")]),
+        ("PRODUCT_ACCURACY", "HUMAN_REVIEW", [protocol_issue("PENDING-HOTEL", "HIGH", human_required=True)]),
+        ("TEST_CREDIBILITY", "HUMAN_REVIEW", [protocol_issue("EVIDENCE-UNBOUND", "HIGH", human_required=True)]),
+        ("CONTENT_QUALITY", "NEED_TEXT_FIX", [protocol_issue("QUALITY-ADLIKE", "MEDIUM")]),
+        ("CAMPAIGN_EFFECTIVENESS", "PASS_WITH_SUGGESTIONS", [protocol_issue("CAMPAIGN-HOOK", "LOW")]),
+    ]
+    results = [
+        {
+            "agent_name": agent_id, "agent_id": agent_id, "agent_version": "tech-media-v1",
+            "decision": decision, "summary": "calibrated", "score": 70, "status": "COMPLETED",
+            "issues": findings, "raw_result": {},
+        }
+        for agent_id, decision, findings in decisions_and_issues
+    ]
+
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session, project_id=project.id, supplier_id="representative", name="representative",
+            contents=[draft],
+        ).content_items[0]
+
+        audit = run_audit(session, item.id, reviewer=FakeReviewer(results))
+
+        assert {finding.rule_id for finding in audit.issues} >= {
+            "TEST-COUNT-001", "TEST-EVIDENCE-001", "CLAIM-UNSUPPORTED-ABSOLUTE-001",
+            "CLAIM-PENDING-001", "COMPLIANCE-ABSOLUTE", "PENDING-HOTEL", "EVIDENCE-UNBOUND",
+        }
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+        assert item.publish_status is PublishStatus.NOT_READY
+        assert {task.task_type for task in item.review_tasks if task.status == "OPEN"} == {
+            "HUMAN_REVIEW", "SUPPLIER_REVISION",
+        }
+        assert any(finding.human_required for finding in audit.issues)
 
 
 def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path: Path) -> None:

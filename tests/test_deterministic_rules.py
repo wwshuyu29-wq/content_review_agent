@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from server.services.deterministic_rule_service import ReviewContext, StructuredIssue, evaluate_rules
 from server.services.review_profile_service import get_review_profile
-from server.services.standard_package_service import compute_package_digest
+from server.services.standard_package_service import compile_standard_package, compute_package_digest, load_standard_package
 
 
 def rule(rule_id, matcher, **kwargs):
@@ -60,6 +61,78 @@ def profile_with(*rules, platform_requirements=None, replacement_rules=None, pla
     }
     version.package_digest = compute_package_digest(compiled)
     return get_review_profile(version)
+
+
+@pytest.fixture
+def representative_draft():
+    path = Path(__file__).parent / "fixtures" / "representative_tech_media_review.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def v09_profile():
+    root = Path(__file__).resolve().parents[1] / "data" / "standards"
+    compiled = compile_standard_package(load_standard_package(root, "bdmap_xdxx_tech_review_2026", "0.9"))
+    version = SimpleNamespace(
+        business_domain=compiled["metadata"]["business_domain"],
+        document_type=compiled["metadata"]["document_type"],
+        project_code=compiled["metadata"]["project_code"],
+        content_type=compiled["metadata"]["content_type"],
+        package_version=compiled["metadata"]["version"],
+        package_digest=compute_package_digest(compiled),
+        dimension_standards=compiled["dimension_standards"],
+        project_facts=compiled["project_facts"],
+        structured_rules=compiled["structured_rules"],
+    )
+    return get_review_profile(version)
+
+
+def test_representative_v09_draft_stably_routes_text_fixes_and_verification(representative_draft, v09_profile):
+    context = ReviewContext(
+        title=representative_draft["title"],
+        body=representative_draft["body"],
+        platform=representative_draft["payload"]["platform"],
+        project_code="bdmap_xdxx_tech_review_2026",
+        test_cases=representative_draft["test_cases"],
+        evidence=representative_draft["evidence"],
+        evidence_assets=representative_draft["evidence_assets"],
+    )
+
+    issues = evaluate_rules(v09_profile, context)
+    by_rule = {}
+    for issue in issues:
+        by_rule.setdefault(issue.rule_id, []).append(issue)
+
+    assert {"TEST-COUNT-001", "TEST-EVIDENCE-001", "CLAIM-UNSUPPORTED-ABSOLUTE-001", "CLAIM-PENDING-001"} <= set(by_rule)
+    assert {issue.evidence for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"]} >= {
+        "全赢", "天花板", "越复杂的需求，它越能扛",
+    }
+    assert any(issue.evidence == "最优解" and issue.suggestion == "一种可行方案" for issue in issues)
+    assert {issue.evidence for issue in by_rule["CLAIM-PENDING-001"]} >= {
+        "AI订酒店", "自动比出哪家更划算",
+    }
+    assert by_rule["TEST-COUNT-001"][0].human_required is True
+    assert "4 个" in by_rule["TEST-COUNT-001"][0].reason
+    assert by_rule["TEST-EVIDENCE-001"][0].human_required is True
+    assert all(issue.action == "REQUIRE_TEXT_FIX" for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"])
+    assert all(issue.human_required is False for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"])
+    assert all(issue.human_required for issue in by_rule["CLAIM-PENDING-001"])
+
+
+def test_unbound_test_records_still_require_version_and_conditions(v09_profile):
+    context = ReviewContext(
+        title="自用实测导航能力",
+        body="亲测后认为路线可用",
+        test_cases=[{"test_case_id": "T1", "command": "规划路线", "observed_result": "返回路线"}],
+        evidence=[{"asset_id": "asset-1"}],
+    )
+
+    issue = next(issue for issue in evaluate_rules(v09_profile, context) if issue.rule_id == "TEST-EVIDENCE-001")
+    assert issue.human_required is True
+    assert "app_version" in issue.reason
+    assert "tested_at" in issue.reason
+    assert "device" in issue.reason
+    assert "network_environment" in issue.reason
 
 
 def test_tech_profile_does_not_load_celebrity_rules():

@@ -1,7 +1,15 @@
 evidence_requirements:
   - requirement_id: EVIDENCE-001
     trigger: test_claim
-    required_fields: [command, observed_result, evidence_asset_ids]
+    required_fields:
+      - command
+      - observed_result
+      - evidence_asset_ids
+      - app_version
+      - tested_at
+      - device
+      - operating_system
+      - network_environment
     source_reference: [test_credibility.md]
   - requirement_id: EVIDENCE-002
     trigger: numeric_claim

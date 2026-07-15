@@ -114,6 +114,40 @@ def test_arbiter_routes_required_outcomes():
     )], []).review_status == ReviewStatus.PASSED
 
 
+def test_arbiter_preserves_supplier_revision_task_under_human_review_precedence():
+    agent_results = [
+        {"agent_id": agent_id, "decision": decision}
+        for agent_id, decision in zip(
+            (
+                "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
+                "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+            ),
+            (
+                "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS", "HUMAN_REVIEW",
+                "HUMAN_REVIEW", "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS",
+            ),
+        )
+    ]
+    findings = [
+        issue("ABSOLUTE", "MEDIUM", human_required=False),
+        issue("PENDING-HOTEL", "HIGH", human_required=True),
+        issue("BRAND-TONE", "LOW", human_required=False),
+        issue("CAMPAIGN-HOOK", "LOW", human_required=False),
+    ]
+
+    result = arbitrate_review(agent_results, findings)
+
+    assert result.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+    assert result.publish_status.value == "NOT_READY"
+    assert {task.task_type for task in result.task_specs} == {"HUMAN_REVIEW", "SUPPLIER_REVISION"}
+    human_task = next(task for task in result.task_specs if task.task_type == "HUMAN_REVIEW")
+    revision_task = next(task for task in result.task_specs if task.task_type == "SUPPLIER_REVISION")
+    assert "PENDING-HOTEL" in human_task.issue_keys
+    assert "ABSOLUTE" in revision_task.issue_keys
+    assert "BRAND-TONE" not in human_task.issue_keys + revision_task.issue_keys
+    assert "CAMPAIGN-HOOK" not in human_task.issue_keys + revision_task.issue_keys
+
+
 def test_run_audit_prefers_exact_version_database_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from server.services import review_service
 

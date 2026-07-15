@@ -21,3 +21,11 @@ pending_claims:
     text: 所有城市、设备和网络环境均支持全部能力
     reason: 待验证
     source_reference: [project.yaml]
+  - claim_id: PENDING-004
+    text: 小度想想可以AI订酒店
+    reason: V0.9 无已批准产品事实支持，待官方确认
+    source_reference: [project.yaml]
+  - claim_id: PENDING-005
+    text: 小度想想可以自动比出哪家酒店更划算
+    reason: V0.9 无已批准产品事实支持，待官方确认
+    source_reference: [project.yaml]
