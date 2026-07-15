@@ -191,6 +191,12 @@ def test_evidenced_percentage_observation_is_not_treated_as_unsupported_absolute
         ("它会自动比较住宿价格", True),
         ("不用自己比较酒店，它会推荐最划算的一家", True),
         ("支持酒店智能比价", True),
+        ("AI订酒店", True),
+        ("代订酒店", True),
+        ("小度想想预订酒店", True),
+        ("小度想想比较酒店价格", True),
+        ("小度想想推荐性价比最高的住宿", True),
+        ("小度想想按性价比给住宿排序", True),
         ("我预订酒店后继续导航", False),
         ("我会预订酒店并比较价格", False),
         ("朋友推荐了这家住宿", False),
@@ -198,6 +204,7 @@ def test_evidenced_percentage_observation_is_not_treated_as_unsupported_absolute
         ("今天讨论酒店价格变化", False),
         ("它没有订酒店功能", False),
         ("不能自动比较酒店价格", False),
+        ("小度想想不能预订酒店", False),
     ],
 )
 def test_pending_hotel_composition_matches_capabilities_with_negation_guard(v09_profile, body, should_match):

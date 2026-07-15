@@ -44,7 +44,7 @@
       "matcher": "hotel_capability",
       "hotel_terms": ["酒店", "住宿"],
       "capability_terms": ["订", "预订", "预约", "自动筛选", "筛选", "比较", "比价", "划算", "性价比", "排序", "推荐"],
-      "unambiguous_capability_terms": ["自动筛选", "自动比较", "自动比", "智能比价"],
+      "unambiguous_capability_terms": ["AI订", "代订", "自动筛选", "自动比较", "自动比", "智能比价"],
       "product_terms": ["小度想想", "助手", "产品", "它"],
       "assertion_terms": ["可以", "会", "能", "能够", "支持", "自动", "直接", "可"],
       "negation_terms": ["不", "没", "无", "并非", "不能", "未"],

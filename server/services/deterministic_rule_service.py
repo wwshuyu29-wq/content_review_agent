@@ -206,8 +206,8 @@ def _hotel_capability_issues(rule: RuleSpec, context: ReviewContext) -> list[Str
                 local = predicate.replace("不但", "").replace("不仅", "")
                 if _is_guarded_context(local, rule) or not _contains_any(local, capability_terms):
                     continue
-                product_assertion = _contains_any(local, product_terms) and _contains_any(local, assertion_terms)
-                unambiguous_assertion = _contains_any(local, unambiguous_terms) and _contains_any(local, assertion_terms)
+                product_assertion = _contains_any(local, product_terms)
+                unambiguous_assertion = _contains_any(local, unambiguous_terms)
                 if product_assertion or unambiguous_assertion:
                     issues.append(_issue(
                         rule, field=field, evidence=local,
