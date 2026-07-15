@@ -8,7 +8,7 @@
       "severity": "HIGH",
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
-      "source_reference": ["test_credibility.md"]
+      "source_reference": ["实测可信度.md"]
     },
     {
       "rule_id": "TEST-EVIDENCE-001",
@@ -20,7 +20,7 @@
       "severity": "HIGH",
       "action": "HUMAN_REVIEW",
       "auto_fixable": false,
-      "source_reference": ["test_credibility.md"]
+      "source_reference": ["实测可信度.md"]
     },
     {
       "rule_id": "CLAIM-UNSUPPORTED-ABSOLUTE-001",
@@ -36,7 +36,7 @@
       "severity": "MEDIUM",
       "action": "REQUIRE_TEXT_FIX",
       "auto_fixable": false,
-      "source_reference": ["compliance.md", "content_quality.md"]
+      "source_reference": ["合规与广告表达.md", "内容质量.md"]
     },
     {
       "rule_id": "CLAIM-PENDING-001",

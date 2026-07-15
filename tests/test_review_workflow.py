@@ -374,7 +374,7 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert audit.content_version.version == 1
         assert audit.rule_version_id == project.current_rule_version_id
         assert audit.model == "model-v1"
-        assert audit.prompt_version == "tech_media_review-0.9"
+        assert audit.prompt_version == "tech_media_review-1.0"
         assert audit.status == "COMPLETED"
         assert reviewer.received_standards.deny_words == []
         assert reviewer.received_standards.recommended == {}

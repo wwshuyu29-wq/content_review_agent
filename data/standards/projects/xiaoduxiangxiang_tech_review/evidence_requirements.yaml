@@ -11,8 +11,8 @@ evidence_requirements:
       - device
       - operating_system
       - network_environment
-    source_reference: [test_credibility.md]
+    source_reference: [实测可信度.md]
   - requirement_id: EVIDENCE-002
     trigger: numeric_claim
     required_fields: [source_reference]
-    source_reference: [content_accuracy.md]
+    source_reference: [内容准确性.md]

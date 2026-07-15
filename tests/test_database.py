@@ -435,7 +435,7 @@ def test_seed_default_project_is_idempotent_and_uses_tech_review_package(tmp_pat
         rules = first.current_rule_version
         assert rules is not None
         assert rules.version == 1
-        assert rules.package_version == "0.9"
+        assert rules.package_version == "1.0"
         assert rules.project_code == "bdmap_xdxx_tech_review_2026"
         assert rules.dimension_standards["metadata"]["content_type"] == "TECH_MEDIA_REVIEW"
         serialized = str({"facts": rules.project_facts, "rules": rules.structured_rules})
@@ -471,7 +471,7 @@ def test_seed_repairs_stale_current_rule_version_pointer(tmp_path: Path) -> None
 
         repaired = seed_default_project(session)
 
-        assert repaired.current_rule_version.package_version == "0.9"
+        assert repaired.current_rule_version.package_version == "1.0"
         assert repaired.current_rule_version.package_digest != "stale"
 
 
@@ -487,7 +487,7 @@ def test_seed_rejects_same_version_snapshot_with_tampered_digest(tmp_path: Path)
         tampered = RuleVersion(
             project=project,
             version=1,
-            package_version="0.9",
+            package_version="1.0",
             package_digest="tampered",
             business_domain="baidu_maps_marketing_review",
             document_type="project_standard",

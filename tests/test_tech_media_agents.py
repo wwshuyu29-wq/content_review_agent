@@ -53,7 +53,7 @@ CONTEXT = ReviewContext(
 def representative_context_and_profile():
     root = Path(__file__).resolve().parents[1]
     draft = json.loads((root / "tests" / "fixtures" / "representative_tech_media_review.json").read_text(encoding="utf-8"))
-    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "0.9"))
+    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.0"))
     version = SimpleNamespace(
         business_domain=compiled["metadata"]["business_domain"],
         document_type=compiled["metadata"]["document_type"],
@@ -109,6 +109,40 @@ def test_specialist_prompts_slice_standards_and_never_include_artist_rules():
         assert "actual test observations" in prompt
         assert "subjective opinion" in prompt
         assert "unsupported industry conclusions" in prompt
+
+
+def test_production_prompts_use_configured_public_specialist_and_one_primary_standard(
+    representative_context_and_profile,
+):
+    context, profile = representative_context_and_profile
+    prompts = TechMediaReviewer().build_prompts(context, profile)
+    standard_markers = {
+        "COMPLIANCE": "[COM-ABS-001]",
+        "BRAND": "[BRAND-NAME-001]",
+        "PRODUCT_ACCURACY": "[ACC-FUNC-001]",
+        "TEST_CREDIBILITY": "[TEST-TRIGGER-001]",
+        "CONTENT_QUALITY": "[QUAL-TITLE-001]",
+        "CAMPAIGN_EFFECTIVENESS": "[CAM-GOAL-001]",
+    }
+
+    for agent_id, prompt in prompts.items():
+        assert "六个审核 Agent 公共约束" in prompt
+        assert profile.agent_prompts[agent_id].splitlines()[0] in prompt
+        assert standard_markers[agent_id] in prompt
+        assert sum(marker in prompt for marker in standard_markers.values()) == 1
+        assert "[AUTH-" not in prompt
+
+
+def test_authorization_standard_is_conditionally_supplemental_for_compliance_and_brand_only(
+    representative_context_and_profile,
+):
+    context, profile = representative_context_and_profile
+    context = context.model_copy(update={"body": context.body + " 素材来自第三方，授权情况待确认。"})
+    prompts = TechMediaReviewer().build_prompts(context, profile)
+
+    assert "[AUTH-" in prompts["COMPLIANCE"]
+    assert "[AUTH-" in prompts["BRAND"]
+    assert all("[AUTH-" not in prompts[agent_id] for agent_id in AGENT_ORDER[2:])
 
 
 def test_representative_prompts_encode_non_overlapping_role_boundaries(representative_context_and_profile):

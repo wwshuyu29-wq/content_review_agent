@@ -8,24 +8,66 @@ approved_claims:
   - claim_id: CLAIM-003
     text: 小度想想支持行程中继续询问沿途信息和周边服务
     source_reference: [project.yaml]
+  - claim_id: PRE-001
+    text: 支持理解多点、多约束、多模式的复杂出行需求
+    source_reference: [approved_claims.yaml]
+  - claim_id: PRE-002
+    text: 支持结合指定时间段规划行程
+    source_reference: [approved_claims.yaml]
+  - claim_id: PRE-003
+    text: 支持结合低成本、少换乘、少走路等用户明确提出的偏好生成方案
+    source_reference: [approved_claims.yaml]
+  - claim_id: PRE-004
+    text: 支持组合公交、骑行、打车等多种出行方式
+    source_reference: [approved_claims.yaml]
+  - claim_id: PRE-005
+    text: 支持表达出发、中转和返程等闭环行程需求
+    source_reference: [approved_claims.yaml]
+  - claim_id: WALK-001
+    text: 步行过程中可以继续询问沿途景点和周边服务
+    source_reference: [approved_claims.yaml]
+  - claim_id: WALK-002
+    text: 支持结合雨天、带娃、散步、低强度等场景偏好规划路线
+    source_reference: [approved_claims.yaml]
+  - claim_id: WALK-003
+    text: 支持结合景点、游览时长等要求规划半天或全天步行行程
+    source_reference: [approved_claims.yaml]
+  - claim_id: WALK-004
+    text: 行程中可以继续提出新的地点和调整需求
+    source_reference: [approved_claims.yaml]
+  - claim_id: WALK-005
+    text: 路线规划可以结合终点附近餐厅或商圈需求
+    source_reference: [approved_claims.yaml]
 pending_claims:
   - claim_id: PENDING-001
-    text: 小度想想可以记住常去地点和出行习惯
-    reason: 待官方确认
-    source_reference: [project.yaml]
+    text: 记住用户出行习惯和常去地点并在后续规划中自动适配
+    reason: 待产品与隐私口径确认，必须人工审核
+    source_reference: [approved_claims.yaml]
   - claim_id: PENDING-002
-    text: 小度想想可以自动筛选、比较酒店并判断最划算
-    reason: 待官方确认，必须人工审核
-    source_reference: [project.yaml]
+    text: AI订酒店、自动筛选酒店并比较价格、位置和评分
+    reason: 当前项目资料未确认，必须人工审核
+    source_reference: [approved_claims.yaml]
   - claim_id: PENDING-003
-    text: 所有城市、设备和网络环境均支持全部能力
-    reason: 待验证
-    source_reference: [project.yaml]
+    text: 自动判断哪家酒店最划算
+    reason: 当前项目资料未确认且涉及动态价格和最优结论，必须人工审核
+    source_reference: [approved_claims.yaml]
   - claim_id: PENDING-004
-    text: 小度想想可以AI订酒店
-    reason: V0.9 无已批准产品事实支持，待官方确认
-    source_reference: [project.yaml]
+    text: 打车时完全无需输入或确认即可自动完成行程
+    reason: 需要确认真实交互流程，必须人工审核
+    source_reference: [approved_claims.yaml]
   - claim_id: PENDING-005
     text: 小度想想可以自动比出哪家酒店更划算
     reason: V0.9 无已批准产品事实支持，待官方确认
+    source_reference: [project.yaml]
+  - claim_id: PENDING-006
+    text: 所有城市、设备和网络环境均支持全部能力
+    reason: 待验证
+    source_reference: [project.yaml]
+  - claim_id: PENDING-007
+    text: 小度想想可以AI订酒店
+    reason: V0.9 无已批准产品事实支持，待官方确认
+    source_reference: [project.yaml]
+  - claim_id: PENDING-008
+    text: 小度想想可以自动筛选、比较酒店并判断最划算
+    reason: 待官方确认，必须人工审核
     source_reference: [project.yaml]

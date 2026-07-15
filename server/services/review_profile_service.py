@@ -32,6 +32,9 @@ class ReviewProfile(BaseModel):
     rules: Tuple[RuleSpec, ...]
     project_facts: Mapping[str, Any] = Field(default_factory=dict)
     global_standards: Mapping[str, str] = Field(default_factory=dict)
+    public_prompt: str = ""
+    agent_prompts: Mapping[str, str] = Field(default_factory=dict)
+    agent_standard_bindings: Mapping[str, Mapping[str, Any]] = Field(default_factory=dict)
     approved_claims: Tuple[Mapping[str, Any], ...] = ()
     pending_claims: Tuple[Mapping[str, Any], ...] = ()
     evidence_requirements: Tuple[Mapping[str, Any], ...] = ()
@@ -44,12 +47,17 @@ class ReviewProfile(BaseModel):
 
 def _snapshot_compiled(rule_version: Any) -> dict[str, Any]:
     metadata = rule_version.dimension_standards.get("metadata", {})
-    return {
+    compiled = {
         "metadata": metadata,
         "project_facts": rule_version.project_facts,
         "dimension_standards": rule_version.dimension_standards,
         "structured_rules": rule_version.structured_rules,
     }
+    if "file_hashes" in rule_version.dimension_standards:
+        compiled["file_hashes"] = rule_version.dimension_standards["file_hashes"]
+    if "agent_prompt_versions" in rule_version.dimension_standards:
+        compiled["agent_prompt_versions"] = rule_version.dimension_standards["agent_prompt_versions"]
+    return compiled
 
 
 def get_review_profile(rule_version: Any) -> ReviewProfile:
@@ -121,10 +129,16 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
     approved_claims = tuple(structured.get("approved_claims", []))
     pending_claims = tuple(structured.get("pending_claims", []))
     global_standards = dict(rule_version.dimension_standards.get("standards", {}))
+    public_prompt = str(rule_version.dimension_standards.get("public_prompt", ""))
+    agent_prompts = dict(rule_version.dimension_standards.get("agent_prompts", {}))
+    agent_standard_bindings = dict(rule_version.dimension_standards.get("agent_standard_bindings", {}))
     project_facts = dict(rule_version.project_facts or {})
     known_references = {
         "project.yaml", "approved_claims.yaml", "evidence_requirements.yaml",
         "platform_requirements.yaml", "project_context.md",
+        "合规与广告表达.md", "品牌一致性.md", "内容准确性.md", "实测可信度.md",
+        "内容质量.md", "传播有效性.md", "舆情与素材授权.md",
+        # Retain historical source-reference aliases for immutable V0.9 snapshots and fixtures.
         "compliance.md", "brand_consistency.md", "content_accuracy.md",
         "test_credibility.md", "content_quality.md", "campaign_effectiveness.md",
     }
@@ -150,6 +164,9 @@ def get_review_profile(rule_version: Any) -> ReviewProfile:
         rules=rules + replacement_specs,
         project_facts=project_facts,
         global_standards=global_standards,
+        public_prompt=public_prompt,
+        agent_prompts=agent_prompts,
+        agent_standard_bindings=agent_standard_bindings,
         approved_claims=approved_claims,
         pending_claims=pending_claims,
         evidence_requirements=tuple(evidence),

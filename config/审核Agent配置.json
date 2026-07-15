@@ -1,0 +1,36 @@
+{
+  "配置版本": "1.0",
+  "公共Prompt": "prompts/公共审核约束.md",
+  "审核Agent": {
+    "COMPLIANCE": {
+      "全局标准": "data/standards/global/合规与广告表达.md",
+      "补充标准": ["data/standards/global/舆情与素材授权.md"],
+      "Prompt": "prompts/合规与广告表达审核Agent.md"
+    },
+    "BRAND": {
+      "全局标准": "data/standards/global/品牌一致性.md",
+      "补充标准": ["data/standards/global/舆情与素材授权.md"],
+      "Prompt": "prompts/品牌一致性审核Agent.md"
+    },
+    "PRODUCT_ACCURACY": {
+      "全局标准": "data/standards/global/内容准确性.md",
+      "补充标准": [],
+      "Prompt": "prompts/产品功能准确性审核Agent.md"
+    },
+    "TEST_CREDIBILITY": {
+      "全局标准": "data/standards/global/实测可信度.md",
+      "补充标准": [],
+      "Prompt": "prompts/实测可信度审核Agent.md"
+    },
+    "CONTENT_QUALITY": {
+      "全局标准": "data/standards/global/内容质量.md",
+      "补充标准": [],
+      "Prompt": "prompts/内容质量审核Agent.md"
+    },
+    "CAMPAIGN_EFFECTIVENESS": {
+      "全局标准": "data/standards/global/传播有效性.md",
+      "补充标准": [],
+      "Prompt": "prompts/传播有效性审核Agent.md"
+    }
+  }
+}

@@ -143,6 +143,14 @@ class TechMediaReviewer:
         }[agent_id]
         return [rule.model_dump(mode="json") for rule in profile.rules if rule.rule_id.upper().startswith(prefixes)]
 
+    @staticmethod
+    def _needs_authorization_standard(context: ReviewContext) -> bool:
+        content = f"{context.title}\n{context.body}".lower()
+        return any(term in content for term in (
+            "授权", "版权", "第三方素材", "素材来源", "隐私", "个人信息",
+            "公众人物", "竞品", "社会事件", "截图来源",
+        ))
+
     def build_prompts(self, context: ReviewContext, profile: ReviewProfile) -> dict[str, str]:
         common = {
             "identity": {
@@ -159,43 +167,69 @@ class TechMediaReviewer:
             "approved_claims": list(profile.approved_claims),
             "pending_claims": list(profile.pending_claims),
         }
+        legacy_standard_names = {
+            "COMPLIANCE": "compliance",
+            "BRAND": "brand_consistency",
+            "PRODUCT_ACCURACY": "content_accuracy",
+            "TEST_CREDIBILITY": "test_credibility",
+            "CONTENT_QUALITY": "content_quality",
+            "CAMPAIGN_EFFECTIVENESS": "campaign_effectiveness",
+        }
+
+        def primary_standard(agent_id: str) -> str:
+            binding = profile.agent_standard_bindings.get(agent_id, {})
+            filename = binding.get("global_standard") if isinstance(binding, dict) else None
+            return profile.global_standards.get(filename or legacy_standard_names[agent_id], "")
+
         prompt_slices = {
             "COMPLIANCE": {
-                "standard": profile.global_standards.get("compliance", ""),
+                "standard": primary_standard("COMPLIANCE"),
                 **claims,
             },
             "BRAND": {
-                "standard": profile.global_standards.get("brand_consistency", ""),
+                "standard": primary_standard("BRAND"),
                 "project_facts": dict(profile.project_facts),
             },
             "PRODUCT_ACCURACY": {
-                "standard": profile.global_standards.get("content_accuracy", ""),
+                "standard": primary_standard("PRODUCT_ACCURACY"),
                 "project_facts": dict(profile.project_facts),
                 **claims,
             },
             "TEST_CREDIBILITY": {
-                "standard": profile.global_standards.get("test_credibility", ""),
+                "standard": primary_standard("TEST_CREDIBILITY"),
                 "evidence_requirements": list(profile.evidence_requirements),
                 "test_cases": list(context.test_cases),
                 "evidence_manifest": list(context.evidence) + list(context.evidence_assets),
             },
             "CONTENT_QUALITY": {
-                "standard": profile.global_standards.get("content_quality", ""),
+                "standard": primary_standard("CONTENT_QUALITY"),
             },
             "CAMPAIGN_EFFECTIVENESS": {
-                "standard": profile.global_standards.get("campaign_effectiveness", ""),
+                "standard": primary_standard("CAMPAIGN_EFFECTIVENESS"),
                 "platform_requirements": dict(profile.platform_requirements),
                 "project_facts": dict(profile.project_facts),
             },
         }
         prompts = {}
+        authorization_required = self._needs_authorization_standard(context)
         for agent_id in AGENT_ORDER:
             payload = dict(common)
-            payload["standard_slice"] = prompt_slices[agent_id]
+            standard_slice = dict(prompt_slices[agent_id])
+            binding = profile.agent_standard_bindings.get(agent_id, {})
+            supplemental_names = binding.get("supplemental_standards", []) if isinstance(binding, dict) else []
+            if authorization_required and agent_id in {"COMPLIANCE", "BRAND"}:
+                standard_slice["supplemental_standard"] = "\n".join(
+                    profile.global_standards.get(filename, "") for filename in supplemental_names
+                )
+            payload["standard_slice"] = standard_slice
             payload["relevant_structured_rules"] = self._relevant_rules(agent_id, profile)
+            configured_public = profile.public_prompt
+            configured_specialist = profile.agent_prompts.get(agent_id, "")
             prompts[agent_id] = (
-                _SHARED_RULES
+                (configured_public + "\n" if configured_public else "")
+                + _SHARED_RULES
                 + "\nSpecialist: " + agent_id + "\n"
+                + (configured_specialist + "\n" if configured_specialist else "")
                 + _AGENT_INSTRUCTIONS[agent_id]
                 + "\nSupplied context (the only permissible basis for findings):\n"
                 + _json(payload)
