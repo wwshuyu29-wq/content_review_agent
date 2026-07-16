@@ -127,6 +127,29 @@ def test_specialist_prompts_slice_standards_and_never_include_artist_rules():
         assert "unsupported industry conclusions" in prompt
 
 
+def test_specialist_prompts_require_stable_protocol_identity() -> None:
+    prompts = TechMediaReviewer().build_prompts(CONTEXT, PROFILE)
+
+    for agent_id, prompt in prompts.items():
+        assert f"Set agent_id exactly to {agent_id}." in prompt
+        assert f"Set agent_version exactly to {AGENT_VERSION}." in prompt
+
+
+def test_specialist_prompts_limit_issue_references_to_exact_allowlist() -> None:
+    prompts = TechMediaReviewer().build_prompts(CONTEXT, PROFILE)
+
+    for prompt in prompts.values():
+        assert "Use only the exact allowed_source_references values" in prompt
+        assert '"allowed_source_references"' in prompt
+        assert '"CLAIM-001"' in prompt
+
+
+def test_campaign_prompt_limits_suggestions_to_non_blocking_low_issues() -> None:
+    prompt = TechMediaReviewer().build_prompts(CONTEXT, PROFILE)["CAMPAIGN_EFFECTIVENESS"]
+
+    assert "Every suggestion issue must use severity LOW and human_required false" in prompt
+
+
 def test_production_prompts_use_configured_public_specialist_and_one_primary_standard(
     representative_context_and_profile,
 ):

@@ -94,6 +94,7 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             )
         if "agent_results" in table_names:
             agent_columns = {column["name"] for column in database_inspector.get_columns("agent_results")}
+            score_column_added = "score" not in agent_columns
             for column, sql_type in (
                 ("agent_id", "VARCHAR(100)"),
                 ("agent_version", "VARCHAR(100)"),
@@ -117,9 +118,10 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 "UPDATE agent_results SET summary = 'Legacy result; excluded from tech arbitration' "
                 "WHERE summary IS NULL"
             )
-            connection.exec_driver_sql(
-                "UPDATE agent_results SET score = 0 WHERE score IS NULL"
-            )
+            if score_column_added:
+                connection.exec_driver_sql(
+                    "UPDATE agent_results SET score = 0 WHERE score IS NULL"
+                )
             _raise_duplicate_groups(connection, "agent_results", ("audit_run_id", "agent_id", "agent_version"))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_results_audit_agent_version "

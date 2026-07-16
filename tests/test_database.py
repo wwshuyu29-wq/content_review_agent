@@ -354,6 +354,43 @@ def test_schema_upgrade_reports_duplicate_audit_review_keys(tmp_path: Path) -> N
         db_module.ensure_schema_upgrades(engine)
 
 
+def test_schema_upgrade_preserves_current_unavailable_agent_null_score(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = seed_default_project(session)
+        batch = Batch(project=project, supplier_id="unavailable", name="unavailable")
+        item = ContentItem(project=project, batch=batch, external_id="unavailable", title="标题")
+        version = ContentVersion(content_item=item, version=1, source="SUPPLIER", title="标题", body="正文")
+        audit = AuditRun(
+            content_item=item,
+            content_version=version,
+            rule_version=project.current_rule_version,
+            model="model",
+            prompt_version="prompt",
+            status="COMPLETED",
+        )
+        result = AgentResult(
+            audit_run=audit,
+            agent_name="COMPLIANCE",
+            agent_id="COMPLIANCE",
+            agent_version="tech-media-v1",
+            decision="HUMAN_REVIEW",
+            summary="模型审核不可用，需要人工审核。",
+            score=None,
+            status="HUMAN_REVIEW",
+            raw_result={"score": None},
+        )
+        session.add(result)
+        session.commit()
+        result_id = result.id
+
+    ensure_schema_upgrades(engine)
+
+    with Session(engine) as session:
+        assert session.get(AgentResult, result_id).score is None
+
+
 def test_schema_upgrade_adds_audit_and_agent_idempotency_indexes(tmp_path: Path) -> None:
     import server.db as db_module
 

@@ -56,7 +56,8 @@ _AGENT_INSTRUCTIONS = {
     ),
     "CAMPAIGN_EFFECTIVENESS": (
         "Check whether the content communicates the supplied campaign objective and platform requirements. This role is suggestions-only "
-        "and cannot independently block; return only PASS or PASS_WITH_SUGGESTIONS and never override factual, compliance, or evidence findings."
+        "and cannot independently block; return only PASS or PASS_WITH_SUGGESTIONS and never override factual, compliance, or evidence findings. "
+        "Every suggestion issue must use severity LOW and human_required false."
     ),
 }
 
@@ -231,6 +232,7 @@ class TechMediaReviewer:
             "platform": context.platform,
             "content": {"title": context.title, "body": context.body},
             "platform_requirements": dict(profile.platform_requirements),
+            "allowed_source_references": list(profile.known_source_references),
         }
         claims = {
             "approved_claims": list(profile.approved_claims),
@@ -302,6 +304,9 @@ class TechMediaReviewer:
                 (configured_public + "\n" if configured_public else "")
                 + _SHARED_RULES
                 + "\nSpecialist: " + agent_id + "\n"
+                + f"Set agent_id exactly to {agent_id}.\n"
+                + f"Set agent_version exactly to {AGENT_VERSION}.\n"
+                + "Use only the exact allowed_source_references values for every non-system issue source_reference.\n"
                 + (configured_specialist + "\n" if configured_specialist else "")
                 + _AGENT_INSTRUCTIONS[agent_id]
                 + "\nSupplied context (the only permissible basis for findings):\n"
