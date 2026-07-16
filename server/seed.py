@@ -11,7 +11,7 @@ from .services.standard_package_service import load_standard_package, publish_st
 DEFAULT_PROJECT_CODE = "bdmap_xdxx_tech_review_2026"
 DEFAULT_PROJECT_NAME = "百度地图小度想想科技媒体测评"
 DEFAULT_CONTENT_TYPE = "TECH_MEDIA_REVIEW"
-DEFAULT_PACKAGE_VERSION = "1.0"
+DEFAULT_PACKAGE_VERSION = "1.1"
 
 
 def seed_default_project(session: Session) -> Project:

@@ -565,7 +565,7 @@ def test_seed_default_project_is_idempotent_and_uses_tech_review_package(tmp_pat
         rules = first.current_rule_version
         assert rules is not None
         assert rules.version == 1
-        assert rules.package_version == "1.0"
+        assert rules.package_version == "1.1"
         assert rules.project_code == "bdmap_xdxx_tech_review_2026"
         assert rules.dimension_standards["metadata"]["content_type"] == "TECH_MEDIA_REVIEW"
         serialized = str({"facts": rules.project_facts, "rules": rules.structured_rules})
@@ -601,11 +601,11 @@ def test_seed_repairs_stale_current_rule_version_pointer(tmp_path: Path) -> None
 
         repaired = seed_default_project(session)
 
-        assert repaired.current_rule_version.package_version == "1.0"
+        assert repaired.current_rule_version.package_version == "1.1"
         assert repaired.current_rule_version.package_digest != "stale"
 
 
-def test_seed_rejects_same_version_snapshot_with_tampered_digest(tmp_path: Path) -> None:
+def test_seed_publishes_new_package_version_over_legacy_snapshot(tmp_path: Path) -> None:
     engine = make_sqlite_engine(tmp_path)
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -614,11 +614,11 @@ def test_seed_rejects_same_version_snapshot_with_tampered_digest(tmp_path: Path)
             code="bdmap_xdxx_tech_review_2026",
             content_type="TECH_MEDIA_REVIEW",
         )
-        tampered = RuleVersion(
+        legacy = RuleVersion(
             project=project,
             version=1,
             package_version="1.0",
-            package_digest="tampered",
+            package_digest="legacy-package-digest",
             business_domain="baidu_maps_marketing_review",
             document_type="project_standard",
             project_code=project.code,
@@ -626,14 +626,19 @@ def test_seed_rejects_same_version_snapshot_with_tampered_digest(tmp_path: Path)
             dimension_standards={},
             project_facts={},
             structured_rules={},
-            prompt_version="tampered",
+            prompt_version="legacy-1.0",
         )
-        project.current_rule_version = tampered
+        project.current_rule_version = legacy
         session.add(project)
         session.flush()
 
-        with pytest.raises(ValueError, match="digest mismatch"):
-            seed_default_project(session)
+        seeded = seed_default_project(session)
+
+        assert [(version.version, version.package_version) for version in seeded.rule_versions] == [
+            (1, "1.0"),
+            (2, "1.1"),
+        ]
+        assert seeded.current_rule_version.package_version == "1.1"
 
 
 def test_get_session_uses_configured_database_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

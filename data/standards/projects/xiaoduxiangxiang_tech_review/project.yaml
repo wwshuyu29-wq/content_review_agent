@@ -2,7 +2,7 @@ business_domain: baidu_maps_marketing_review
 document_type: project_standard
 project_code: bdmap_xdxx_tech_review_2026
 content_type: TECH_MEDIA_REVIEW
-version: "1.0"
+version: "1.1"
 name: 百度地图小度想想科技媒体测评
 facts:
   brand: 百度地图

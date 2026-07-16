@@ -53,7 +53,7 @@ CONTEXT = ReviewContext(
 def representative_context_and_profile():
     root = Path(__file__).resolve().parents[1]
     draft = json.loads((root / "tests" / "fixtures" / "representative_tech_media_review.json").read_text(encoding="utf-8"))
-    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.0"))
+    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.1"))
     version = SimpleNamespace(
         business_domain=compiled["metadata"]["business_domain"],
         document_type=compiled["metadata"]["document_type"],
@@ -172,7 +172,7 @@ def test_production_prompts_use_configured_public_specialist_and_one_primary_sta
 
 
 def test_v1_prompt_building_rejects_missing_configured_binding() -> None:
-    profile = PROFILE.model_copy(update={"package_version": "1.0"})
+    profile = PROFILE.model_copy(update={"package_version": "1.1"})
 
     with pytest.raises(ValueError, match="configured.*binding|binding.*configured"):
         TechMediaReviewer().build_prompts(CONTEXT, profile)

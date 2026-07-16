@@ -45,7 +45,7 @@ EXPECTED_AGENT_IDS = {
 def refresh_manifest(
     standards_root: Path,
     project_code: str = "bdmap_xdxx_tech_review_2026",
-    package_version: str = "1.0",
+    package_version: str = "1.1",
 ) -> None:
     standard_package_service.regenerate_standard_manifest(
         standards_root,
@@ -252,7 +252,7 @@ def test_loads_v1_package_from_canonical_chinese_paths() -> None:
         "bdmap_xdxx_tech_review_2026",
     )
 
-    assert package.metadata.version == "1.0"
+    assert package.metadata.version == "1.1"
     assert package.project.name == "百度地图小度想想科技媒体测评"
     assert set(package.global_standards) == CANONICAL_GLOBAL_FILES
     assert set(package.agent_prompt_versions) == EXPECTED_AGENT_IDS
@@ -425,15 +425,15 @@ def test_loads_future_semantic_version_from_matching_project_directory(standards
     project_file.write_text(
         project_file.read_text(encoding="utf-8")
         .replace("bdmap_xdxx_tech_review_2026", "future_tech_review_2027")
-        .replace('version: "1.0"', 'version: "1.1"'),
+        .replace('version: "1.1"', 'version: "1.2"'),
         encoding="utf-8",
     )
-    refresh_manifest(standards_root, "future_tech_review_2027", "1.1")
+    refresh_manifest(standards_root, "future_tech_review_2027", "1.2")
 
-    package = load_standard_package(standards_root, "future_tech_review_2027", "1.1")
+    package = load_standard_package(standards_root, "future_tech_review_2027", "1.2")
 
     assert package.metadata.project_code == "future_tech_review_2027"
-    assert package.metadata.version == "1.1"
+    assert package.metadata.version == "1.2"
 
 
 def test_rejects_unknown_top_level_package_fields(standards_root: Path) -> None:
@@ -445,7 +445,7 @@ def test_rejects_unknown_top_level_package_fields(standards_root: Path) -> None:
     refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="unexpected_field"):
-        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.0")
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.1")
 
 
 def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
@@ -485,11 +485,11 @@ def test_rejects_legacy_rule_arrays(standards_root: Path) -> None:
     refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="deny_words"):
-        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.0")
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.1")
 
 
 def test_same_version_tampering_is_rejected_by_digest(standards_root: Path, tmp_path: Path) -> None:
-    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.0")
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.1")
     engine = create_db_engine(f"sqlite:///{tmp_path / 'tamper.db'}")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -507,7 +507,7 @@ def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path
     package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
     compiled = compile_standard_package(package)
 
-    assert compiled["metadata"]["version"] == "1.0"
+    assert compiled["metadata"]["version"] == "1.1"
     assert compiled["structured_rules"]["rules"]
     assert compiled["project_facts"]["project_code"] == "bdmap_xdxx_tech_review_2026"
 
@@ -527,7 +527,7 @@ def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path
 
         assert version.id == same_version.id
         assert version.version == 1
-        assert version.package_version == "1.0"
+        assert version.package_version == "1.1"
         assert version.package_digest == compute_package_digest(compiled)
         assert version.project_code == "bdmap_xdxx_tech_review_2026"
         assert version.dimension_standards["metadata"] == compiled["metadata"]

@@ -72,7 +72,7 @@ def representative_draft():
 @pytest.fixture
 def v09_profile():
     root = Path(__file__).resolve().parents[1] / "data" / "standards"
-    compiled = compile_standard_package(load_standard_package(root, "bdmap_xdxx_tech_review_2026", "1.0"))
+    compiled = compile_standard_package(load_standard_package(root, "bdmap_xdxx_tech_review_2026", "1.1"))
     version = SimpleNamespace(
         business_domain=compiled["metadata"]["business_domain"],
         document_type=compiled["metadata"]["document_type"],

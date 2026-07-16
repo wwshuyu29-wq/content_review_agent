@@ -104,11 +104,11 @@ def test_startup_seeds_project_and_supports_project_rule_workflow(api) -> None:
 
     package_rule = client.post(
         f"/api/projects/{seeded['id']}/rule-versions",
-        json={"project_code": "bdmap_xdxx_tech_review_2026", "package_version": "1.0"},
+        json={"project_code": "bdmap_xdxx_tech_review_2026", "package_version": "1.1"},
     )
     assert package_rule.status_code == 200
     assert package_rule.json()["version"] == 1
-    assert package_rule.json()["package_version"] == "1.0"
+    assert package_rule.json()["package_version"] == "1.1"
 
     versions = client.get(f"/api/projects/{seeded['id']}/rule-versions")
     assert versions.status_code == 200
