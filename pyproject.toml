@@ -20,4 +20,7 @@ dependencies = [
 package = false
 
 [tool.vercel]
-entrypoint = "server.main:app"
+entrypoint = "server.vercel_app:app"
+
+[tool.vercel.scripts]
+build = "python build.py"
