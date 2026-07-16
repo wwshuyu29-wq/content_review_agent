@@ -28,8 +28,9 @@ from server.seed import seed_default_project
 from server.services.content_service import submit_batch
 from server.services.deterministic_rule_service import ReviewContext
 from server.services.report_service import build_report
-from server.services.review_profile_service import get_review_profile
+from server.services.review_profile_service import _snapshot_compiled, get_review_profile
 from server.services.review_service import _standards_from_rule_version, resolve_task, run_audit
+from server.services.standard_package_service import compute_package_digest
 
 
 class FakeReviewer:
@@ -683,6 +684,27 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
         brand = next(result for result in unavailable.agent_results if result.agent_id == "BRAND")
         for issue in list(brand.issues):
             session.delete(issue)
+        previous_rules = project.current_rule_version
+        current_dimensions = json.loads(json.dumps(previous_rules.dimension_standards))
+        current_dimensions["metadata"]["version"] = "1.2"
+        current_rules = RuleVersion(
+            project=project,
+            version=previous_rules.version + 1,
+            package_version="1.2",
+            package_digest="current-package-digest",
+            business_domain=previous_rules.business_domain,
+            document_type=previous_rules.document_type,
+            project_code=previous_rules.project_code,
+            content_type=previous_rules.content_type,
+            dimension_standards=current_dimensions,
+            project_facts=previous_rules.project_facts,
+            structured_rules=previous_rules.structured_rules,
+            prompt_version="tech_media_review-1.2",
+        )
+        current_rules.package_digest = compute_package_digest(_snapshot_compiled(current_rules))
+        session.add(current_rules)
+        session.flush()
+        project.current_rule_version = current_rules
         session.commit()
 
         replacement = run_audit(session, item.id, reviewer=ProtocolReviewer())
@@ -690,6 +712,33 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
         assert unavailable.status == "SUPERSEDED"
         assert replacement.status == "COMPLETED"
         assert all(task.status == "SUPERSEDED" for task in unavailable.review_tasks)
+
+
+def test_nonzero_score_result_with_unavailable_raw_issue_cannot_be_superseded(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="inconsistent-unavailable",
+            name="不一致不可用审核",
+            contents=[{
+                "external_id": "inconsistent-unavailable-1",
+                "title": "路线规划体验",
+                "body": "路线规划步骤清晰，正文信息完整。",
+                "payload": {"platform": "xiaohongshu"},
+            }],
+        ).content_items[0]
+        audit = run_audit(session, item.id, reviewer=TechMediaReviewer())
+        audit.agent_results[0].score = 90
+        audit.agent_results[0].raw_result["score"] = 90
+        session.commit()
+
+        with pytest.raises(ValueError, match="already been audited"):
+            run_audit(session, item.id, reviewer=ProtocolReviewer())
+
+        assert audit.status == "COMPLETED"
+        assert audit.review_key is not None
 
 
 def test_valid_audit_prevents_newer_unavailable_history_from_being_superseded(tmp_path: Path) -> None:

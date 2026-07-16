@@ -118,9 +118,14 @@ def _review_key(content_version_id: int, rule_version_id: int) -> str:
 def _is_unavailable_agent_result(result: AgentResult) -> bool:
     raw_issues = result.raw_result.get("issues") if isinstance(result.raw_result, dict) else None
     if isinstance(raw_issues, list) and raw_issues:
-        return all(
-            isinstance(issue, dict) and issue.get("rule_id") == "SYSTEM-LLM-UNAVAILABLE"
-            for issue in raw_issues
+        raw_score = result.raw_result.get("score")
+        return (
+            result.score in (None, 0)
+            and raw_score in (None, 0)
+            and all(
+                isinstance(issue, dict) and issue.get("rule_id") == "SYSTEM-LLM-UNAVAILABLE"
+                for issue in raw_issues
+            )
         )
     return (
         result.score is None
@@ -413,12 +418,18 @@ def run_audit(
     running_audit = next((audit for audit in matching_audits if audit.status == "RUNNING"), None)
     if running_audit is not None:
         raise ValueError("Content version has already been audited with this rule version")
-    unavailable_audit = next(
-        (audit for audit in matching_audits if _is_unavailable_only_audit(audit)),
-        None,
-    )
-    if unavailable_audit is not None:
-        _supersede_unavailable_audit(unavailable_audit)
+    historical_audits = list(session.scalars(
+        select(AuditRun)
+        .where(
+            AuditRun.content_version_id == content_version.id,
+            AuditRun.status == "COMPLETED",
+        )
+        .order_by(AuditRun.id.desc())
+    ))
+    unavailable_audits = [audit for audit in historical_audits if _is_unavailable_only_audit(audit)]
+    if unavailable_audits:
+        for unavailable_audit in unavailable_audits:
+            _supersede_unavailable_audit(unavailable_audit)
         session.flush()
     if _open_tasks(item):
         raise ValueError("Content has open review tasks; resolve them before re-audit")
