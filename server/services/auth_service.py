@@ -25,6 +25,7 @@ from server.models import User, UserSession
 
 SESSION_COOKIE_NAME = "content_review_session"
 DEFAULT_SESSION_TTL = timedelta(hours=12)
+DEFAULT_TEAM_MODEL = "GPT 5.6 SOL"
 _PASSWORD_HASHER = PasswordHasher(type=Type.ID)
 _DUMMY_PASSWORD_HASH: Optional[str] = None
 
@@ -484,3 +485,63 @@ def ensure_initial_admin(session: Session) -> Optional[User]:
         session.rollback()
         return _verified_initial_admin(session, username)
     return admin
+
+
+def _configured_team_usernames() -> list[str]:
+    raw = os.environ.get("TEAM_USERNAMES", "")
+    usernames: list[str] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        username = normalize_username(item)
+        if username not in seen:
+            usernames.append(username)
+            seen.add(username)
+    return usernames
+
+
+def ensure_team_users(session: Session) -> list[User]:
+    usernames = _configured_team_usernames()
+    if not usernames:
+        return []
+    password = os.environ.get("TEAM_USER_PASSWORD", "")
+    if len(password) < 12:
+        raise RuntimeError("TEAM_USER_PASSWORD must contain at least 12 characters")
+    _session_secret()
+    model = os.environ.get("TEAM_USER_MODEL", DEFAULT_TEAM_MODEL).strip() or DEFAULT_TEAM_MODEL
+    users: list[User] = []
+    for username in usernames:
+        existing = session.scalar(select(User).where(User.username == username))
+        if existing is None:
+            existing = User(
+                username=username,
+                display_name=username,
+                password_hash=hash_password(password),
+                role="REVIEWER",
+                is_active=True,
+                oneapi_model=model,
+            )
+            session.add(existing)
+            session.flush()
+            users.append(existing)
+            continue
+        changed = False
+        if existing.role not in {"ADMIN", "REVIEWER"}:
+            existing.role = "REVIEWER"
+            changed = True
+        if not existing.is_active:
+            existing.is_active = True
+            changed = True
+        if not verify_password(existing.password_hash, password):
+            existing.password_hash = hash_password(password)
+            changed = True
+        if not existing.oneapi_model:
+            existing.oneapi_model = model
+            changed = True
+        if changed:
+            existing.session_version += 1
+            revoke_user_sessions(session, existing)
+            session.flush()
+        users.append(existing)
+    return users

@@ -85,6 +85,7 @@ from server.services.auth_service import (
     decrypt_secret,
     encrypt_secret,
     ensure_initial_admin,
+    ensure_team_users,
     hash_password,
     normalize_username,
     require_admin,
@@ -218,6 +219,7 @@ async def lifespan(_app: FastAPI):
     ensure_schema_upgrades(engine)
     with Session(engine) as session:
         ensure_initial_admin(session)
+        ensure_team_users(session)
         seed_default_project(session)
         stale_seconds = max(1, int(os.environ.get("AUDIT_JOB_STALE_SECONDS", "300")))
         interrupt_stale_jobs(session, datetime.utcnow() - timedelta(seconds=stale_seconds))

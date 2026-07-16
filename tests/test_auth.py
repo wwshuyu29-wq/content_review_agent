@@ -269,6 +269,66 @@ def test_existing_initial_admin_password_is_refreshed_from_bootstrap_env(
         assert lookup_session(session, old_session.session_token) is None
 
 
+def test_team_users_are_bootstrapped_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.models import User
+    from server.services.auth_service import ensure_team_users, verify_password
+
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'team-users.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setenv("SESSION_SECRET", "bootstrap-session-secret-with-32-bytes")
+    monkeypatch.setenv("TEAM_USERNAMES", "jhz,lsy,lyx,qj,lxl,cj,jhz")
+    monkeypatch.setenv("TEAM_USER_PASSWORD", "team-password-123")
+
+    with Session(engine) as session:
+        created = ensure_team_users(session)
+        created_names = [user.username for user in created]
+        session.commit()
+
+    assert created_names == ["jhz", "lsy", "lyx", "qj", "lxl", "cj"]
+    with Session(engine) as session:
+        users = list(session.scalars(select(User).order_by(User.username)))
+        assert [user.username for user in users] == ["cj", "jhz", "lsy", "lxl", "lyx", "qj"]
+        assert all(user.role == "REVIEWER" for user in users)
+        assert all(user.is_active for user in users)
+        assert all(user.oneapi_model == "GPT 5.6 SOL" for user in users)
+        assert all(verify_password(user.password_hash, "team-password-123") for user in users)
+
+
+def test_team_user_bootstrap_refreshes_existing_password_and_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.models import User
+    from server.services.auth_service import create_session, ensure_team_users, hash_password, lookup_session, verify_password
+
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'refresh-team-users.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setenv("SESSION_SECRET", "bootstrap-session-secret-with-32-bytes")
+    monkeypatch.setenv("TEAM_USERNAMES", "jhz")
+    monkeypatch.setenv("TEAM_USER_PASSWORD", "new-team-password")
+
+    with Session(engine) as session:
+        user = User(
+            username="jhz",
+            display_name="jhz",
+            password_hash=hash_password("old-team-password"),
+            role="REVIEWER",
+            is_active=True,
+        )
+        session.add(user)
+        session.flush()
+        old_session = create_session(session, user)
+        session.commit()
+
+        refreshed = ensure_team_users(session)
+        session.commit()
+
+        assert refreshed[0].username == "jhz"
+        assert verify_password(refreshed[0].password_hash, "new-team-password")
+        assert lookup_session(session, old_session.session_token) is None
+
+
 def test_missing_bootstrap_secrets_fail_only_when_no_users_exist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

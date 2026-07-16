@@ -71,6 +71,18 @@ export ONEAPI_BASE_URL="https://oneapi-comate.baidu-int.com/v1"
 
 `ONEAPI_BASE_URL` 默认是 `https://oneapi-comate.baidu-int.com/v1`，只能由受信任的进程环境提供，API 和审核台均不能读取或修改它。`ONEAPI_MODEL` 可在审核台保存为非敏感运行配置，非空保存值优先于环境变量。`ONEAPI_KEY` 不在 API、网页配置或数据库中接收、返回或持久化。不要将密钥写入仓库文件或命令历史。
 
+### 团队账号
+
+生产环境可通过环境变量自动创建内部团队账号。应用每次启动都会幂等检查这些账号；不存在则创建，已存在则确保启用并刷新为配置的初始密码。
+
+```bash
+export TEAM_USERNAMES="jhz,lsy,lyx,qj,lxl,cj"
+export TEAM_USER_PASSWORD="至少12位的团队初始密码"
+export TEAM_USER_MODEL="GPT 5.6 SOL"
+```
+
+这些账号默认是 `REVIEWER`。每个成员登录后在首页/看板的 One API 配置卡片中填写自己的 API key；key 按账号加密保存，不会与其他成员共享。
+
 ## 使用流程
 
 1. 在“标准管理”选择默认项目或创建项目，发布规则版本。
