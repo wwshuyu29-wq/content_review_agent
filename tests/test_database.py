@@ -391,6 +391,52 @@ def test_schema_upgrade_preserves_current_unavailable_agent_null_score(tmp_path:
         assert session.get(AgentResult, result_id).score is None
 
 
+def test_legacy_agent_score_upgrade_backfills_once_and_preserves_current_nulls(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE agent_results (
+                id INTEGER PRIMARY KEY,
+                audit_run_id INTEGER NOT NULL,
+                agent_name VARCHAR(100) NOT NULL,
+                status VARCHAR(50) NOT NULL,
+                raw_result JSON NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO agent_results "
+            "(id, audit_run_id, agent_name, status, raw_result, created_at, updated_at) "
+            "VALUES (1, 1, 'legacy', 'COMPLETED', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+
+    ensure_schema_upgrades(engine)
+
+    with engine.begin() as connection:
+        first_upgrade = connection.exec_driver_sql(
+            "SELECT score, agent_id, agent_version FROM agent_results WHERE id = 1"
+        ).one()
+        assert first_upgrade == (0, "LEGACY-1", "legacy-v1")
+        connection.exec_driver_sql(
+            "INSERT INTO agent_results "
+            "(id, audit_run_id, agent_name, agent_id, agent_version, decision, summary, score, status, raw_result, created_at, updated_at) "
+            "VALUES (2, 2, 'COMPLIANCE', 'COMPLIANCE', 'tech-media-v1', 'HUMAN_REVIEW', ?, NULL, "
+            "'HUMAN_REVIEW', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            ("模型审核不可用，需要人工审核。", '{"score": null}'),
+        )
+
+    ensure_schema_upgrades(engine)
+
+    with engine.begin() as connection:
+        rows = connection.exec_driver_sql(
+            "SELECT id, score FROM agent_results ORDER BY id"
+        ).all()
+        assert rows == [(1, 0), (2, None)]
+
+
 def test_schema_upgrade_adds_audit_and_agent_idempotency_indexes(tmp_path: Path) -> None:
     import server.db as db_module
 

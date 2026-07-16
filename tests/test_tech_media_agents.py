@@ -393,6 +393,108 @@ def test_protocol_validator_requires_score_but_allows_controlled_unavailable_nul
     assert "score" in validate_agent_result(noncontrolled, "CAMPAIGN_EFFECTIVENESS", set()).lower()
 
 
+def _protocol_result(
+    agent_id: str,
+    *,
+    agent_version: str = AGENT_VERSION,
+    decision: str = "PASS",
+    issues: list[dict] | None = None,
+) -> dict:
+    return {
+        "agent_id": agent_id,
+        "agent_version": agent_version,
+        "decision": decision,
+        "summary": "协议行为测试",
+        "score": 80,
+        "confidence": 0.9,
+        "issues": issues or [],
+    }
+
+
+def _protocol_issue(*, severity: str = "HIGH", human_required: bool = True, reference: str = "CLAIM-001") -> dict:
+    return {
+        "rule_id": "PROTOCOL-001",
+        "category": "protocol",
+        "severity": severity,
+        "field": "body",
+        "evidence": {"quote": "证据"},
+        "reason": "协议行为测试",
+        "suggestion": "修正协议输出",
+        "source_reference": [reference],
+        "auto_fixable": False,
+        "human_required": human_required,
+        "confidence": 0.9,
+    }
+
+
+@pytest.mark.parametrize(
+    ("expected_agent_id", "invalid_result", "error_fragment"),
+    [
+        ("COMPLIANCE", _protocol_result("BRAND"), "agent_id must be COMPLIANCE"),
+        (
+            "COMPLIANCE",
+            _protocol_result("COMPLIANCE", agent_version="unexpected-v2"),
+            "unexpected agent_version",
+        ),
+        (
+            "COMPLIANCE",
+            _protocol_result(
+                "COMPLIANCE",
+                decision="HUMAN_REVIEW",
+                issues=[_protocol_issue(reference="UNKNOWN-SOURCE")],
+            ),
+            "unknown issue references",
+        ),
+        (
+            "CAMPAIGN_EFFECTIVENESS",
+            _protocol_result(
+                "CAMPAIGN_EFFECTIVENESS",
+                decision="PASS_WITH_SUGGESTIONS",
+                issues=[_protocol_issue(severity="HIGH", human_required=True)],
+            ),
+            "invalid suggestions",
+        ),
+    ],
+)
+def test_protocol_violations_are_rejected_then_retry_to_controlled_fallback(
+    expected_agent_id: str,
+    invalid_result: dict,
+    error_fragment: str,
+) -> None:
+    parsed = AgentReviewResult.model_validate(invalid_result)
+    assert error_fragment in validate_agent_result(
+        parsed,
+        expected_agent_id,
+        set(PROFILE.known_source_references),
+    )
+
+    class LLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat_json(self, prompt, schema):
+            self.calls += 1
+            return invalid_result
+
+    llm = LLM()
+    result = TechMediaReviewer(llm=llm)._llm_result(
+        expected_agent_id,
+        "behavioral protocol test",
+        PROFILE,
+    )
+
+    assert llm.calls == 3
+    assert result.score is None
+    assert result.issues[0].rule_id == "SYSTEM-LLM-UNAVAILABLE"
+    if expected_agent_id == "CAMPAIGN_EFFECTIVENESS":
+        assert result.decision == "PASS_WITH_SUGGESTIONS"
+        assert result.issues[0].severity == "LOW"
+        assert result.issues[0].human_required is False
+    else:
+        assert result.decision == "HUMAN_REVIEW"
+        assert result.issues[0].human_required is True
+
+
 def test_llm_parse_retry_succeeds_on_third_call():
     class LLM:
         def __init__(self):
