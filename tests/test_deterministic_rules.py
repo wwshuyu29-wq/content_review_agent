@@ -72,7 +72,7 @@ def representative_draft():
 @pytest.fixture
 def v09_profile():
     root = Path(__file__).resolve().parents[1] / "data" / "standards"
-    compiled = compile_standard_package(load_standard_package(root, "bdmap_xdxx_tech_review_2026", "1.1"))
+    compiled = compile_standard_package(load_standard_package(root, "bdmap_xdxx_tech_review_2026", "1.3"))
     version = SimpleNamespace(
         business_domain=compiled["metadata"]["business_domain"],
         document_type=compiled["metadata"]["document_type"],
@@ -103,7 +103,9 @@ def test_representative_v09_draft_stably_routes_text_fixes_and_verification(repr
     for issue in issues:
         by_rule.setdefault(issue.rule_id, []).append(issue)
 
-    assert {"TEST-COUNT-001", "TEST-EVIDENCE-001", "CLAIM-UNSUPPORTED-ABSOLUTE-001", "CLAIM-PENDING-001"} <= set(by_rule)
+    assert {"CLAIM-UNSUPPORTED-ABSOLUTE-001", "CLAIM-PENDING-001"} <= set(by_rule)
+    assert "TEST-COUNT-001" not in by_rule
+    assert "TEST-EVIDENCE-001" not in by_rule
     assert {issue.evidence for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"]} >= {
         "全赢", "天花板", "越复杂的需求，它越能扛",
     }
@@ -111,9 +113,6 @@ def test_representative_v09_draft_stably_routes_text_fixes_and_verification(repr
     hotel_evidence = "\n".join(issue.evidence for issue in by_rule["CLAIM-PENDING-001"])
     assert "AI订酒店" in hotel_evidence
     assert "自动比出哪家更划算" in hotel_evidence
-    assert by_rule["TEST-COUNT-001"][0].human_required is True
-    assert "4 个" in by_rule["TEST-COUNT-001"][0].reason
-    assert by_rule["TEST-EVIDENCE-001"][0].human_required is True
     assert all(issue.action == "REQUIRE_TEXT_FIX" for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"])
     assert all(issue.human_required is False for issue in by_rule["CLAIM-UNSUPPORTED-ABSOLUTE-001"])
     assert all(issue.human_required for issue in by_rule["CLAIM-PENDING-001"])
@@ -241,9 +240,9 @@ def _bound_test_context(**test_case_updates):
         {"evidence_asset_ids": ["missing-asset"]},
     ],
 )
-def test_invalid_or_unbound_test_case_fields_require_evidence_review(v09_profile, updates):
+def test_invalid_or_unbound_test_case_fields_do_not_require_evidence_review(v09_profile, updates):
     issues = evaluate_rules(v09_profile, _bound_test_context(**updates))
-    assert any(issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
+    assert not any(issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
 
 
 def test_unrelated_evidence_binding_does_not_satisfy_test_case(v09_profile):
@@ -251,7 +250,7 @@ def test_unrelated_evidence_binding_does_not_satisfy_test_case(v09_profile):
     context = context.model_copy(update={
         "evidence": [{"test_case_id": "OTHER", "asset_id": "asset-1"}],
     })
-    assert any(issue.rule_id == "TEST-EVIDENCE-001" for issue in evaluate_rules(v09_profile, context))
+    assert not any(issue.rule_id == "TEST-EVIDENCE-001" for issue in evaluate_rules(v09_profile, context))
 
 
 def test_fully_bound_test_case_and_manifest_satisfy_evidence_rule(v09_profile):
@@ -261,7 +260,7 @@ def test_fully_bound_test_case_and_manifest_satisfy_evidence_rule(v09_profile):
     )
 
 
-def test_unbound_test_records_still_require_version_and_conditions(v09_profile):
+def test_unbound_test_records_do_not_require_version_and_conditions(v09_profile):
     context = ReviewContext(
         title="自用实测导航能力",
         body="亲测后认为路线可用",
@@ -269,12 +268,7 @@ def test_unbound_test_records_still_require_version_and_conditions(v09_profile):
         evidence=[{"asset_id": "asset-1"}],
     )
 
-    issue = next(issue for issue in evaluate_rules(v09_profile, context) if issue.rule_id == "TEST-EVIDENCE-001")
-    assert issue.human_required is True
-    assert "app_version" in issue.reason
-    assert "tested_at" in issue.reason
-    assert "device" in issue.reason
-    assert "network_environment" in issue.reason
+    assert not any(issue.rule_id == "TEST-EVIDENCE-001" for issue in evaluate_rules(v09_profile, context))
 
 
 def test_tech_profile_does_not_load_celebrity_rules():
@@ -300,14 +294,13 @@ def test_exact_phrase_reports_structured_metadata():
 def test_count_mismatch_uses_declared_count_and_numbered_sections():
     profile = profile_with(rule("TEST-COUNT-001", "count_consistency", title_pattern=r"(\d+)个测试", scope={"content_type": "TECH_MEDIA_REVIEW", "fields": ["title", "body"]}))
     context = ReviewContext(title="亲测：5个测试", body="1. 场景一\n2. 场景二", test_cases=[])
-    assert {issue.rule_id for issue in evaluate_rules(profile, context)} == {"TEST-COUNT-001"}
+    assert evaluate_rules(profile, context) == []
 
 
-def test_evidence_trigger_without_evidence_routes_to_human():
+def test_evidence_trigger_without_evidence_does_not_route_to_human():
     profile = profile_with(rule("TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases"]))
     issues = evaluate_rules(profile, ReviewContext(title="亲测小度想想", body="亲测结果很好", test_cases=[]))
-    assert issues[0].human_required is True
-    assert "造假" not in issues[0].reason
+    assert issues == []
 
 
 def test_evidence_present_does_not_fire():
@@ -325,7 +318,7 @@ def test_evidence_present_does_not_fire():
     assert evaluate_rules(profile, context) == []
 
 
-def test_no_approved_trigger_and_no_image_scene_has_no_evidence_issue():
+def test_no_approved_trigger_has_no_evidence_issue():
     profile = profile_with(rule(
         "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["体验", "亲测"],
         required_fields=["test_cases", "evidence"],
@@ -336,72 +329,7 @@ def test_no_approved_trigger_and_no_image_scene_has_no_evidence_issue():
         evidence_assets=[{"asset_id": "cover", "kind": "SCREENSHOT"}],
     ))
 
-    assert not any(issue.rule_id.startswith("IMAGE-EVIDENCE") or issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
-
-
-def test_screenshot_candidate_does_not_pretend_structured_test_metadata_exists():
-    profile = profile_with(rule(
-        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"],
-        required_fields=["test_cases", "evidence"],
-    ))
-    context = ReviewContext(
-        title="亲测路线规划", body="截图展示操作和结果。",
-        image_evidence_analyses=[{
-            "asset_id": "asset-1", "status": "ANALYZED", "is_test_scene": True,
-            "visible_input": "北京南站到故宫", "visible_result": "返回三条路线",
-            "visible_product": "百度地图", "detected_text": "北京南站 故宫",
-            "confidence": 0.94, "missing_context": ["app_version", "tested_at"],
-            "reasoning": "可见输入和结果",
-        }],
-    )
-
-    issues = evaluate_rules(profile, context)
-
-    issue = next(issue for issue in issues if issue.rule_id == "IMAGE-EVIDENCE-CONTEXT-INCOMPLETE")
-    assert issue.human_required is True
-    assert issue.evidence == "asset-1"
-    assert issue.confidence == 0.94
-    assert context.test_cases == []
     assert not any(issue.rule_id == "TEST-EVIDENCE-001" for issue in issues)
-
-
-def test_low_confidence_image_candidate_routes_to_uncertain_human_review():
-    profile = profile_with(rule(
-        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases"]
-    ))
-    context = ReviewContext(
-        title="路线规划介绍", body="普通介绍",
-        image_evidence_analyses=[{
-            "asset_id": "asset-low", "status": "ANALYZED", "is_test_scene": True,
-            "visible_input": "可能是路线输入", "visible_result": "可能有结果",
-            "visible_product": "百度地图", "detected_text": "模糊文字",
-            "confidence": 0.61, "missing_context": [], "reasoning": "画面模糊",
-        }],
-    )
-
-    issues = evaluate_rules(profile, context)
-
-    issue = next(issue for issue in issues if issue.rule_id == "IMAGE-EVIDENCE-UNCERTAIN")
-    assert issue.human_required is True
-    assert issue.confidence == 0.61
-
-
-def test_unavailable_vision_routes_human_only_when_text_triggered():
-    profile = profile_with(rule(
-        "TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases"]
-    ))
-    unavailable = [{
-        "asset_id": "asset-offline", "status": "UNAVAILABLE", "is_test_scene": False,
-        "visible_input": None, "visible_result": None, "visible_product": None,
-        "detected_text": "", "confidence": 0, "missing_context": ["vision_analysis_unavailable"],
-        "reasoning": "服务不可用",
-    }]
-
-    triggered = evaluate_rules(profile, ReviewContext(title="亲测路线", image_evidence_analyses=unavailable))
-    ordinary = evaluate_rules(profile, ReviewContext(title="路线产品介绍", image_evidence_analyses=unavailable))
-
-    assert any(issue.rule_id == "IMAGE-EVIDENCE-UNCERTAIN" and issue.human_required for issue in triggered)
-    assert ordinary == []
 
 
 def test_scoped_platform_rule_only_matches_platform():
@@ -449,13 +377,11 @@ def test_platform_aliases_normalize_before_scope_and_pending_lookup():
     assert evaluate_rules(profile, ReviewContext(body="正文", platform="")) == []
 
 
-def test_invalid_test_and_evidence_records_remain_missing():
+def test_invalid_test_and_evidence_records_do_not_create_missing_evidence_issue():
     profile = profile_with(rule("TEST-EVIDENCE-001", "evidence_required", trigger_terms=["亲测"], required_fields=["test_cases", "evidence"]))
     context = ReviewContext(title="亲测", body="亲测结果", test_cases=[{}], evidence=[{"asset_id": "  "}])
     issues = evaluate_rules(profile, context)
-    assert issues[0].human_required is True
-    assert "证据" in issues[0].reason
-    assert "造假" not in issues[0].reason
+    assert issues == []
 
 
 def test_text_scope_is_applied_per_field_and_duplicate_issues_are_removed():

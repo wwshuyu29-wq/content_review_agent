@@ -83,6 +83,73 @@ class DimensionReviewBatch(BaseModel):
         return self
 
 
+class BatchManuscriptReviewItem(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    content_item_id: int
+    external_id: str
+    results: list[AgentReviewResult]
+
+    @model_validator(mode="after")
+    def require_complete_dimension_set(self) -> "BatchManuscriptReviewItem":
+        expected = tuple(get_args(AgentReviewResult.model_fields["agent_id"].annotation))
+        actual = tuple(result.agent_id for result in self.results)
+        if actual != expected:
+            raise ValueError(f"results must contain the five scoring dimensions in order: {expected}")
+        return self
+
+
+class BatchManuscriptReviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    items: list[BatchManuscriptReviewItem]
+
+
+class LightweightBatchIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    level: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    field: str
+    quote: str
+    problem: str
+    advice: str
+    human: bool
+
+
+class LightweightBatchDimension(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    dimension: Literal[
+        "CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY",
+        "CAMPAIGN_EFFECTIVENESS",
+    ]
+    decision: Literal["PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"]
+    score: int = Field(ge=0, le=100)
+    summary: str
+    issues: list[LightweightBatchIssue]
+
+
+class LightweightBatchReview(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    content_id: int
+    dimensions: list[LightweightBatchDimension]
+
+    @model_validator(mode="after")
+    def require_complete_dimension_set(self) -> "LightweightBatchReview":
+        expected = tuple(get_args(AgentReviewResult.model_fields["agent_id"].annotation))
+        actual = tuple(result.dimension for result in self.dimensions)
+        if actual != expected:
+            raise ValueError(f"dimensions must contain the five scoring dimensions in order: {expected}")
+        return self
+
+
+class LightweightBatchReviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    reviews: list[LightweightBatchReview]
+
+
 def agent_review_protocol_contract() -> dict[str, Any]:
     """Return the strict runtime protocol used to validate the committed JSON Schema."""
     return {

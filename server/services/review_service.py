@@ -16,6 +16,7 @@ from scripts.text_review.standards import Standards
 from server.models import (
     AgentResult,
     AuditRun,
+    Batch,
     ContentItem,
     ContentVersion,
     FormatStatus,
@@ -28,7 +29,7 @@ from server.models import (
     RuleVersion,
 )
 from server.services.content_service import validate_content_format
-from server.services.deterministic_rule_service import ReviewContext, evaluate_rules
+from server.services.deterministic_rule_service import ReviewContext, StructuredIssue, evaluate_rules
 from server.services.evidence_service import list_content_test_cases
 from server.services.review_arbiter_service import ArbitrationResult, ReviewTaskSpec, arbitrate_review
 from server.services.review_profile_service import get_review_profile
@@ -39,6 +40,80 @@ ISSUE_FIELDS = (
     "evidence_end", "evidence_asset_id", "evidence_timestamp", "reason", "suggestion",
     "source_reference", "auto_fixable", "human_required", "confidence",
 )
+TECH_MEDIA_INLINE_RULE_MATCHERS = {"exact_phrase", "phrase_list", "replacement_map", "required_term"}
+FAST_REVIEW_IGNORED_RULE_IDS = {
+    "TEST-COUNT-001",
+    "TEST-EVIDENCE-001",
+}
+FAST_REVIEW_IGNORED_TERMS = ("证据", "测试", "实测", "亲测")
+
+
+def _is_fast_review_ignored_issue(issue_data: Mapping[str, Any]) -> bool:
+    rule_id = str(issue_data.get("rule_id", ""))
+    if rule_id in FAST_REVIEW_IGNORED_RULE_IDS:
+        return True
+    searchable = " ".join(
+        str(issue_data.get(key, ""))
+        for key in ("rule_id", "category", "reason", "suggestion")
+    )
+    return any(term in searchable for term in FAST_REVIEW_IGNORED_TERMS)
+
+
+def _simplify_fast_review_agent_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    simplified = []
+    for result in results:
+        issues = list(result.get("issues", []))
+        kept_issues = [issue for issue in issues if not _is_fast_review_ignored_issue(issue)]
+        if len(kept_issues) == len(issues):
+            simplified.append(result)
+            continue
+        updated = {**result, "issues": kept_issues}
+        if not kept_issues and updated.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}:
+            updated["decision"] = "PASS"
+        simplified.append(updated)
+    return simplified
+
+
+def _normalized_agent_result(result: Any) -> dict[str, Any]:
+    issues = []
+    for issue in result.issues:
+        evidence = issue.evidence
+        issues.append({
+            "rule_id": issue.rule_id,
+            "category": issue.category,
+            "severity": issue.severity,
+            "field": issue.field,
+            "evidence_quote": evidence.quote,
+            "evidence_start": evidence.start,
+            "evidence_end": evidence.end,
+            "evidence_asset_id": evidence.asset_id,
+            "evidence_timestamp": evidence.timestamp,
+            "reason": issue.reason,
+            "suggestion": issue.suggestion,
+            "source_reference": issue.source_reference,
+            "auto_fixable": issue.auto_fixable,
+            "human_required": issue.human_required,
+            "confidence": issue.confidence,
+        })
+    return {
+        "agent_name": result.agent_id,
+        "agent_id": result.agent_id,
+        "agent_version": result.agent_version,
+        "decision": result.decision,
+        "summary": result.summary,
+        "score": result.score,
+        "status": result.decision,
+        "issues": issues,
+        "raw_result": result.model_dump(mode="json"),
+    }
+
+
+class _PrecomputedReviewer:
+    def __init__(self, results: list[Any]):
+        self._results = results
+
+    def review_structured(self, _row: dict, _standards: Standards) -> list[dict[str, Any]]:
+        return [_normalized_agent_result(result) for result in self._results]
 
 
 def validate_rule_version_identity(project, rule_version: RuleVersion) -> None:
@@ -73,6 +148,18 @@ def _standards_from_rule_version(rule_version: RuleVersion) -> Standards:
         must_human_keywords=[],
         required_tags=[],
     )
+
+
+def _audit_deterministic_issues(profile: Any, context: ReviewContext) -> list[StructuredIssue]:
+    issues = evaluate_rules(profile, context)
+    if context.content_type != "TECH_MEDIA_REVIEW":
+        return issues
+    rules_by_id = {rule.rule_id: rule for rule in profile.rules}
+    return [
+        issue for issue in issues
+        if rules_by_id.get(issue.rule_id)
+        and rules_by_id[issue.rule_id].matcher in TECH_MEDIA_INLINE_RULE_MATCHERS
+    ]
 
 
 def _system_issue(*, rule_id: str, reason: str, suggestion: str) -> dict[str, Any]:
@@ -321,40 +408,7 @@ def _normalize_agent_results(
                 profile,
                 progress_callback=progress_callback,
             )
-        normalized = []
-        for result in structured:
-            issues = []
-            for issue in result.issues:
-                evidence = issue.evidence
-                issues.append({
-                    "rule_id": issue.rule_id,
-                    "category": issue.category,
-                    "severity": issue.severity,
-                    "field": issue.field,
-                    "evidence_quote": evidence.quote,
-                    "evidence_start": evidence.start,
-                    "evidence_end": evidence.end,
-                    "evidence_asset_id": evidence.asset_id,
-                    "evidence_timestamp": evidence.timestamp,
-                    "reason": issue.reason,
-                    "suggestion": issue.suggestion,
-                    "source_reference": issue.source_reference,
-                    "auto_fixable": issue.auto_fixable,
-                    "human_required": issue.human_required,
-                    "confidence": issue.confidence,
-                })
-            normalized.append({
-                "agent_name": result.agent_id,
-                "agent_id": result.agent_id,
-                "agent_version": result.agent_version,
-                "decision": result.decision,
-                "summary": result.summary,
-                "score": result.score,
-                "status": result.decision,
-                "issues": issues,
-                "raw_result": result.model_dump(mode="json"),
-            })
-        return normalized
+        return [_normalized_agent_result(result) for result in structured]
     if hasattr(reviewer, "review_structured"):
         return list(reviewer.review_structured(row, standards))
     verdict = reviewer.review(row, standards)
@@ -373,6 +427,161 @@ def _normalize_agent_results(
             "confidence": verdict.confidence,
         })
     return [{"agent_name": "legacy", "status": "COMPLETED", "issues": issues, "raw_result": {}}]
+
+
+def _profile_for_item(item: ContentItem, rule_version: RuleVersion) -> Any:
+    profile = get_review_profile(rule_version)
+    review_brief = item.batch.review_brief or item.project.description
+    if review_brief:
+        profile = profile.model_copy(
+            update={
+                "project_facts": {
+                    **dict(profile.project_facts),
+                    "review_brief": review_brief,
+                    "batch_review_brief": item.batch.review_brief or "",
+                }
+            }
+        )
+    return profile
+
+
+def _review_context_for_item(
+    session: Session,
+    item: ContentItem,
+    content_version: ContentVersion,
+) -> ReviewContext:
+    database_test_cases = list_content_test_cases(
+        session, item.id, content_version_id=content_version.id
+    )
+    if item.project.content_type == "TECH_MEDIA_REVIEW" or database_test_cases:
+        context_test_cases = database_test_cases
+        context_evidence_assets = [
+            asset for test_case in database_test_cases for asset in test_case["evidence_assets"]
+        ]
+        context_evidence = [
+            {"test_case_id": test_case["test_case_id"], "asset_id": asset["asset_id"]}
+            for test_case in database_test_cases for asset in test_case["evidence_assets"]
+        ]
+    else:
+        context_test_cases = list(content_version.payload.get("test_cases", []))
+        context_evidence = list(content_version.payload.get("evidence", []))
+        context_evidence_assets = list(content_version.payload.get("evidence_assets", []))
+    return ReviewContext(
+        title=content_version.title,
+        body=content_version.body,
+        platform=str(content_version.payload.get("platform", "")),
+        content_type=item.project.content_type or "",
+        project_id=str(item.project_id),
+        project_code=item.project.code or "",
+        test_cases=context_test_cases,
+        evidence=context_evidence,
+        evidence_assets=context_evidence_assets,
+    )
+
+
+def _batch_audit_candidate(
+    session: Session,
+    item: ContentItem,
+) -> tuple[ContentVersion, RuleVersion, Any, ReviewContext]:
+    if item.review_status is ReviewStatus.REJECTED:
+        raise ValueError("Rejected content is terminal")
+    if item.format_status is not FormatStatus.PASSED:
+        raise ValueError("Only content with PASSED format status can be audited")
+    rule_version = item.project.current_rule_version
+    if rule_version is None:
+        raise ValueError("Project has no current rule version")
+    validate_rule_version_identity(item.project, rule_version)
+    content_version = _latest_version(item)
+    matching_audits = list(session.scalars(
+        select(AuditRun)
+        .where(
+            AuditRun.content_version_id == content_version.id,
+            AuditRun.rule_version_id == rule_version.id,
+            AuditRun.status.in_(("RUNNING", "COMPLETED")),
+        )
+        .order_by(AuditRun.id.desc())
+    ))
+    if any(
+        audit.status == "COMPLETED" and not _is_unavailable_only_audit(audit)
+        for audit in matching_audits
+    ):
+        raise ValueError("Content version has already been audited with this rule version")
+    if any(audit.status == "RUNNING" for audit in matching_audits):
+        raise ValueError("Content version has already been audited with this rule version")
+    historical_audits = list(session.scalars(
+        select(AuditRun)
+        .where(
+            AuditRun.content_version_id == content_version.id,
+            AuditRun.status == "COMPLETED",
+        )
+        .order_by(AuditRun.id.desc())
+    ))
+    unavailable_audits = [audit for audit in historical_audits if _is_unavailable_only_audit(audit)]
+    open_tasks = _open_tasks(item)
+    if open_tasks and not unavailable_audits:
+        raise ValueError("Content has open review tasks; resolve them before re-audit")
+    profile = _profile_for_item(item, rule_version)
+    context = _review_context_for_item(session, item, content_version)
+    return content_version, rule_version, profile, context
+
+
+def run_batch_audit_once(
+    session: Session,
+    batch: Batch,
+    *,
+    reviewer: Any,
+    model: Optional[str] = None,
+    created_by_user_id: Optional[int] = None,
+) -> Optional[tuple[list[AuditRun], list[tuple[int, str]]]]:
+    if (
+        not isinstance(reviewer, TechMediaReviewer)
+        or reviewer.llm is None
+        or not callable(getattr(reviewer, "review_manuscript_batch_structured", None))
+    ):
+        return None
+    if any(item.project.content_type != "TECH_MEDIA_REVIEW" for item in batch.content_items):
+        return None
+    candidates = []
+    errors: list[tuple[int, str]] = []
+    shared_profile = None
+    for item in batch.content_items:
+        try:
+            content_version, _rule_version, profile, context = _batch_audit_candidate(session, item)
+        except ValueError as error:
+            errors.append((item.id, str(error)))
+            continue
+        if shared_profile is None:
+            shared_profile = profile
+        candidates.append({
+            "content_item_id": item.id,
+            "external_id": item.external_id,
+            "context": context,
+            "content_version_id": content_version.id,
+        })
+    if not candidates:
+        return [], errors
+    batch_results = reviewer.review_manuscript_batch_structured(candidates, shared_profile)
+    audits: list[AuditRun] = []
+    for candidate in candidates:
+        content_id = int(candidate["content_item_id"])
+        results = batch_results.get(content_id)
+        if not results:
+            errors.append((content_id, "Batch model response did not include this content"))
+            continue
+        try:
+            audit = run_audit(
+                session,
+                content_id,
+                reviewer=_PrecomputedReviewer(results),
+                model=model,
+                created_by_user_id=created_by_user_id,
+            )
+        except ValueError as error:
+            session.rollback()
+            errors.append((content_id, str(error)))
+        else:
+            audits.append(audit)
+    return audits, errors
 
 
 def run_audit(
@@ -494,12 +703,6 @@ def run_audit(
         context_test_cases = list(content_version.payload.get("test_cases", []))
         context_evidence = list(content_version.payload.get("evidence", []))
         context_evidence_assets = list(content_version.payload.get("evidence_assets", []))
-    image_evidence_analyses = [
-        analysis
-        for asset in item.assets
-        if isinstance(asset.asset_metadata, dict)
-        and isinstance((analysis := asset.asset_metadata.get("image_evidence_analysis")), dict)
-    ]
     context = ReviewContext(
         title=content_version.title,
         body=content_version.body,
@@ -510,10 +713,9 @@ def run_audit(
         test_cases=context_test_cases,
         evidence=context_evidence,
         evidence_assets=context_evidence_assets,
-        image_evidence_analyses=image_evidence_analyses,
     )
     persisted_issues: list[Issue] = []
-    for deterministic in evaluate_rules(profile, context):
+    for deterministic in _audit_deterministic_issues(profile, context):
         persisted = Issue(
             audit_run=audit,
             rule_id=deterministic.rule_id,
@@ -538,6 +740,7 @@ def run_audit(
         profile=profile,
         progress_callback=progress_callback,
     )
+    agent_result_data = _simplify_fast_review_agent_results(agent_result_data)
     strict_protocol = item.project.content_type == "TECH_MEDIA_REVIEW"
     protocol_error = _validate_agent_protocol(agent_result_data, profile) if strict_protocol else None
     role_boundary_agents = {
@@ -576,6 +779,8 @@ def run_audit(
             missing = [field for field in ISSUE_FIELDS if field not in issue_data]
             if missing:
                 raise ValueError(f"Structured issue missing fields: {', '.join(missing)}")
+            if _is_fast_review_ignored_issue(issue_data):
+                continue
             persisted = Issue(
                 audit_run=audit,
                 agent_result=result,

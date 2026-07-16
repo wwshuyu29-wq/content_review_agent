@@ -276,7 +276,6 @@ export interface ContentTableRow {
   final_title: string;
   final_body: string;
   body_summary: string;
-  image_filename: string | null;
   publish_time: string | null;
   note: string | null;
   row_number: number | null;
@@ -325,6 +324,8 @@ export interface DashboardWorkloadRow { user_id: number; username: string; displ
 export interface DashboardBatchQuality { batch_id: number; batch_name: string; total_count: number; passed_count: number; pass_rate: number; }
 export interface DashboardQuality { total_count: number; passed_count: number; pass_rate: number; batches: DashboardBatchQuality[]; }
 export interface DashboardProjectQuality { project_id: number; project_name: string; total_count: number; passed_count: number; pass_rate: number; }
+export interface DashboardMonthlyReview { month: string; reviewed_count: number; }
+export interface DashboardSupplierQuality { supplier_name: string; project_names: string[]; total_count: number; passed_count: number; pass_rate: number; }
 export interface DashboardIssueManuscript { content_id: number; title: string; severity: string; reason: string; }
 export interface DashboardIssueCluster { category: string; issue_count: number; manuscript_count: number; high_count: number; manuscripts: DashboardIssueManuscript[]; }
 export interface DashboardOverview {
@@ -332,6 +333,8 @@ export interface DashboardOverview {
   workload: DashboardWorkloadRow[];
   quality: DashboardQuality;
   project_quality: DashboardProjectQuality[];
+  monthly_reviews: DashboardMonthlyReview[];
+  supplier_quality: DashboardSupplierQuality[];
   issue_clusters: DashboardIssueCluster[];
 }
 

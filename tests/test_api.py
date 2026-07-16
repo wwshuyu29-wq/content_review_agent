@@ -82,7 +82,7 @@ def test_startup_seeds_project_and_supports_project_rule_workflow(api) -> None:
     projects = client.get("/api/projects")
     assert projects.status_code == 200
     seeded = projects.json()[0]
-    assert seeded["name"] == "百度地图小度想想科技媒体测评"
+    assert seeded["name"] == "百度地图小度想想"
     assert seeded["code"] == "bdmap_xdxx_tech_review_2026"
     assert seeded["content_type"] == "TECH_MEDIA_REVIEW"
 
@@ -105,11 +105,11 @@ def test_startup_seeds_project_and_supports_project_rule_workflow(api) -> None:
 
     package_rule = client.post(
         f"/api/projects/{seeded['id']}/rule-versions",
-        json={"project_code": "bdmap_xdxx_tech_review_2026", "package_version": "1.1"},
+        json={"project_code": "bdmap_xdxx_tech_review_2026", "package_version": "1.3"},
     )
     assert package_rule.status_code == 200
     assert package_rule.json()["version"] == 1
-    assert package_rule.json()["package_version"] == "1.1"
+    assert package_rule.json()["package_version"] == "1.3"
 
     versions = client.get(f"/api/projects/{seeded['id']}/rule-versions")
     assert versions.status_code == 200
@@ -287,6 +287,82 @@ def test_dashboard_overview_groups_team_workload_quality_and_issue_clusters(api)
             updated_at=recorded_at,
         )
         session.add(issue)
+        session.add(
+            Issue(
+                audit_run_id=audit.id,
+                agent_result_id=None,
+                rule_id="TEST-EVIDENCE-001",
+                category="deterministic",
+                severity="HIGH",
+                field="body",
+                evidence_quote="亲测",
+                source_reference=[],
+                reason="出现实测触发词，但缺少结构化证据字段或测试条件：test_cases, evidence",
+                suggestion="补充证据",
+                auto_fixable=False,
+                human_required=True,
+                confidence=1.0,
+                created_at=recorded_at,
+                updated_at=recorded_at,
+            )
+        )
+        session.add(
+            Issue(
+                audit_run_id=audit.id,
+                agent_result_id=None,
+                rule_id="CLAIM-UNSUPPORTED-ABSOLUTE-001",
+                category="deterministic",
+                severity="MEDIUM",
+                field="body",
+                evidence_quote="所有场景都能支持",
+                source_reference=[],
+                reason="命中缺少所提供依据的绝对、保证或能力比较表述",
+                suggestion="改为有边界的观察",
+                auto_fixable=False,
+                human_required=False,
+                confidence=1.0,
+                created_at=recorded_at,
+                updated_at=recorded_at,
+            )
+        )
+        session.add(
+            Issue(
+                audit_run_id=audit.id,
+                agent_result_id=None,
+                rule_id="CLAIM-PENDING-001",
+                category="deterministic",
+                severity="MEDIUM",
+                field="body",
+                evidence_quote="稳定覆盖所有场景",
+                source_reference=[],
+                reason="命中缺少所提供依据的绝对、保证或能力比较表述",
+                suggestion="去掉无边界能力承诺",
+                auto_fixable=False,
+                human_required=False,
+                confidence=1.0,
+                created_at=recorded_at,
+                updated_at=recorded_at,
+            )
+        )
+        session.add(
+            Issue(
+                audit_run_id=audit.id,
+                agent_result_id=None,
+                rule_id="SYSTEM-LLM-UNAVAILABLE",
+                category="system",
+                severity="HIGH",
+                field="review",
+                evidence_quote="",
+                source_reference=[],
+                reason="模型审核暂时不可用",
+                suggestion="检查模型配置",
+                auto_fixable=False,
+                human_required=True,
+                confidence=1.0,
+                created_at=recorded_at,
+                updated_at=recorded_at,
+            )
+        )
         session.flush()
         task = ReviewTask(
             content_item_id=second.id,
@@ -309,14 +385,31 @@ def test_dashboard_overview_groups_team_workload_quality_and_issue_clusters(api)
     assert payload["quality"]["total_count"] == 2
     assert payload["quality"]["passed_count"] == 1
     assert payload["quality"]["pass_rate"] == 0.5
+    assert payload["monthly_reviews"][-1] == {"month": "2026-07", "reviewed_count": 1}
+    assert payload["supplier_quality"] == [
+        {
+            "supplier_name": "internal",
+            "project_names": ["7 月科技稿件"],
+            "total_count": 2,
+            "passed_count": 1,
+            "pass_rate": 0.5,
+        }
+    ]
     assert payload["workload"][0]["display_name"] == "test-admin"
     assert payload["workload"][0]["months"][0]["uploaded_count"] == 2
     reviewer_row = next(row for row in payload["workload"] if row["username"] == "reviewer-a")
     assert reviewer_row["months"][0]["audit_started_count"] == 1
     assert reviewer_row["months"][0]["human_decision_count"] == 1
-    assert payload["issue_clusters"][0]["category"] == "BRAND"
-    assert payload["issue_clusters"][0]["issue_count"] == 1
-    assert payload["issue_clusters"][0]["manuscripts"][0]["title"] == "品牌表达问题稿件"
+    assert {cluster["category"] for cluster in payload["issue_clusters"]} == {"BRAND", "COMPLIANCE"}
+    assert "deterministic" not in {cluster["category"] for cluster in payload["issue_clusters"]}
+    assert "CLAIM-UNSUPPORTED-ABSOLUTE-001" not in {cluster["category"] for cluster in payload["issue_clusters"]}
+    assert "TEST-EVIDENCE-001" not in {cluster["category"] for cluster in payload["issue_clusters"]}
+    brand_cluster = next(cluster for cluster in payload["issue_clusters"] if cluster["category"] == "BRAND")
+    claim_cluster = next(cluster for cluster in payload["issue_clusters"] if cluster["category"] == "COMPLIANCE")
+    assert brand_cluster["issue_count"] == 1
+    assert brand_cluster["manuscripts"][0]["title"] == "品牌表达问题稿件"
+    assert claim_cluster["issue_count"] == 1
+    assert claim_cluster["manuscript_count"] == 1
 
 
 def test_content_test_cases_endpoint_returns_bound_evidence(api) -> None:

@@ -6,7 +6,7 @@ type Props = { results: AgentResult[]; issues?: Issue[]; loading?: boolean; erro
 export default function AgentResultPanel({ results, issues = [], loading = false, error = "", auditExists = false }: Props) {
   const byId = new Map(results.map((result) => [result.agent_id || result.agent_name, result]));
   return <section className="workspace-panel" aria-labelledby="agent-results-title">
-    <div className="panel-heading"><h3 id="agent-results-title">AI 评分结果</h3>{auditExists && !loading && !error && <span className="count">{results.length}/{AGENT_ORDER.length} 个维度</span>}</div>
+    <div className="panel-heading"><h3 id="agent-results-title">五维评审结果</h3>{auditExists && !loading && !error && <span className="count">{results.length}/{AGENT_ORDER.length} 个维度</span>}</div>
     {loading && <p className="panel-state" role="status">正在加载审核结果...</p>}
     {error && <div className="panel-state error" role="alert">审核结果加载失败：{error}</div>}
     {!loading && !error && !auditExists && <p className="panel-state">尚未运行评分，当前评分维度均无结果。</p>}
@@ -18,7 +18,7 @@ export default function AgentResultPanel({ results, issues = [], loading = false
         {!result ? <p className="panel-state compact">该评分维度未返回结果。</p> : <>
           <div className="agent-decision"><strong>{decisionLabel(result.decision)}</strong><span>{result.score === null || result.score === undefined ? "未评分" : `${result.score} 分`}</span></div>
           <p>{detail?.summary}</p>
-          <details><summary>查看评分详情</summary><dl className="detail-list"><div><dt>证据</dt><dd>{detail?.evidence}</dd></div><div><dt>原因</dt><dd>{detail?.reason}</dd></div><div><dt>建议</dt><dd>{detail?.suggestion}</dd></div><div><dt>置信度</dt><dd>{detail?.confidence}</dd></div><div><dt>评分维度</dt><dd>{detail?.source}</dd></div></dl></details>
+          <details><summary>查看评分详情</summary><dl className="detail-list"><div><dt>原文片段</dt><dd>{detail?.evidence}</dd></div><div><dt>原因</dt><dd>{detail?.reason}</dd></div><div><dt>建议</dt><dd>{detail?.suggestion}</dd></div><div><dt>置信度</dt><dd>{detail?.confidence}</dd></div><div><dt>评分维度</dt><dd>{detail?.source}</dd></div></dl></details>
         </>}
       </article>;
     })}</div>}

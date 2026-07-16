@@ -22,7 +22,7 @@ from server.services.excel_export_service import EXPORT_COLUMNS
 from server.services.excel_import_service import CONTENT_COLUMNS, TEST_CASE_COLUMNS
 
 
-NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期")
 
 
 @pytest.fixture
@@ -71,7 +71,7 @@ def workbook_bytes(
     content = workbook.active
     content.title = "内容清单"
     content.append(list(CONTENT_COLUMNS))
-    content.append([external_id, campaign_theme, account_name, account_type, "小红书", "原始标题", body, None, "2026-07-20", "备注"])
+    content.append([external_id, campaign_theme, account_name, account_type, "小红书", "原始标题", body, "2026-07-20", "备注"])
     tests = workbook.create_sheet("测试场景")
     tests.append(list(TEST_CASE_COLUMNS))
     if evidence:
@@ -87,7 +87,7 @@ def new_workbook_bytes() -> bytes:
     content = workbook.active
     content.title = "内容清单"
     content.append(list(NEW_CONTENT_COLUMNS))
-    content.append(["新标题", "新内容", "图文", "小红书", "新作者", "2026-07-21", None])
+    content.append(["新标题", "新内容", "图文", "小红书", "新作者", "2026-07-21"])
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
@@ -141,9 +141,8 @@ def test_template_route_has_attachment_and_exact_sheets(excel_api) -> None:
     assert response.status_code == 200
     assert "attachment" in response.headers["content-disposition"]
     workbook = load_workbook(BytesIO(response.content))
-    assert workbook.sheetnames == ["内容清单", "测试场景", "字段说明"]
+    assert workbook.sheetnames == ["内容清单", "字段说明"]
     assert tuple(cell.value for cell in workbook["内容清单"][1]) == NEW_CONTENT_COLUMNS
-    assert tuple(cell.value for cell in workbook["测试场景"][1]) == TEST_CASE_COLUMNS
 
 
 def test_preview_multipart_accepts_new_content_headers(excel_api) -> None:
@@ -160,56 +159,32 @@ def test_preview_multipart_accepts_new_content_headers(excel_api) -> None:
     assert row["normalized"]["external_id"].startswith("excel:")
 
 
-def test_confirm_uses_configured_reviewer_llm_for_image_analysis(excel_api) -> None:
-    client, engine, _ = excel_api
+def test_import_preview_rejects_media_zip_in_text_only_mode(excel_api) -> None:
+    client, _, _ = excel_api
     current = project(client)
     workbook = Workbook()
     content = workbook.active
     content.title = "内容清单"
     content.append(list(NEW_CONTENT_COLUMNS))
-    content.append(["路线规划", "普通产品介绍", "图文", "小红书", "作者", "2026-07-21", "scene.png"])
+    content.append(["路线规划", "普通产品介绍", "图文", "小红书", "作者", "2026-07-21"])
     output = BytesIO()
     workbook.save(output)
 
-    class VisionTransport:
-        def chat_json_multimodal(self, prompt: str, image_data_uri: str, schema: object) -> str:
-            return json.dumps({
-                "asset_id": "model-value-is-ignored",
-                "status": "ANALYZED",
-                "is_test_scene": False,
-                "visible_input": None,
-                "visible_result": None,
-                "visible_product": "百度地图",
-                "detected_text": "百度地图",
-                "confidence": 0.98,
-                "missing_context": [],
-                "reasoning": "普通产品截图",
-            }, ensure_ascii=False)
-
-    main.app.dependency_overrides[main.get_audit_reviewer] = lambda: SimpleNamespace(llm=VisionTransport())
-    preview = preview_request(
+    response = preview_request(
         client,
         current["id"],
         xlsx=output.getvalue(),
         zip_content=zip_bytes("scene.png", b"\x89PNG\r\n\x1a\nimage"),
     )
-    token = preview.json()["token"]
-    confirmed = client.post(
-        f"/api/imports/{token}/confirm",
-        json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"},
-    )
 
-    assert confirmed.status_code == 200, confirmed.text
-    with Session(engine) as session:
-        asset = session.scalar(select(Asset))
-        assert asset is not None
-        assert asset.asset_metadata["image_evidence_analysis"]["status"] == "ANALYZED"
+    assert response.status_code == 422
+    assert "仅支持文字" in response.text
 
 
 def test_preview_multipart_returns_typed_identity_rows_and_tests(excel_api) -> None:
     client, _, _ = excel_api
     current = project(client)
-    response = preview_request(client, current["id"], xlsx=workbook_bytes(body="亲测 1 个测试", evidence="proof.png"), zip_content=zip_bytes("proof.png"))
+    response = preview_request(client, current["id"], xlsx=workbook_bytes(body="亲测 1 个测试", evidence="proof.png"))
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["project_id"] == current["id"]
@@ -217,7 +192,8 @@ def test_preview_multipart_returns_typed_identity_rows_and_tests(excel_api) -> N
     assert payload["batch_name"] == "batch"
     assert payload["project_type"] == current["name"]
     assert payload["owner_name"] == "supplier"
-    assert payload["rows"][0]["tests"][0]["external_test_case_id"] == "case-1"
+    assert payload["rows"][0]["tests"] == []
+    assert payload["test_count"] == 0
     assert payload["errors"] == []
 
 
@@ -311,7 +287,7 @@ def test_preview_temp_upload_directory_is_cleaned(excel_api) -> None:
 def test_confirm_is_idempotent_and_rejects_cross_identity(excel_api) -> None:
     client, _, _ = excel_api
     current = project(client)
-    token = preview_request(client, current["id"]).json()["token"]
+    token = preview_request(client, current["id"], xlsx=new_workbook_bytes()).json()["token"]
     body = {"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"}
     first = client.post(f"/api/imports/{token}/confirm", json=body)
     second = client.post(f"/api/imports/{token}/confirm", json=body)
@@ -358,7 +334,7 @@ def test_http_preview_and_confirm_retain_incomplete_rows(
 def test_expired_token_returns_422(excel_api) -> None:
     client, _, tmp_path = excel_api
     current = project(client)
-    token = preview_request(client, current["id"]).json()["token"]
+    token = preview_request(client, current["id"], xlsx=new_workbook_bytes()).json()["token"]
     manifest = tmp_path / "data" / "import-previews" / token / "preview.json"
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -390,7 +366,6 @@ def test_export_route_and_missing_batch(excel_api) -> None:
         "小红书",
         "地图账号",
         "2026-07-20",
-        None,
     ]
     assert client.get("/api/batches/99999/export").status_code == 404
 
@@ -398,7 +373,7 @@ def test_export_route_and_missing_batch(excel_api) -> None:
 def test_contents_table_contract_filters_severity_agents_and_missing_media(excel_api) -> None:
     client, engine, _ = excel_api
     current = project(client)
-    token = preview_request(client, current["id"]).json()["token"]
+    token = preview_request(client, current["id"], xlsx=new_workbook_bytes()).json()["token"]
     batch = client.post(f"/api/imports/{token}/confirm", json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"}).json()
     content_id = batch["contents"][0]["id"]
     with Session(engine) as session:
@@ -409,16 +384,21 @@ def test_contents_table_contract_filters_severity_agents_and_missing_media(excel
         audit.issues.extend([
             Issue(rule_id="LOW", category="quality", severity="LOW", field="body", evidence_quote="", reason="low", suggestion="s1", auto_fixable=False, human_required=False, confidence=1),
             Issue(rule_id="CRITICAL", category="risk", severity="CRITICAL", field="body", evidence_quote="", reason="critical", suggestion="s2", auto_fixable=False, human_required=True, confidence=1),
+            Issue(rule_id="TEST-EVIDENCE-001", category="deterministic", severity="HIGH", field="body", evidence_quote="亲测", reason="deprecated", suggestion="old", auto_fixable=False, human_required=True, confidence=1),
         ])
         session.add(audit); session.commit()
     response = client.get("/api/contents/table", params={"project_id": current["id"], "batch_id": batch["id"], "format_status": "PASSED"})
     assert response.status_code == 200
     row = response.json()[0]
-    assert row["supplier_external_id"] == "content-1"
-    assert row["original_title"] == "原始标题" and row["final_title"] == "原始标题"
+    assert row["supplier_external_id"].startswith("excel:")
+    assert row["original_title"] == "新标题" and row["final_title"] == "新标题"
     assert row["highest_severity"] == "CRITICAL"
+    assert row["issue_count"] == 1
+    assert row["categories"] == ["CONTENT_QUALITY"]
+    assert len(row["issues"]) == 1
+    assert "deterministic" not in row["categories"]
     assert [agent["agent_id"] for agent in row["agents"]] == ["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS"]
-    assert row["media_url"] is None
+    assert row["media_url"] == f"/api/media/{content_id}"
     assert client.get("/api/contents/table", params={"review_status": "INVALID"}).status_code == 422
 
 
@@ -440,7 +420,7 @@ def test_preview_orphan_test_does_not_block_confirmation(excel_api) -> None:
     tests = workbook["测试场景"]
     tests.append(["missing", "orphan", "通过", "指令", "结果", None, None, None, None, None, None, "proof.png"])
     output = BytesIO(); workbook.save(output)
-    response = preview_request(client, current["id"], xlsx=output.getvalue(), zip_content=zip_bytes("proof.png"))
+    response = preview_request(client, current["id"], xlsx=output.getvalue())
     assert response.status_code == 200
     payload = response.json()
     assert payload["errors"] == []

@@ -501,7 +501,6 @@ class ContentTableRow(BaseModel):
     final_title: str
     final_body: str
     body_summary: str
-    image_filename: Optional[str]
     publish_time: Optional[str]
     note: Optional[str]
     row_number: Optional[int]

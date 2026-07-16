@@ -4,7 +4,16 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
 
-from .base import AgentIssue, AgentReviewResult, DimensionReviewBatch, EvidenceSpan, allows_unavailable_score
+from .base import (
+    AgentIssue,
+    AgentReviewResult,
+    BatchManuscriptReviewResponse,
+    DimensionReviewBatch,
+    EvidenceSpan,
+    LightweightBatchReviewResponse,
+    allows_unavailable_score,
+    parse_json,
+)
 
 if TYPE_CHECKING:
     from server.services.deterministic_rule_service import ReviewContext
@@ -18,6 +27,20 @@ AGENT_ORDER = (
     "CAMPAIGN_EFFECTIVENESS",
 )
 AGENT_VERSION = "tech-media-v1"
+_DIMENSION_CATEGORY = {
+    "CONTENT_QUALITY": "内容质量",
+    "COMPLIANCE": "合规表达",
+    "BRAND": "品牌一致性",
+    "PRODUCT_ACCURACY": "产品准确性",
+    "CAMPAIGN_EFFECTIVENESS": "传播有效性",
+}
+_DIMENSION_REFERENCE_HINTS = {
+    "CONTENT_QUALITY": ("content_quality.md", "内容质量.md"),
+    "COMPLIANCE": ("合规与广告表达.md", "compliance.md"),
+    "BRAND": ("brand_consistency.md", "品牌一致性.md"),
+    "PRODUCT_ACCURACY": ("content_accuracy.md", "内容准确性.md", "实测可信度.md"),
+    "CAMPAIGN_EFFECTIVENESS": ("campaign_effectiveness.md", "传播有效性.md"),
+}
 
 _SHARED_RULES = """You are a structured technology-media content scoring reviewer.
 Distinguish these four evidence classes and never merge them:
@@ -347,6 +370,111 @@ class TechMediaReviewer:
             + _json(payload)
         )
 
+    def build_batch_scoring_prompt(
+        self,
+        manuscripts: list[Mapping[str, Any]],
+        profile: ReviewProfile,
+    ) -> str:
+        if not manuscripts:
+            raise ValueError("batch scoring requires at least one manuscript")
+        first_context = manuscripts[0]["context"]
+        project_facts = dict(profile.project_facts)
+        brief = str(project_facts.get("batch_review_brief") or project_facts.get("review_brief") or "")[:3000]
+        standards = {
+            dimension_id: {
+                "goal": _AGENT_INSTRUCTIONS[dimension_id],
+                "reference": [
+                    reference for reference in _DIMENSION_REFERENCE_HINTS[dimension_id]
+                    if reference in set(profile.known_source_references)
+                ][:2],
+            }
+            for dimension_id in AGENT_ORDER
+        }
+        manuscript_payloads = []
+        for manuscript in manuscripts:
+            context = manuscript["context"]
+            manuscript_payloads.append({
+                "content_id": manuscript["content_item_id"],
+                "platform": context.platform,
+                "content": {"title": context.title, "body": context.body},
+            })
+        payload = {
+            "brief": brief,
+            "approved_claims": list(profile.approved_claims)[:80],
+            "pending_claims": list(profile.pending_claims)[:80],
+            "dimensions": standards,
+            "manuscripts": manuscript_payloads,
+            "required_dimension_order": list(AGENT_ORDER),
+        }
+        return (
+            "你是百度地图小度想想科技媒体内容审核助手。请一次审核这一批稿件。\n"
+            "只依据 brief、claims 和每篇正文判断；不要编造测试证据。每篇必须返回五个维度，顺序严格等于 required_dimension_order。\n"
+            "MVP 五维度判定标准：\n"
+            "基础内容校对：只抓错别字、标点异常、明显语病、重复词句、标题正文不一致、字段缺失导致读不通。\n"
+            "合规审核：只抓明显绝对化、第一/唯一/最强、保证效果、无依据承诺、明显虚假宣传或高风险暗示。\n"
+            "品牌一致性：只抓品牌名/产品名写错、品牌关系混乱、功能归错产品、官方称谓错误。\n"
+            "产品准确性：只抓功能讲错、能力说过头、未确认功能说成确定功能。\n"
+            "传播有效性：只判断是否跑题、卖点缺失、平台语感明显不适合；默认只给建议，不阻断。\n"
+            "评分逻辑：90-100 分：无影响发布的问题；80-89 分：只有轻微建议；70-79 分：有一处需要修改但不需要人工判断；60-69 分：需要人工确认；60 分以下：明显不可发布。\n"
+            "每个维度最多返回 1 个最关键问题；没有明确影响发布的问题就返回空 issues。\n"
+            "不要追踪证据字段、测试字段或测试条件缺失，不要因为未上传 test_cases/evidence/实测材料而判问题。\n"
+            "不要因为文案没有展开实测过程、实测细节、截图说明或素材证据而判问题；这类佐证暂由供应商素材承担，当前只审文字本身。\n"
+            "不要把低风险表达建议计入问题数；低风险只允许放在 summary 或 PASS_WITH_SUGGESTIONS，不放入 issues。\n"
+            "CAMPAIGN_EFFECTIVENESS 只能 PASS 或 PASS_WITH_SUGGESTIONS；需要人工判断时用 human=true。\n"
+            "输出 JSON，结构为 {\"reviews\":[{\"content_id\":数字,\"dimensions\":[{\"dimension\":\"CONTENT_QUALITY\",\"decision\":\"PASS\",\"score\":90,\"summary\":\"...\",\"issues\":[{\"level\":\"LOW\",\"field\":\"body\",\"quote\":\"原文片段\",\"problem\":\"问题\",\"advice\":\"建议\",\"human\":false}]}]}]}。\n"
+            "不要输出 markdown 或解释。\n"
+            "审核包：\n"
+            + _json(payload)
+        )
+
+    @staticmethod
+    def _reference_for_dimension(agent_id: str, profile: ReviewProfile) -> list[str]:
+        known = set(profile.known_source_references)
+        references = [
+            reference for reference in _DIMENSION_REFERENCE_HINTS[agent_id]
+            if reference in known
+        ]
+        if references:
+            return references[:1]
+        return [next(iter(sorted(known)))] if known else [f"SYSTEM:{agent_id}"]
+
+    def _lightweight_to_agent_results(
+        self,
+        response: LightweightBatchReviewResponse,
+        profile: ReviewProfile,
+    ) -> dict[int, list[AgentReviewResult]]:
+        converted: dict[int, list[AgentReviewResult]] = {}
+        for review in response.reviews:
+            dimension_results: list[AgentReviewResult] = []
+            for dimension in review.dimensions:
+                issues = [
+                    AgentIssue(
+                        rule_id=f"BATCH-{dimension.dimension}-{index:03d}",
+                        category=_DIMENSION_CATEGORY[dimension.dimension],
+                        severity=issue.level,
+                        field=issue.field,
+                        evidence=EvidenceSpan(quote=issue.quote),
+                        reason=issue.problem,
+                        suggestion=issue.advice,
+                        source_reference=self._reference_for_dimension(dimension.dimension, profile),
+                        auto_fixable=False,
+                        human_required=issue.human,
+                        confidence=0.85,
+                    )
+                    for index, issue in enumerate(dimension.issues, start=1)
+                ]
+                dimension_results.append(AgentReviewResult(
+                    agent_id=dimension.dimension,
+                    agent_version=AGENT_VERSION,
+                    decision=dimension.decision,
+                    summary=dimension.summary,
+                    score=dimension.score,
+                    confidence=0.85,
+                    issues=issues,
+                ))
+            converted[review.content_id] = dimension_results
+        return converted
+
     @staticmethod
     def _heuristic(agent_id: str) -> AgentReviewResult:
         return TechMediaReviewer._unavailable(
@@ -489,6 +617,73 @@ class TechMediaReviewer:
             for result in results:
                 progress_callback("agent_failed", agent_id=result.agent_id, attempt=3, result=result)
         return results
+
+    def review_manuscript_batch_structured(
+        self,
+        manuscripts: list[Mapping[str, Any]],
+        profile: ReviewProfile,
+    ) -> dict[int, list[AgentReviewResult]]:
+        if self.llm is None:
+            return {
+                int(manuscript["content_item_id"]): [
+                    self._heuristic(agent_id) for agent_id in AGENT_ORDER
+                ]
+                for manuscript in manuscripts
+            }
+        prompt = self.build_batch_scoring_prompt(manuscripts, profile)
+        last_error = "no response"
+        for _attempt in range(1, 4):
+            try:
+                if callable(getattr(self.llm, "chat", None)):
+                    raw = self.llm.chat(prompt)
+                elif callable(getattr(self.llm, "chat_json", None)):
+                    raw = self.llm.chat_json(prompt, LightweightBatchReviewResponse)
+                else:
+                    raise RuntimeError("LLM client does not support chat")
+                if isinstance(raw, Mapping):
+                    data = raw
+                else:
+                    data = parse_json(str(raw)) or json.loads((raw or "").strip())
+                if isinstance(data, Mapping) and "items" in data:
+                    batch = BatchManuscriptReviewResponse.model_validate(data)
+                    expected_ids = [int(manuscript["content_item_id"]) for manuscript in manuscripts]
+                    actual_ids = [item.content_item_id for item in batch.items]
+                    if actual_ids != expected_ids:
+                        raise ValueError("batch result items do not match requested manuscript order")
+                    results: dict[int, list[AgentReviewResult]] = {
+                        item.content_item_id: list(item.results)
+                        for item in batch.items
+                    }
+                else:
+                    lightweight = LightweightBatchReviewResponse.model_validate(data)
+                    results = self._lightweight_to_agent_results(lightweight, profile)
+                expected_ids = [int(manuscript["content_item_id"]) for manuscript in manuscripts]
+                actual_ids = list(results)
+                if actual_ids != expected_ids:
+                    raise ValueError("batch result items do not match requested manuscript order")
+                normalized_by_item: dict[int, list[AgentReviewResult]] = {}
+                for content_item_id, item_results in results.items():
+                    normalized_item_results = []
+                    for result in item_results:
+                        error = validate_agent_result(
+                            result,
+                            result.agent_id,
+                            set(profile.known_source_references),
+                        )
+                        normalized_item_results.append(
+                            self._unavailable(result.agent_id, error) if error else result
+                        )
+                    normalized_by_item[content_item_id] = normalized_item_results
+                return normalized_by_item
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+        return {
+            int(manuscript["content_item_id"]): [
+                self._unavailable(agent_id, last_error) for agent_id in AGENT_ORDER
+            ]
+            for manuscript in manuscripts
+        }
 
     def review_structured(
         self,

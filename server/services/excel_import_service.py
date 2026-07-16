@@ -13,18 +13,16 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from secrets import token_urlsafe
 from typing import Any, Dict, List, Optional, Tuple
-from uuid import uuid4
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.datetime import from_excel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from server.models import Asset, AssetKind, Batch, FormatStatus, Project
+from server.models import Batch, FormatStatus, Project
 from server.services.content_service import MAX_BODY_LENGTH, MAX_TITLE_LENGTH, submit_batch
-from server.services.evidence_service import attach_evidence, create_asset, create_test_case
-from server.services.image_evidence_service import analyze_image_evidence, unavailable_image_analysis
 
 
 IMPORT_COLUMNS = (
@@ -33,24 +31,19 @@ IMPORT_COLUMNS = (
     "平台",
     "标题",
     "正文",
-    "图片文件名",
     "计划发布时间",
     "备注",
 )
-CONTENT_COLUMNS = ("供应商内容编号", "活动主题", "账号名称", "账号类型", "平台", "标题", "正文", "图片文件名", "计划发布时间", "备注")
-NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
+CONTENT_COLUMNS = ("供应商内容编号", "活动主题", "账号名称", "账号类型", "平台", "标题", "正文", "计划发布时间", "备注")
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期")
+OPTIMIZED_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "优化后版本")
 TEST_CASE_COLUMNS = ("供应商内容编号", "测试场景编号", "测试结论", "测试指令", "实际返回结果", "测试城市", "测试时间", "百度地图版本", "设备", "操作系统", "网络环境", "证据文件名")
 REQUIRED_CONTENT_COLUMNS = CONTENT_COLUMNS[:7]
 EVIDENCE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".webm", ".txt", ".log", ".json"})
 MAX_EVIDENCE_BYTES = 100 * 1024 * 1024
-MAX_EVIDENCE_TOTAL_BYTES = 500 * 1024 * 1024
 REQUIRED_COLUMNS = IMPORT_COLUMNS[:5]
 MAX_IMPORT_ROWS = 500
 EXCEL_CELL_TEXT_LIMIT = 32_767
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
-MAX_ZIP_BYTES = 200 * 1024 * 1024
-MAX_ZIP_ENTRIES = 1000
-MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_XLSX_ENTRIES = 2000
 MAX_XLSX_ENTRY_BYTES = 50 * 1024 * 1024
 MAX_XLSX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
@@ -60,15 +53,12 @@ PREVIEW_TTL = timedelta(hours=2)
 PREVIEW_MANIFEST_VERSION = 3
 PREVIEW_ROOT_REGISTRY_ENV = "CONTENT_REVIEW_PREVIEW_ROOT_REGISTRY"
 DEFAULT_PREVIEW_ROOT_REGISTRY = Path(__file__).resolve().parents[2] / "data" / "preview-roots.json"
-ALLOWED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
-ALLOWED_MEDIA_SUFFIXES = ALLOWED_IMAGE_SUFFIXES | frozenset({".mp4", ".mov", ".webm"})
 _COLUMN_KEYS = {
     "供应商内容编号": "external_id",
     "活动主题": "campaign_theme",
     "平台": "platform",
     "标题": "title",
     "正文": "body",
-    "图片文件名": "image_filename",
     "计划发布时间": "publish_time",
     "备注": "note",
     "账号名称": "account_name",
@@ -78,7 +68,7 @@ _COLUMN_KEYS = {
     "目标平台": "platform",
     "作者": "account_name",
     "发布日期": "publish_time",
-    "图片/视频": "image_filename",
+    "优化后版本": "body",
 }
 _TEST_COLUMN_KEYS = {"供应商内容编号": "供应商内容编号", "测试场景编号": "测试场景编号", "测试结论": "测试结论", "测试指令": "测试指令", "实际返回结果": "实际返回结果", "测试城市": "测试城市", "测试时间": "测试时间", "百度地图版本": "百度地图版本", "设备": "设备", "操作系统": "操作系统", "网络环境": "网络环境", "证据文件名": "证据文件名"}
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
@@ -177,7 +167,6 @@ def build_import_template() -> bytes:
     worksheet = workbook.active
     worksheet.title = "内容清单"
     worksheet.append(list(NEW_CONTENT_COLUMNS))
-    workbook.create_sheet("测试场景").append(list(TEST_CASE_COLUMNS))
     workbook.create_sheet("字段说明").append(["本表仅用于说明字段，导入时忽略"])
     output = BytesIO()
     workbook.save(output)
@@ -200,25 +189,14 @@ def preview_import(
     registered = False
 
     try:
+        if zip_path is not None:
+            raise ValueError("当前仅支持文字审核，不支持媒体 ZIP 或证据 ZIP")
         preview_dir.mkdir(parents=True, exist_ok=False)
         brief = _normalize_review_brief(review_brief)
         rows, test_cases = _read_workbook(xlsx_path)
         warnings: List[str] = []
-        zip_entries: Dict[str, ZipInfo] = {}
-
-        if zip_path is not None:
-            zip_entries, warnings = _inspect_zip(zip_path)
-
-        rows, image_warnings = _validate_images(rows, zip_path, zip_entries)
         rows, test_cases, preview_errors = _validate_test_cases(rows, test_cases, trigger_terms)
-        rows, evidence_warnings = _validate_test_evidence(rows, test_cases, zip_entries, trigger_terms)
-        warnings.extend(image_warnings)
-        warnings.extend(evidence_warnings)
         rows = _mark_duplicate_external_ids(rows)
-
-        if zip_path is not None:
-            _extract_referenced_images(zip_path, zip_entries, rows, preview_dir / "images")
-            _extract_referenced_evidence(zip_path, zip_entries, test_cases, preview_dir / "evidence")
 
         valid_count = sum(row.valid for row in rows)
         preview = ImportPreview(
@@ -291,7 +269,6 @@ def confirm_import(
     *,
     project_type: str | None = None,
     owner_name: str | None = None,
-    image_llm: Any = None,
     uploaded_by_user_id: int | None = None,
 ) -> Batch:
     if not isinstance(token, str) or not _TOKEN_PATTERN.fullmatch(token):
@@ -341,10 +318,9 @@ def confirm_import(
     confirmed_project_type = preview.identity.project_type if preview.identity is not None else project_type
     confirmed_owner_name = preview.identity.owner_name if preview.identity is not None else owner_name
 
-    saved_paths: List[Path] = []
     commit_completed = False
     try:
-        contents = _build_confirm_contents(preview, location, saved_paths)
+        contents = _build_confirm_contents(preview)
         batch = submit_batch(
             session,
             project_id=project_id,
@@ -358,14 +334,11 @@ def confirm_import(
             uploaded_by_user_id=uploaded_by_user_id,
             commit=False,
         )
-        _create_confirmed_media_assets(session, batch, image_llm)
-        _create_confirmed_test_records(session, batch, preview, location, saved_paths)
         session.commit()
         commit_completed = True
     except IntegrityError:
         if not commit_completed:
             session.rollback()
-            _delete_saved_paths(saved_paths)
             existing = session.scalar(select(Batch).where(Batch.import_token == token))
             if existing is not None:
                 if preview.identity is not None and (
@@ -377,7 +350,6 @@ def confirm_import(
     except Exception:
         if not commit_completed:
             session.rollback()
-            _delete_saved_paths(saved_paths)
         raise
 
     session.refresh(batch)
@@ -389,33 +361,13 @@ class _ExpiredPreviewError(ValueError):
     pass
 
 
-def _data_dir() -> Path:
-    return Path(os.environ.get("CR_DATA_DIR", str(Path(__file__).resolve().parents[2] / "data"))).resolve()
-
-
-def _uploads_dir() -> Path:
-    return _data_dir() / "uploads"
-
-
-def _delete_saved_paths(saved_paths: List[Path]) -> None:
-    for path in saved_paths:
-        path.unlink(missing_ok=True)
-
-
-def _build_confirm_contents(
-    preview: ImportPreview,
-    location: _PreviewLocation,
-    saved_paths: List[Path],
-) -> List[Dict[str, Any]]:
+def _build_confirm_contents(preview: ImportPreview) -> List[Dict[str, Any]]:
     contents: List[Dict[str, Any]] = []
     for row in preview.rows:
         normalized = row.normalized
         payload = _payload_for_row(preview.token, row)
         if preview.identity is not None:
             payload["preview_identity"] = asdict(preview.identity)
-        media = _copy_preview_image(location, normalized.get("image_filename"), saved_paths)
-        if media is not None:
-            payload["media"] = media
         contents.append(
             {
                 "external_id": _external_id_for_row(preview.token, row),
@@ -438,7 +390,6 @@ def _payload_for_row(token: str, row: ImportRowPreview) -> Dict[str, Any]:
         "platform": normalized.get("platform"),
         "title": normalized.get("title"),
         "body": normalized.get("body"),
-        "image_filename": normalized.get("image_filename"),
         "publish_time": normalized.get("publish_time"),
         "note": normalized.get("note"),
         "manuscript_index": row.manuscript_index,
@@ -469,149 +420,6 @@ def _format_status_for_row(row: ImportRowPreview) -> FormatStatus:
     if any(not value for value in required_values):
         return FormatStatus.INCOMPLETE
     return FormatStatus.INVALID
-
-
-def _evidence_kind_and_mime(filename: str) -> Tuple[AssetKind, str]:
-    suffix = Path(filename).suffix.lower()
-    mapping = {
-        ".png": (AssetKind.SCREENSHOT, "image/png"),
-        ".jpg": (AssetKind.SCREENSHOT, "image/jpeg"),
-        ".jpeg": (AssetKind.SCREENSHOT, "image/jpeg"),
-        ".webp": (AssetKind.SCREENSHOT, "image/webp"),
-        ".gif": (AssetKind.SCREENSHOT, "image/gif"),
-        ".mp4": (AssetKind.SCREEN_RECORDING, "video/mp4"),
-        ".mov": (AssetKind.SCREEN_RECORDING, "video/quicktime"),
-        ".webm": (AssetKind.SCREEN_RECORDING, "video/webm"),
-        ".txt": (AssetKind.TEST_LOG, "text/plain"),
-        ".log": (AssetKind.TEST_LOG, "text/plain"),
-        ".json": (AssetKind.TEST_LOG, "application/json"),
-    }
-    if suffix not in mapping:
-        raise ValueError(f"unsupported evidence suffix: {suffix}")
-    return mapping[suffix]
-
-
-def _create_confirmed_media_assets(session: Session, batch: Batch, image_llm: Any) -> None:
-    for item in batch.content_items:
-        if not item.versions:
-            continue
-        version = item.versions[0]
-        filename = version.payload.get("image_filename")
-        storage_key = version.payload.get("media")
-        if not isinstance(filename, str) or not isinstance(storage_key, str):
-            continue
-        media_path = _uploads_dir() / storage_key
-        if not media_path.is_file():
-            raise ValueError(f"导入媒体文件不存在：{filename}")
-        kind, mime_type = _evidence_kind_and_mime(filename)
-        stable_id = "media:" + hashlib.sha256(
-            f"{item.external_id}\0{filename}".encode("utf-8")
-        ).hexdigest()[:32]
-        metadata: Dict[str, Any] = {}
-        if Path(filename).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
-            try:
-                analysis = analyze_image_evidence(
-                    asset_id=stable_id,
-                    image_path=media_path,
-                    filename=media_path.name,
-                    title=version.title,
-                    body=version.body,
-                    llm=image_llm,
-                )
-            except ValueError as error:
-                analysis = unavailable_image_analysis(stable_id, str(error))
-            metadata["image_evidence_analysis"] = {
-                **analysis.model_dump(mode="json"),
-                "verified": False,
-            }
-        create_asset(
-            session,
-            item.id,
-            asset_id=stable_id,
-            external_id=filename,
-            kind=kind,
-            filename=filename,
-            storage_key=storage_key,
-            mime_type=mime_type,
-            size_bytes=media_path.stat().st_size,
-            metadata=metadata,
-        )
-
-
-def _create_confirmed_test_records(session, batch, preview, location, saved_paths) -> None:
-    if not preview.test_cases:
-        return
-    by_external = {
-        item.versions[0].payload.get("supplier_external_id"): item
-        for item in batch.content_items
-        if item.versions and item.versions[0].payload.get("supplier_external_id")
-    }
-    valid_owners = {row.normalized.get("external_id") for row in preview.rows if row.valid}
-    assets: Dict[Tuple[int, str], Any] = {}
-    for test in preview.test_cases:
-        if test.content_external_id not in valid_owners:
-            continue
-        item = by_external.get(test.content_external_id)
-        if item is None or not item.versions:
-            raise ValueError(f"测试场景引用的内容编号不存在：{test.content_external_id}")
-        record = create_test_case(
-            session, item.id, item.versions[0].id,
-            external_test_case_id=test.external_test_case_id,
-            claim=test.claim or "测试结论", command=test.command,
-            observed_result=test.observed_result, city=test.city, tested_at=test.tested_at,
-            app_version=test.app_version, device=test.device,
-            operating_system=test.operating_system,
-            network_environment=test.network_environment,
-        )
-        for filename in test.evidence_filenames:
-            cache_key = (item.id, filename)
-            asset = assets.get(cache_key)
-            if asset is None:
-                source = location.preview_dir / "evidence" / filename
-                if not source.is_file():
-                    raise ValueError(f"证据文件不存在：{filename}")
-                suffix = Path(filename).suffix.lower()
-                destination = _uploads_dir() / f"{uuid4().hex}{suffix}"
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with source.open("rb") as input_stream, destination.open("xb") as output_stream:
-                    shutil.copyfileobj(input_stream, output_stream)
-                saved_paths.append(destination)
-                kind, mime_type = _evidence_kind_and_mime(filename)
-                stable_id = "evidence:" + hashlib.sha256(filename.encode("utf-8")).hexdigest()[:32]
-                asset = create_asset(
-                    session, item.id, asset_id=stable_id, external_id=filename,
-                    kind=kind, filename=filename, storage_key=destination.name,
-                    mime_type=mime_type, size_bytes=destination.stat().st_size,
-                )
-                assets[cache_key] = asset
-            attach_evidence(session, record.id, asset.id)
-
-
-def _copy_preview_image(
-    location: _PreviewLocation,
-    image_filename: Any,
-    saved_paths: List[Path],
-) -> Optional[str]:
-    if not isinstance(image_filename, str) or not _is_safe_basename(image_filename):
-        return None
-
-    image_dir = location.preview_dir / "images"
-    source = image_dir / image_filename
-    try:
-        resolved_image_dir = image_dir.resolve(strict=True)
-        resolved_source = source.resolve(strict=True)
-    except (FileNotFoundError, RuntimeError):
-        return None
-    if resolved_source.parent != resolved_image_dir or not resolved_source.is_file():
-        return None
-
-    suffix = Path(image_filename).suffix.lower()
-    destination = _uploads_dir() / f"{uuid4().hex}{suffix}"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with resolved_source.open("rb") as input_stream, destination.open("xb") as output_stream:
-        shutil.copyfileobj(input_stream, output_stream)
-    saved_paths.append(destination)
-    return destination.name
 
 
 def _resolve_preview_location(token: str) -> _PreviewLocation:
@@ -679,22 +487,6 @@ def _validate_preview_files(location: _PreviewLocation, preview: ImportPreview) 
                 raise ValueError(f"预览证据文件不存在：{filename}") from exc
             if resolved.parent != root or not resolved.is_file() or resolved.stat().st_size > MAX_EVIDENCE_BYTES:
                 raise ValueError(f"预览证据文件无效：{filename}")
-    image_root = location.preview_dir / "images"
-    for row in preview.rows:
-        if not row.valid:
-            continue
-        filename = row.normalized.get("image_filename")
-        if not filename:
-            continue
-        path = image_root / filename
-        try:
-            root = image_root.resolve(strict=True)
-            resolved = path.resolve(strict=True)
-        except (FileNotFoundError, RuntimeError) as exc:
-            raise ValueError(f"预览图片不存在：{filename}") from exc
-        if resolved.parent != root or not resolved.is_file() or resolved.stat().st_size > MAX_IMAGE_BYTES:
-            raise ValueError(f"预览图片无效：{filename}")
-
 
 def _remove_preview(token: str, location: _PreviewLocation) -> None:
     with _preview_locations_lock:
@@ -777,34 +569,6 @@ def _read_workbook(xlsx_path: Path) -> Tuple[List[ImportRowPreview], List[TestCa
             raise ValueError("Excel 缺少命名工作表：内容清单")
         rows = _read_sheet_rows(workbook["内容清单"])
         tests: List[TestCasePreview] = []
-        if "测试场景" in workbook.sheetnames:
-            sheet = workbook["测试场景"]
-            iterator = sheet.iter_rows()
-            header = next(iterator, None)
-            if header is None:
-                raise ValueError("测试场景表头不能为空")
-            if any(cell.data_type == "f" for cell in header):
-                raise ValueError("测试场景表头不允许公式")
-            headers = tuple(str(cell.value).strip() if cell.value is not None else "" for cell in header)
-            if headers != TEST_CASE_COLUMNS:
-                raise ValueError("测试场景表头必须严格匹配")
-            for number, cells in enumerate(iterator, 2):
-                values = tuple(cell.value for cell in cells)
-                if _is_blank_row(values):
-                    continue
-                if len(tests) >= MAX_IMPORT_ROWS:
-                    raise ValueError("测试场景最多允许 500 条")
-                if any(cell.data_type == "f" for cell in cells):
-                    raise ValueError(f"测试场景第 {number} 行不允许公式")
-                values = tuple(_normalize_text(value) for value in values)
-                padded = values + (None,) * (len(TEST_CASE_COLUMNS) - len(values))
-                tests.append(TestCasePreview(
-                    content_external_id=padded[0], external_test_case_id=padded[1],
-                    claim=padded[2], command=padded[3], observed_result=padded[4],
-                    city=padded[5], tested_at=padded[6], app_version=padded[7],
-                    device=padded[8], operating_system=padded[9],
-                    network_environment=padded[10], evidence_filenames=_split_filenames(padded[11]),
-                ))
         return rows, tests
     except ValueError:
         raise
@@ -825,8 +589,10 @@ def _read_sheet_rows(sheet) -> List[ImportRowPreview]:
     headers = _validate_headers(tuple(cell.value for cell in header_cells), ())
     if headers == NEW_CONTENT_COLUMNS:
         format_name = "new"
-    elif any(column in headers for column in NEW_CONTENT_COLUMNS[1:]):
-        raise ValueError("Excel 新模板表头必须严格匹配：" + "、".join(NEW_CONTENT_COLUMNS))
+    elif headers == OPTIMIZED_CONTENT_COLUMNS:
+        format_name = "new_optimized"
+    elif any(column in headers for column in NEW_CONTENT_COLUMNS[1:] + ("优化后版本",)):
+        raise ValueError("Excel 新模板表头必须严格匹配：" + "、".join(NEW_CONTENT_COLUMNS) + "；也支持将最后一列替换为：优化后版本")
     else:
         required = REQUIRED_CONTENT_COLUMNS if all(column in headers for column in ("账号名称", "账号类型")) else REQUIRED_COLUMNS
         _validate_headers(headers, required)
@@ -892,71 +658,6 @@ def _validate_test_cases(rows, tests, _trigger_terms):
     return updated, accepted_tests, []
 
 
-def _valid_evidence_filename(filename: str, entries: Dict[str, ZipInfo]) -> bool:
-    return (
-        _is_safe_basename(filename)
-        and Path(filename).suffix.lower() in EVIDENCE_SUFFIXES
-        and filename in entries
-        and entries[filename].file_size <= MAX_EVIDENCE_BYTES
-    )
-
-
-def _validate_test_evidence(rows, tests, entries, trigger_terms):
-    # Precheck only validates that referenced evidence filenames are safe and
-    # exist in the ZIP (when a ZIP was provided). It does NOT require evidence to
-    # be present, does NOT check trigger words, and does NOT check count
-    # consistency. Those checks belong to the six-Agent semantic review after
-    # import (run_audit), not to precheck.
-    errors: Dict[str, List[str]] = {}
-    referenced = set()
-    for test in tests:
-        for filename in test.evidence_filenames:
-            referenced.add(filename)
-            if not _is_safe_basename(filename):
-                errors.setdefault(test.content_external_id, []).append(
-                    f"证据文件名必须是不含路径的安全文件名：{filename}"
-                )
-            elif Path(filename).suffix.lower() not in EVIDENCE_SUFFIXES:
-                errors.setdefault(test.content_external_id, []).append(
-                    f"证据文件格式不支持：{filename}"
-                )
-            elif entries and filename not in entries:
-                errors.setdefault(test.content_external_id, []).append(
-                    f"证据文件不存在：{filename}"
-                )
-            elif entries and entries[filename].file_size > MAX_EVIDENCE_BYTES:
-                errors.setdefault(test.content_external_id, []).append(
-                    f"证据文件不能超过 100 MiB：{filename}"
-                )
-    warnings = [
-        f"ZIP 中证据文件未被引用：{name}"
-        for name in sorted(set(entries) - referenced)
-        if PurePosixPath(name).suffix.lower() in EVIDENCE_SUFFIXES
-    ]
-    updated = []
-    for row in rows:
-        owner = row.normalized.get("external_id") or ""
-        row_extra = list(errors.get(owner, []))
-        updated.append(_replace_row_errors(row, list(row.errors) + row_extra))
-    return updated, warnings
-
-
-def _extract_referenced_evidence(zip_path, entries, tests, evidence_dir):
-    names={name for test in tests for name in test.evidence_filenames}
-    if not names: return
-    evidence_dir.mkdir()
-    with ZipFile(zip_path) as archive:
-        for name in names:
-            if name not in entries: continue
-            destination=evidence_dir/name; written=0
-            with archive.open(entries[name]) as source, destination.open("xb") as output:
-                while True:
-                    chunk=source.read(1024*1024)
-                    if not chunk: break
-                    written += len(chunk)
-                    if written > MAX_EVIDENCE_BYTES: raise ValueError(f"证据文件不能超过 100 MiB：{name}")
-                    output.write(chunk)
-
 def _validate_headers(raw_headers: Tuple[Any, ...], required_columns=None) -> Tuple[str, ...]:
     headers: List[str] = []
     for value in raw_headers:
@@ -995,8 +696,13 @@ def _normalize_row(
         if index < len(headers)
     ]
 
-    columns = NEW_CONTENT_COLUMNS if format_name == "new" else (CONTENT_COLUMNS if format_name == "named_legacy" else IMPORT_COLUMNS)
-    normalized = {key: None for key in _NORMALIZED_KEYS} if format_name == "new" else {}
+    columns = (
+        NEW_CONTENT_COLUMNS if format_name == "new"
+        else OPTIMIZED_CONTENT_COLUMNS if format_name == "new_optimized"
+        else CONTENT_COLUMNS if format_name == "named_legacy"
+        else IMPORT_COLUMNS
+    )
+    normalized = {key: None for key in _NORMALIZED_KEYS} if format_name in {"new", "new_optimized"} else {}
     for column in columns:
         index = indexes.get(column)
         raw_value = (
@@ -1012,12 +718,21 @@ def _normalize_row(
         else:
             normalized[key] = _normalize_text(raw_value)
 
-    required_columns = ("标题", "内容", "目标平台") if format_name == "new" else (REQUIRED_CONTENT_COLUMNS if format_name == "named_legacy" else REQUIRED_COLUMNS)
+    if format_name == "new_optimized":
+        content_index = indexes.get("内容")
+        optimized_index = indexes.get("优化后版本")
+        original_body = _normalize_text(values[content_index]) if content_index is not None and content_index < len(values) and content_index not in formula_indexes else None
+        optimized_body = _normalize_text(values[optimized_index]) if optimized_index is not None and optimized_index < len(values) and optimized_index not in formula_indexes else None
+        normalized["body"] = optimized_body or original_body
+        if optimized_body and original_body and optimized_body != original_body:
+            normalized["note"] = "导入时使用“优化后版本”作为审核正文"
+
+    required_columns = ("标题", "内容", "目标平台") if format_name in {"new", "new_optimized"} else (REQUIRED_CONTENT_COLUMNS if format_name == "named_legacy" else REQUIRED_COLUMNS)
     for column in required_columns:
         if not normalized[_COLUMN_KEYS[column]]:
             errors.append(f"{column}不能为空")
 
-    if format_name == "new":
+    if format_name in {"new", "new_optimized"}:
         normalized["external_id"] = _derive_external_id(row_number, normalized["title"], normalized["account_name"])
 
     external_id = normalized["external_id"]
@@ -1031,15 +746,6 @@ def _normalize_row(
         errors.append("正文达到 Excel 单元格上限，可能已被截断")
     elif body and len(body) > MAX_BODY_LENGTH:
         errors.append(f"正文不能超过 {MAX_BODY_LENGTH} 个字符")
-
-    image_filename = normalized["image_filename"]
-    if image_filename:
-        if "," in image_filename or "，" in image_filename:
-            errors.append("第一版每条内容最多只能引用一张图片")
-        elif not _is_safe_basename(image_filename):
-            errors.append("图片文件名必须是不含路径的安全文件名")
-        elif Path(image_filename).suffix.lower() not in ALLOWED_MEDIA_SUFFIXES:
-            errors.append("图片/视频文件名必须使用 JPG、JPEG、PNG、WEBP、MP4、MOV 或 WEBM 格式")
 
     return ImportRowPreview(manuscript_index, row_number, normalized, errors, [], not errors, [])
 
@@ -1065,54 +771,19 @@ def _normalize_date(value: Any, column: str = "计划发布时间") -> Tuple[Opt
     if isinstance(value, date):
         return value.isoformat(), None
     text = str(value).strip()
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        try:
+            converted = from_excel(float(text))
+            if isinstance(converted, datetime):
+                return converted.date().isoformat(), None
+            if isinstance(converted, date):
+                return converted.isoformat(), None
+        except (TypeError, ValueError, OverflowError):
+            pass
     try:
         return date.fromisoformat(text).isoformat(), None
     except ValueError:
         return text, f"{column}必须为 YYYY-MM-DD 或 Excel 日期"
-
-
-def _inspect_zip(zip_path: Path) -> Tuple[Dict[str, ZipInfo], List[str]]:
-    try:
-        if zip_path.stat().st_size > MAX_ZIP_BYTES:
-            raise ValueError("ZIP 文件不能超过 200 MiB")
-    except OSError as exc:
-        raise ValueError("ZIP 文件无法读取") from exc
-
-    entries: Dict[str, ZipInfo] = {}
-    total_size = 0
-    evidence_total = 0
-    try:
-        with ZipFile(zip_path) as archive:
-            if len(archive.filelist) > MAX_ZIP_ENTRIES:
-                raise ValueError(f"ZIP 文件条目不能超过 {MAX_ZIP_ENTRIES} 个")
-            for info in archive.filelist:
-                _validate_zip_path(info.filename)
-                if info.flag_bits & 0x1:
-                    raise ValueError(f"ZIP 包含加密文件：{info.filename}")
-                if _is_zip_symlink(info):
-                    raise ValueError(f"ZIP 不允许符号链接：{info.filename}")
-                if info.is_dir():
-                    continue
-                suffix = PurePosixPath(info.filename).suffix.lower()
-                if suffix not in (ALLOWED_IMAGE_SUFFIXES | EVIDENCE_SUFFIXES):
-                    raise ValueError(f"ZIP 仅允许图片格式或证据格式：{info.filename}")
-                if info.file_size > max(MAX_IMAGE_BYTES, MAX_EVIDENCE_BYTES):
-                    raise ValueError(f"ZIP 单文件超过安全限制：{info.filename}")
-                total_size += info.file_size
-                if suffix in EVIDENCE_SUFFIXES:
-                    evidence_total += info.file_size
-                    if evidence_total > MAX_EVIDENCE_TOTAL_BYTES:
-                        raise ValueError("ZIP 证据文件总大小超过安全限制")
-                if total_size > MAX_UNCOMPRESSED_BYTES:
-                    raise ValueError("ZIP 解压后内容超过安全限制")
-                basename = PurePosixPath(info.filename).name
-                if basename in entries:
-                    raise ValueError(f"ZIP 内图片文件名重复：{basename}")
-                entries[basename] = info
-    except BadZipFile as exc:
-        raise ValueError("ZIP 文件无法读取") from exc
-
-    return entries, []
 
 
 def _validate_zip_path(name: str) -> None:
@@ -1135,36 +806,6 @@ def _is_safe_basename(name: str) -> bool:
     return PurePosixPath(name).name == name
 
 
-def _validate_images(
-    rows: List[ImportRowPreview], zip_path: Optional[Path], entries: Dict[str, ZipInfo]
-) -> Tuple[List[ImportRowPreview], List[str]]:
-    referenced = {
-        row.normalized["image_filename"]
-        for row in rows
-        if row.normalized["image_filename"] and _is_safe_basename(row.normalized["image_filename"])
-    }
-    updated: List[ImportRowPreview] = []
-    for row in rows:
-        errors = list(row.errors)
-        image_filename = row.normalized["image_filename"]
-        if image_filename and _is_safe_basename(image_filename):
-            if zip_path is None:
-                errors.append("填写图片文件名时必须上传图片 ZIP")
-            elif image_filename not in entries:
-                errors.append(f"ZIP 中未找到图片：{image_filename}")
-            elif entries[image_filename].file_size > MAX_IMAGE_BYTES:
-                errors.append(f"图片不能超过 20 MiB：{image_filename}")
-        updated.append(_replace_row_errors(row, errors))
-
-    warnings = []
-    if zip_path is not None:
-        warnings = [
-            f"ZIP 中图片未被 Excel 引用：{name}"
-            for name in sorted(set(entries) - referenced)
-        ]
-    return updated, warnings
-
-
 def _mark_duplicate_external_ids(rows: List[ImportRowPreview]) -> List[ImportRowPreview]:
     counts: Dict[str, int] = {}
     for row in rows:
@@ -1184,37 +825,6 @@ def _mark_duplicate_external_ids(rows: List[ImportRowPreview]) -> List[ImportRow
 
 def _replace_row_errors(row: ImportRowPreview, errors: List[str]) -> ImportRowPreview:
     return ImportRowPreview(row.manuscript_index, row.row_number, row.normalized, errors, row.warnings, not errors, row.tests)
-
-
-def _extract_referenced_images(
-    zip_path: Path, entries: Dict[str, ZipInfo], rows: List[ImportRowPreview], image_dir: Path
-) -> None:
-    referenced = {
-        row.normalized["image_filename"]
-        for row in rows
-        if row.normalized["image_filename"] in entries
-        and entries[row.normalized["image_filename"]].file_size <= MAX_IMAGE_BYTES
-    }
-    if not referenced:
-        return
-
-    image_dir.mkdir()
-    try:
-        with ZipFile(zip_path) as archive:
-            for basename in sorted(referenced):
-                destination = image_dir / basename
-                written = 0
-                with archive.open(entries[basename]) as source, destination.open("xb") as output:
-                    while True:
-                        chunk = source.read(min(1024 * 1024, MAX_IMAGE_BYTES + 1 - written))
-                        if not chunk:
-                            break
-                        written += len(chunk)
-                        if written > MAX_IMAGE_BYTES:
-                            raise ValueError(f"图片不能超过 20 MiB：{basename}")
-                        output.write(chunk)
-    except (BadZipFile, OSError, RuntimeError) as exc:
-        raise ValueError("ZIP 图片解压失败") from exc
 
 
 def _write_preview(path: Path, preview: ImportPreview, expires_at: datetime) -> None:

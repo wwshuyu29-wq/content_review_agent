@@ -1,7 +1,11 @@
 import { useState, type FormEvent } from "react";
 import { api, type Config } from "../../api";
 
-const DEFAULT_MODEL = "GPT 5.6 SOL";
+const DEFAULT_MODEL = "gpt-5.6-luna";
+const MODEL_OPTIONS = [
+  "gpt-5.6-luna",
+  "GPT 5.6 SOL",
+];
 
 export default function ApiSetupCard({ config, onSaved }: { config: Config | null; onSaved: (config: Config) => void }) {
   const [model, setModel] = useState(config?.model || DEFAULT_MODEL);
@@ -38,16 +42,24 @@ export default function ApiSetupCard({ config, onSaved }: { config: Config | nul
       <div className="panel-heading">
         <div>
           <h3>个人模型配置</h3>
-          <p className="small">{config?.key_set ? "One API 已接入" : "需要接入 One API"}</p>
+          <p className="small">{config?.key_set ? "One API 已接入，团队成员各自保存自己的 key 和模型" : "需要接入 One API"}</p>
         </div>
         <span className={`dot ${config?.key_set ? "on" : "off"}`} />
       </div>
       <form onSubmit={submit}>
         <div className="field">
           <label htmlFor="dashboard-model">模型</label>
-          <select id="dashboard-model" value={model} onChange={(event) => setModel(event.target.value)}>
-            <option value={DEFAULT_MODEL}>{DEFAULT_MODEL}</option>
-          </select>
+          <input
+            id="dashboard-model"
+            list="dashboard-model-options"
+            value={model}
+            onChange={(event) => setModel(event.target.value)}
+            placeholder={DEFAULT_MODEL}
+          />
+          <datalist id="dashboard-model-options">
+            {MODEL_OPTIONS.map((option) => <option key={option} value={option} />)}
+          </datalist>
+          <p className="field-help">可选择常用模型，也可以直接输入团队可用的模型名。</p>
         </div>
         <div className="field">
           <label htmlFor="dashboard-api-key">One API key</label>

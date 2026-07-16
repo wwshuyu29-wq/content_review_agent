@@ -226,7 +226,7 @@ def test_initial_admin_is_created_once_without_changing_existing_review_data(
         assert users[0].username == "admin"
         assert users[0].role == "ADMIN"
         assert verify_password(users[0].password_hash, "correct horse battery staple")
-        assert projects and projects[0].current_rule_version.package_version == "1.1"
+        assert projects and projects[0].current_rule_version.package_version == "1.3"
 
     with TestClient(main.app) as second_client:
         assert second_client.get("/api/health").status_code == 200

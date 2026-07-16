@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
@@ -100,7 +100,7 @@ from server.services.content_service import submit_batch
 from server.services.excel_import_service import PreviewIdentity, build_import_template, preview_import, confirm_import as confirm_excel_import
 from server.services.excel_export_service import export_batch
 from server.services.report_service import build_report
-from server.services.review_service import resolve_task, run_audit
+from server.services.review_service import resolve_task, run_audit, run_batch_audit_once
 from server.services.standard_package_service import load_standard_package, publish_standard_package
 from server.services.severity_service import highest_severity
 
@@ -454,11 +454,26 @@ class DashboardIssueCluster(BaseModel):
     manuscripts: List[DashboardIssueManuscript]
 
 
+class DashboardMonthlyReview(BaseModel):
+    month: str
+    reviewed_count: int
+
+
+class DashboardSupplierQuality(BaseModel):
+    supplier_name: str
+    project_names: List[str]
+    total_count: int
+    passed_count: int
+    pass_rate: float
+
+
 class DashboardOverview(BaseModel):
     month: str
     workload: List[DashboardWorkloadRow]
     quality: DashboardQuality
     project_quality: List[DashboardProjectQuality]
+    monthly_reviews: List[DashboardMonthlyReview]
+    supplier_quality: List[DashboardSupplierQuality]
     issue_clusters: List[DashboardIssueCluster]
 
 
@@ -481,6 +496,77 @@ SAFE_SERVICE_MESSAGES = {
     "提交信息有误，请检查后重试。",
     "当前内容状态不允许重复审核，请刷新后重试。",
 }
+
+DEPRECATED_PRESENTATION_RULE_IDS = {
+    "TEST-COUNT-001",
+    "TEST-EVIDENCE-001",
+}
+DEPRECATED_PRESENTATION_TERMS = ("证据", "测试", "实测", "亲测")
+DASHBOARD_DIMENSIONS = {
+    "CONTENT_QUALITY",
+    "COMPLIANCE",
+    "BRAND",
+    "PRODUCT_ACCURACY",
+    "CAMPAIGN_EFFECTIVENESS",
+}
+
+
+def _contains_any(value: str, terms: tuple[str, ...]) -> bool:
+    return any(term in value for term in terms)
+
+
+def _is_visible_review_issue(issue: Issue) -> bool:
+    if issue.category in {"system", "system_suggestion"}:
+        return False
+    if issue.rule_id in DEPRECATED_PRESENTATION_RULE_IDS:
+        return False
+    searchable = " ".join(str(value or "") for value in (issue.rule_id, issue.category, issue.reason, issue.suggestion))
+    return not any(term in searchable for term in DEPRECATED_PRESENTATION_TERMS)
+
+
+def _issue_dimension_key(issue: Issue) -> str:
+    raw_category = str(issue.category or "")
+    if raw_category in DASHBOARD_DIMENSIONS:
+        return raw_category
+
+    rule_id = str(issue.rule_id or "")
+    searchable = " ".join(
+        str(value or "")
+        for value in (rule_id, raw_category, issue.reason, issue.suggestion, issue.field, issue.evidence_quote)
+    )
+    if rule_id.startswith("BRAND") or _contains_any(searchable, ("品牌", "官方名称", "产品名", "卖点口径")):
+        return "BRAND"
+    if rule_id.startswith("CLAIM") or _contains_any(searchable, ("合规", "绝对", "保证", "承诺", "夸大", "广告法")):
+        return "COMPLIANCE"
+    if _contains_any(searchable, ("功能", "能力", "路线", "规划", "导航", "产品准确", "事实错误", "讲错")):
+        return "PRODUCT_ACCURACY"
+    if _contains_any(searchable, ("传播", "卖点", "转化", "受众", "场景", "标题吸引")):
+        return "CAMPAIGN_EFFECTIVENESS"
+    return "CONTENT_QUALITY"
+
+
+_SEVERITY_WEIGHT = {"CRITICAL": 5, "HIGH": 4, "UNKNOWN": 4, "MEDIUM": 3, "MID": 3, "LOW": 2, "NONE": 1}
+
+
+def _issue_display_priority(issue: Issue) -> tuple[int, int, int]:
+    severity_score = _SEVERITY_WEIGHT.get(str(issue.severity or "").upper(), 0)
+    return (
+        1 if issue.human_required else 0,
+        severity_score,
+        int(issue.confidence * 100),
+    )
+
+
+def _display_review_issues(issues: Iterable[Issue]) -> list[Issue]:
+    selected: Dict[str, Issue] = {}
+    for issue in issues:
+        if not _is_visible_review_issue(issue):
+            continue
+        dimension = _issue_dimension_key(issue)
+        current = selected.get(dimension)
+        if current is None or _issue_display_priority(issue) > _issue_display_priority(current):
+            selected[dimension] = issue
+    return sorted(selected.values(), key=lambda issue: (-_issue_display_priority(issue)[1], _issue_dimension_key(issue)))
 
 
 def _not_found(entity: str, entity_id: int) -> HTTPException:
@@ -506,7 +592,11 @@ def _content_summary(item: ContentItem) -> ContentSummary:
 
 
 def _audit_detail(audit: AuditRun) -> AuditDetail:
-    return AuditDetail.model_validate(audit)
+    return AuditDetail(
+        **AuditRunRead.model_validate(audit).model_dump(),
+        agent_results=[AgentResultRead.model_validate(result) for result in audit.agent_results],
+        issues=[IssueRead.model_validate(issue) for issue in _display_review_issues(audit.issues)],
+    )
 
 
 def _content_detail(item: ContentItem) -> ContentDetail:
@@ -956,7 +1046,7 @@ async def preview_excel_import(
         xlsx = await _save_excel_upload(excel_file, temp, {".xlsx"}, MAX_EXCEL_UPLOAD_BYTES)
         zip_path = None
         if evidence_zip is not None:
-            zip_path = await _save_excel_upload(evidence_zip, temp, {".zip"}, MAX_EVIDENCE_ZIP_UPLOAD_BYTES)
+            raise ValueError("当前仅支持文字审核，不支持媒体 ZIP 或证据 ZIP")
         result = preview_import(
             xlsx, zip_path, root, identity=identity, review_brief=brief_text,
             trigger_terms=_evidence_trigger_terms(project),
@@ -994,7 +1084,6 @@ def confirm_excel_import_endpoint(
             payload.batch_name,
             project_type=payload.project_type,
             owner_name=payload.owner_name,
-            image_llm=getattr(reviewer, "llm", None),
             uploaded_by_user_id=user.id,
         )
         return BatchDetail(
@@ -1188,7 +1277,7 @@ def contents_table(
         payload = dict(supplier.payload or {})
         latest_payload = dict(latest.payload or {})
         audit = max(item.audit_runs, key=lambda value: value.id or 0) if item.audit_runs else None
-        issues = list(audit.issues) if audit else []
+        issues = _display_review_issues(audit.issues if audit else [])
         open_tasks = [task for task in item.review_tasks if task.status == "OPEN"]
         agent_map = {result.agent_id or result.agent_name: result for result in (audit.agent_results if audit else [])}
         agents = []
@@ -1202,7 +1291,6 @@ def contents_table(
                 score=result.score if result else None,
                 status=result.status if result else "NOT_RUN",
             ))
-        media = latest_payload.get("media", payload.get("media"))
         evidence_count = len({binding.asset_id for test in item.test_cases for binding in test.evidence})
         rows.append(ContentTableRow(
             id=item.id, project_id=item.project_id, batch_id=item.batch_id,
@@ -1211,13 +1299,12 @@ def contents_table(
             account_type=payload.get("account_type"), platform=payload.get("platform"),
             original_title=supplier.title, original_body=supplier.body,
             final_title=latest.title, final_body=latest.body,
-            body_summary=latest.body[:200], image_filename=payload.get("image_filename"),
-            publish_time=payload.get("publish_time"), note=payload.get("note"),
+            body_summary=latest.body[:200], publish_time=payload.get("publish_time"), note=payload.get("note"),
             row_number=payload.get("row_number"), format_status=item.format_status,
             review_status=item.review_status, publish_status=item.publish_status,
             issues=[IssueRead.model_validate(issue) for issue in issues], issue_count=len(issues),
             highest_severity=highest_severity((issue.severity for issue in issues)),
-            categories=sorted({issue.category for issue in issues}),
+            categories=sorted({_issue_dimension_key(issue) for issue in issues}),
             suggestions=[issue.suggestion for issue in issues],
             open_task_count=len(open_tasks), open_task_types=sorted({task.task_type for task in open_tasks}),
             latest_audit_id=audit.id if audit else None,
@@ -1311,6 +1398,30 @@ def audit_batch(
     if batch is None:
         raise _not_found("Batch", batch_id)
     config = _config_for_user(user)
+    batch_audit = run_batch_audit_once(
+        session,
+        batch,
+        reviewer=reviewer,
+        model=config["model"] or None,
+        created_by_user_id=user.id,
+    )
+    if batch_audit is not None:
+        audits, errors = batch_audit
+        audit_ids = [audit.id for audit in audits]
+        results = [
+            BatchAuditItemResult(content_id=audit.content_item_id, status="success", audit_run_id=audit.id)
+            for audit in audits
+        ]
+        results.extend(
+            BatchAuditItemResult(content_id=content_id, status="error", error=error)
+            for content_id, error in errors
+        )
+        return BatchAuditResponse(
+            batch_id=batch_id,
+            audited=len(audit_ids),
+            audit_run_ids=audit_ids,
+            results=results,
+        )
     audit_ids = []
     results = []
     for item in batch.content_items:
@@ -1467,6 +1578,14 @@ def _month_key(value: datetime) -> str:
     return value.strftime("%Y-%m")
 
 
+def _shift_month(month: str, offset: int) -> str:
+    base = datetime.strptime(month, "%Y-%m")
+    zero_based = base.month - 1 + offset
+    year = base.year + zero_based // 12
+    month_number = zero_based % 12 + 1
+    return f"{year:04d}-{month_number:02d}"
+
+
 @app.get("/api/dashboard/overview", response_model=DashboardOverview)
 def dashboard_overview(
     month: Optional[str] = None,
@@ -1511,6 +1630,17 @@ def dashboard_overview(
         for user in users
     ]
 
+    monthly_review_keys = [_shift_month(selected_month, offset) for offset in range(-5, 1)]
+    monthly_review_sets: Dict[str, set[int]] = {month_key: set() for month_key in monthly_review_keys}
+    for audit in audit_runs:
+        month_key = _month_key(audit.created_at)
+        if month_key in monthly_review_sets:
+            monthly_review_sets[month_key].add(audit.content_item_id)
+    monthly_reviews = [
+        DashboardMonthlyReview(month=month_key, reviewed_count=len(monthly_review_sets[month_key]))
+        for month_key in monthly_review_keys
+    ]
+
     monthly_items = list(
         session.scalars(
             select(ContentItem)
@@ -1541,6 +1671,30 @@ def dashboard_overview(
                 pass_rate=round(batch_passed / len(items), 4),
             )
         )
+    supplier_groups: Dict[str, Dict[str, Any]] = {}
+    for item in monthly_items:
+        supplier_name = item.batch.supplier_id if item.batch else "未标记供应商"
+        group = supplier_groups.setdefault(
+            supplier_name,
+            {"total_count": 0, "passed_count": 0, "project_names": set()},
+        )
+        group["total_count"] += 1
+        if item.review_status in passed_statuses:
+            group["passed_count"] += 1
+        if item.batch and item.batch.name:
+            group["project_names"].add(item.batch.name)
+    supplier_quality = [
+        DashboardSupplierQuality(
+            supplier_name=supplier_name,
+            project_names=sorted(payload["project_names"]),
+            total_count=payload["total_count"],
+            passed_count=payload["passed_count"],
+            pass_rate=round(payload["passed_count"] / payload["total_count"], 4)
+            if payload["total_count"] else 0,
+        )
+        for supplier_name, payload in supplier_groups.items()
+    ]
+    supplier_quality.sort(key=lambda item: (-item.total_count, item.supplier_name))
     project_lookup = {project.id: project.name for project in session.scalars(select(Project).order_by(Project.id))}
     project_quality = []
     for current_project_id, project_name in project_lookup.items():
@@ -1573,14 +1727,16 @@ def dashboard_overview(
     )
     clusters: Dict[str, Dict[str, Any]] = {}
     for issue in issues:
+        if issue.category in {"system", "system_suggestion"} or not _is_visible_review_issue(issue):
+            continue
+        category_key = _issue_dimension_key(issue)
         cluster = clusters.setdefault(
-            issue.category,
-            {"issue_count": 0, "high_count": 0, "manuscripts": {}},
+            category_key,
+            {"high_content_ids": set(), "manuscripts": {}},
         )
-        cluster["issue_count"] += 1
-        if issue.severity.upper() in {"HIGH", "UNKNOWN"}:
-            cluster["high_count"] += 1
         item = issue.audit_run.content_item
+        if issue.severity.upper() in {"HIGH", "UNKNOWN"}:
+            cluster["high_content_ids"].add(item.id)
         cluster["manuscripts"].setdefault(
             item.id,
             DashboardIssueManuscript(
@@ -1593,9 +1749,9 @@ def dashboard_overview(
     issue_clusters = [
         DashboardIssueCluster(
             category=category,
-            issue_count=payload["issue_count"],
+            issue_count=len(payload["manuscripts"]),
             manuscript_count=len(payload["manuscripts"]),
-            high_count=payload["high_count"],
+            high_count=len(payload["high_content_ids"]),
             manuscripts=list(payload["manuscripts"].values())[:8],
         )
         for category, payload in clusters.items()
@@ -1612,6 +1768,8 @@ def dashboard_overview(
             batches=batch_quality,
         ),
         project_quality=project_quality,
+        monthly_reviews=monthly_reviews,
+        supplier_quality=supplier_quality,
         issue_clusters=issue_clusters,
     )
 

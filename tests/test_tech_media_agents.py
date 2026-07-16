@@ -53,7 +53,7 @@ CONTEXT = ReviewContext(
 def representative_context_and_profile():
     root = Path(__file__).resolve().parents[1]
     draft = json.loads((root / "tests" / "fixtures" / "representative_tech_media_review.json").read_text(encoding="utf-8"))
-    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.1"))
+    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.3"))
     version = SimpleNamespace(
         business_domain=compiled["metadata"]["business_domain"],
         document_type=compiled["metadata"]["document_type"],
@@ -78,6 +78,24 @@ def test_all_active_agents_return_strict_results_in_fixed_order():
     assert tuple(result.agent_id for result in results) == AGENT_ORDER
     assert all(isinstance(result, AgentReviewResult) for result in results)
     assert all(result.model_dump() for result in results)
+
+
+def test_batch_scoring_prompt_limits_findings_to_five_dimensions() -> None:
+    prompt = TechMediaReviewer().build_batch_scoring_prompt(
+        [{"content_item_id": 1, "context": CONTEXT}],
+        PROFILE,
+    )
+
+    assert "每个维度最多返回 1 个最关键问题" in prompt
+    assert "不要追踪证据字段、测试字段或测试条件缺失" in prompt
+    assert "不要把低风险表达建议计入问题数" in prompt
+    assert "90-100 分：无影响发布的问题" in prompt
+    assert "80-89 分：只有轻微建议" in prompt
+    assert "70-79 分：有一处需要修改但不需要人工判断" in prompt
+    assert "60-69 分：需要人工确认" in prompt
+    assert "60 分以下：明显不可发布" in prompt
+    assert "基础内容校对：只抓错别字、标点异常、明显语病、重复词句、标题正文不一致、字段缺失导致读不通" in prompt
+    assert "传播有效性：只判断是否跑题、卖点缺失、平台语感明显不适合；默认只给建议，不阻断" in prompt
 
 
 def test_output_models_forbid_extra_fields_and_bound_scores():
@@ -171,7 +189,7 @@ def test_production_prompts_use_configured_public_specialist_and_one_primary_sta
 
 
 def test_v1_prompt_building_rejects_missing_configured_binding() -> None:
-    profile = PROFILE.model_copy(update={"package_version": "1.1"})
+    profile = PROFILE.model_copy(update={"package_version": "1.2"})
 
     with pytest.raises(ValueError, match="active Agent binding"):
         TechMediaReviewer().build_prompts(CONTEXT, profile)

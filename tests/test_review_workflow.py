@@ -29,7 +29,7 @@ from server.services.content_service import submit_batch
 from server.services.deterministic_rule_service import ReviewContext
 from server.services.report_service import build_report
 from server.services.review_profile_service import _snapshot_compiled, get_review_profile
-from server.services.review_service import _standards_from_rule_version, resolve_task, run_audit
+from server.services.review_service import _standards_from_rule_version, resolve_task, run_audit, run_batch_audit_once
 from server.services.standard_package_service import compute_package_digest
 
 
@@ -131,6 +131,85 @@ class ProtocolReviewer:
             }
             for agent_id, decision in zip(ids, self.decisions)
         ]
+
+
+class CountingBatchLLM:
+    def __init__(self, records):
+        self.records = records
+        self.calls = 0
+        self.prompt = ""
+
+    def chat_json(self, prompt, _schema):
+        self.calls += 1
+        self.prompt = prompt
+        return {
+            "items": [
+                {
+                    "content_item_id": content_id,
+                    "external_id": external_id,
+                    "results": [
+                        {
+                            "agent_id": agent_id,
+                            "agent_version": "tech-media-v1",
+                            "decision": "PASS",
+                            "summary": f"{external_id} {agent_id} passed",
+                            "score": 90,
+                            "confidence": 0.9,
+                            "issues": [],
+                        }
+                        for agent_id in AGENT_ORDER
+                    ],
+                }
+                for content_id, external_id in self.records
+            ]
+        }
+
+
+class LightweightBatchLLM:
+    def __init__(self, records):
+        self.records = records
+        self.calls = 0
+        self.prompt = ""
+
+    def chat_json(self, prompt, _schema):
+        self.calls += 1
+        self.prompt = prompt
+        return {
+            "reviews": [
+                {
+                    "content_id": content_id,
+                    "dimensions": [
+                        {
+                            "dimension": "CONTENT_QUALITY",
+                            "decision": "PASS_WITH_SUGGESTIONS",
+                            "score": 82,
+                            "summary": "表达基本通顺，但有一处可优化。",
+                            "issues": [
+                                {
+                                    "level": "LOW",
+                                    "field": "body",
+                                    "quote": "正文信息完整",
+                                    "problem": "表达偏泛，缺少具体使用场景。",
+                                    "advice": "补充更明确的出行场景和用户收益。",
+                                    "human": False,
+                                }
+                            ],
+                        },
+                        *[
+                            {
+                                "dimension": agent_id,
+                                "decision": "PASS",
+                                "score": 90,
+                                "summary": "未发现明显问题。",
+                                "issues": [],
+                            }
+                            for agent_id in AGENT_ORDER[1:]
+                        ],
+                    ],
+                }
+                for content_id, _external_id in self.records
+            ]
+        }
 
 
 def make_session(tmp_path: Path) -> Session:
@@ -516,7 +595,7 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert audit.content_version.version == 1
         assert audit.rule_version_id == project.current_rule_version_id
         assert audit.model == "model-v1"
-        assert audit.prompt_version == "tech_media_review-1.1"
+        assert audit.prompt_version == "tech_media_review-1.3"
         assert audit.status == "COMPLETED"
         assert reviewer.received_standards.deny_words == []
         assert reviewer.received_standards.recommended == {}
@@ -561,7 +640,7 @@ def test_run_audit_prefers_batch_brief_over_project_brief(tmp_path: Path) -> Non
         assert reviewer.received_profile.project_facts["batch_review_brief"] == batch.review_brief
 
 
-def test_deterministic_issue_is_persisted_in_audit_before_reviewer_results(tmp_path: Path) -> None:
+def test_tech_media_semantic_rules_are_not_persisted_as_precheck_issues(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project = seed_default_project(session)
         item = submit_batch(
@@ -579,10 +658,42 @@ def test_deterministic_issue_is_persisted_in_audit_before_reviewer_results(tmp_p
 
         audit = run_audit(session, item.id, reviewer=FakeReviewer([agent_result()]))
 
-        assert [saved.rule_id for saved in audit.issues] == ["CLAIM-PENDING-001"]
-        assert audit.issues[0].agent_result_id is None
-        assert audit.issues[0].human_required is True
-        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+        assert "CLAIM-PENDING-001" not in [saved.rule_id for saved in audit.issues]
+        assert audit.issues == []
+        assert item.review_status is ReviewStatus.PASSED
+
+
+def test_evidence_and_test_agent_findings_do_not_affect_fast_review(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-simple",
+            name="简单审核批次",
+            contents=[{
+                "external_id": "simple-1",
+                "title": "亲测小度想想路线规划",
+                "body": "我亲测出去玩路线规划很好用。",
+                "payload": {"platform": "xiaohongshu"},
+            }],
+        ).content_items[0]
+        risk = issue(
+            "high",
+            rule_id="AGENT-EVIDENCE-001",
+            category="实测观察缺少证据",
+            evidence_quote="亲测",
+            reason="缺少测试证据",
+            suggestion="补充测试证据",
+            auto_fixable=False,
+            human_required=True,
+        )
+
+        audit = run_audit(session, item.id, reviewer=FakeReviewer([agent_result("accuracy", [risk])]))
+
+        assert audit.issues == []
+        assert item.review_status is ReviewStatus.PASSED
+        assert item.review_tasks == []
 
 
 def test_representative_fixture_audit_keeps_revision_and_human_tasks_open(tmp_path: Path) -> None:
@@ -622,9 +733,12 @@ def test_representative_fixture_audit_keeps_revision_and_human_tasks_open(tmp_pa
         audit = run_audit(session, item.id, reviewer=FakeReviewer(results))
 
         assert {finding.rule_id for finding in audit.issues} >= {
-            "TEST-COUNT-001", "TEST-EVIDENCE-001", "CLAIM-UNSUPPORTED-ABSOLUTE-001",
-            "CLAIM-PENDING-001", "QUALITY-TYPO", "COMPLIANCE-ABSOLUTE", "PENDING-HOTEL",
+            "QUALITY-TYPO", "COMPLIANCE-ABSOLUTE", "PENDING-HOTEL",
         }
+        assert not {
+            "TEST-COUNT-001", "TEST-EVIDENCE-001", "CLAIM-UNSUPPORTED-ABSOLUTE-001",
+            "CLAIM-PENDING-001",
+        } & {finding.rule_id for finding in audit.issues}
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
         assert {task.task_type for task in item.review_tasks if task.status == "OPEN"} == {
@@ -712,11 +826,11 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
             session.delete(issue)
         previous_rules = project.current_rule_version
         current_dimensions = json.loads(json.dumps(previous_rules.dimension_standards))
-        current_dimensions["metadata"]["version"] = "1.2"
+        current_dimensions["metadata"]["version"] = "1.4"
         current_rules = RuleVersion(
             project=project,
             version=previous_rules.version + 1,
-            package_version="1.2",
+            package_version="1.4",
             package_digest="current-package-digest",
             business_domain=previous_rules.business_domain,
             document_type=previous_rules.document_type,
@@ -725,7 +839,7 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
             dimension_standards=current_dimensions,
             project_facts=previous_rules.project_facts,
             structured_rules=previous_rules.structured_rules,
-            prompt_version="tech_media_review-1.2",
+            prompt_version="tech_media_review-1.4",
         )
         current_rules.package_digest = compute_package_digest(_snapshot_compiled(current_rules))
         session.add(current_rules)
@@ -738,6 +852,93 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
         assert unavailable.status == "SUPERSEDED"
         assert replacement.status == "COMPLETED"
         assert all(task.status == "SUPERSEDED" for task in unavailable.review_tasks)
+
+
+def test_batch_audit_uses_one_llm_call_for_multiple_manuscripts(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-a",
+            name="批量一次调用",
+            contents=[
+                {
+                    "external_id": f"batch-fast-{index}",
+                    "title": f"路线规划体验 {index}",
+                    "body": "路线规划步骤清晰，正文信息完整。",
+                    "payload": {"platform": "xiaohongshu"},
+                }
+                for index in range(3)
+            ],
+        )
+        records = [(item.id, item.external_id) for item in batch.content_items]
+        llm = CountingBatchLLM(records)
+
+        result = run_batch_audit_once(
+            session,
+            batch,
+            reviewer=TechMediaReviewer(llm=llm),
+            model="batch-model",
+        )
+
+        assert result is not None
+        audits, errors = result
+        assert errors == []
+        assert llm.calls == 1
+        assert len(audits) == 3
+        assert {audit.model for audit in audits} == {"batch-model"}
+        assert "路线规划体验 0" in llm.prompt
+        assert "路线规划体验 2" in llm.prompt
+        assert all(audit.status == "COMPLETED" for audit in audits)
+        assert len(list(session.scalars(select(AuditRun).where(AuditRun.model == "batch-model")))) == 3
+
+
+def test_batch_audit_accepts_lightweight_model_response(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-light",
+            name="轻结构批量审核",
+            contents=[
+                {
+                    "external_id": f"batch-light-{index}",
+                    "title": f"路线规划体验 {index}",
+                    "body": "路线规划步骤清晰，正文信息完整。",
+                    "payload": {"platform": "xiaohongshu"},
+                }
+                for index in range(2)
+            ],
+        )
+        records = [(item.id, item.external_id) for item in batch.content_items]
+        llm = LightweightBatchLLM(records)
+
+        result = run_batch_audit_once(
+            session,
+            batch,
+            reviewer=TechMediaReviewer(llm=llm),
+            model="light-batch-model",
+        )
+
+        assert result is not None
+        audits, errors = result
+        assert errors == []
+        assert llm.calls == 1
+        assert len(audits) == 2
+        first_audit = audits[0]
+        assert len(first_audit.agent_results) == len(AGENT_ORDER)
+        quality = next(result for result in first_audit.agent_results if result.agent_id == "CONTENT_QUALITY")
+        assert quality.decision == "PASS_WITH_SUGGESTIONS"
+        assert quality.score == 82
+        assert quality.summary == "表达基本通顺，但有一处可优化。"
+        assert first_audit.issues[0].rule_id == "BATCH-CONTENT_QUALITY-001"
+        assert first_audit.issues[0].category == "内容质量"
+        assert first_audit.issues[0].evidence_quote == "正文信息完整"
+        assert first_audit.issues[0].reason == "表达偏泛，缺少具体使用场景。"
+        assert first_audit.issues[0].suggestion == "补充更明确的出行场景和用户收益。"
+        assert first_audit.issues[0].human_required is False
 
 
 def test_nonzero_score_result_with_unavailable_raw_issue_cannot_be_superseded(tmp_path: Path) -> None:
@@ -1075,7 +1276,7 @@ def test_approvals_validate_trimmed_content_and_format_limits(tmp_path: Path) ->
                 raise AssertionError("invalid edited content must be rejected")
 
 
-def test_build_report_returns_project_batch_status_category_rule_and_manual_metrics(tmp_path: Path) -> None:
+def test_build_report_returns_project_batch_status_dimension_summary_and_manual_metrics(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         project = seed_default_project(session)
         batch = submit_batch(session, project_id=project.id, supplier_id="approved", name="approved", contents=[
@@ -1097,7 +1298,14 @@ def test_build_report_returns_project_batch_status_category_rule_and_manual_metr
             auto_fixable=False,
             human_required=True,
         )
-        run_audit(session, second.id, reviewer=FakeReviewer([agent_result("external", [high])]))
+        duplicate_same_dimension = issue(
+            "second high",
+            rule_id="QUALITY-001",
+            category="quality",
+            auto_fixable=False,
+            human_required=True,
+        )
+        run_audit(session, second.id, reviewer=FakeReviewer([agent_result("external", [high, duplicate_same_dimension])]))
 
         report = build_report(session, project_id=project.id)
         batch_report = build_report(session, project_id=project.id, batch_id=batch.id)
@@ -1105,8 +1313,8 @@ def test_build_report_returns_project_batch_status_category_rule_and_manual_metr
         assert report["project"] == {"id": project.id, "name": project.name}
         assert report["totals"]["contents"] == 2
         assert report["status_counts"] == {"PASSED": 1, "HUMAN_REVIEW_REQUIRED": 1}
-        assert report["category_counts"] == {"external": 1}
-        assert report["rule_counts"] == {"PARTNER-003": 1}
+        assert report["category_counts"] == {"CONTENT_QUALITY": 1}
+        assert report["rule_counts"] == {}
         assert report["manual_metrics"] == {"contents": 1, "tasks": 1, "rate": 0.5}
         assert batch_report["batch"] == {"id": batch.id, "name": batch.name}
         assert batch_report["totals"]["contents"] == 1

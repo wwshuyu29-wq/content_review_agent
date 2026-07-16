@@ -8,6 +8,52 @@ from sqlalchemy.orm import Session
 
 from server.models import AuditRun, Batch, ContentItem, Issue, Project, ReviewStatus, ReviewTask
 
+DIMENSION_KEYS = {
+    "CONTENT_QUALITY",
+    "COMPLIANCE",
+    "BRAND",
+    "PRODUCT_ACCURACY",
+    "CAMPAIGN_EFFECTIVENESS",
+}
+DEPRECATED_PRESENTATION_RULE_IDS = {
+    "TEST-COUNT-001",
+    "TEST-EVIDENCE-001",
+}
+DEPRECATED_PRESENTATION_TERMS = ("证据", "测试", "实测", "亲测")
+
+
+def _contains_any(value: str, terms: tuple[str, ...]) -> bool:
+    return any(term in value for term in terms)
+
+
+def _is_visible_report_issue(issue: Issue) -> bool:
+    if issue.category in {"system", "system_suggestion"}:
+        return False
+    if issue.rule_id in DEPRECATED_PRESENTATION_RULE_IDS:
+        return False
+    searchable = " ".join(str(value or "") for value in (issue.rule_id, issue.category, issue.reason, issue.suggestion))
+    return not any(term in searchable for term in DEPRECATED_PRESENTATION_TERMS)
+
+
+def _issue_dimension_key(issue: Issue) -> str:
+    raw_category = str(issue.category or "")
+    if raw_category in DIMENSION_KEYS:
+        return raw_category
+    rule_id = str(issue.rule_id or "")
+    searchable = " ".join(
+        str(value or "")
+        for value in (rule_id, raw_category, issue.reason, issue.suggestion, issue.field, issue.evidence_quote)
+    )
+    if rule_id.startswith("BRAND") or _contains_any(searchable, ("品牌", "官方名称", "产品名", "卖点口径")):
+        return "BRAND"
+    if rule_id.startswith("CLAIM") or _contains_any(searchable, ("合规", "绝对", "保证", "承诺", "夸大", "广告法")):
+        return "COMPLIANCE"
+    if _contains_any(searchable, ("功能", "能力", "路线", "规划", "导航", "产品准确", "事实错误", "讲错")):
+        return "PRODUCT_ACCURACY"
+    if _contains_any(searchable, ("传播", "卖点", "转化", "受众", "场景", "标题吸引")):
+        return "CAMPAIGN_EFFECTIVENESS"
+    return "CONTENT_QUALITY"
+
 
 def build_report(session: Session, *, project_id: int, batch_id: Optional[int] = None) -> dict:
     project = session.get(Project, project_id)
@@ -53,6 +99,12 @@ def build_report(session: Session, *, project_id: int, batch_id: Optional[int] =
             select(func.count(ReviewTask.id)).where(ReviewTask.content_item_id.in_(item_ids))
         ) or 0
 
+    dimension_content_ids: dict[str, set[int]] = {}
+    for issue in issues:
+        if not _is_visible_report_issue(issue):
+            continue
+        dimension_content_ids.setdefault(_issue_dimension_key(issue), set()).add(issue.audit_run.content_item_id)
+
     manual_item_ids = {
         item.id for item in items if item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
     }
@@ -65,8 +117,11 @@ def build_report(session: Session, *, project_id: int, batch_id: Optional[int] =
         "totals": {"contents": len(items), "issues": len(issues), "tasks": len(active_tasks)},
         "historical_totals": {"issues": historical_issue_count, "tasks": historical_task_count},
         "status_counts": dict(Counter(item.review_status.value for item in items)),
-        "category_counts": dict(Counter(issue.category for issue in issues)),
-        "rule_counts": dict(Counter(issue.rule_id for issue in issues)),
+        "category_counts": {
+            dimension: len(content_ids)
+            for dimension, content_ids in sorted(dimension_content_ids.items())
+        },
+        "rule_counts": {},
         "manual_metrics": {
             "contents": len(manual_item_ids),
             "tasks": sum(task.task_type in {"HUMAN_REVIEW", "BLOCK_REVIEW"} for task in active_tasks),

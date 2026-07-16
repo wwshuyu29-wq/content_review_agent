@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import importlib
 import json
-import stat
-import struct
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -15,7 +13,6 @@ from openpyxl import Workbook, load_workbook
 from server.services import excel_import_service
 from server.services.excel_import_service import (
     IMPORT_COLUMNS,
-    MAX_IMAGE_BYTES,
     build_import_template,
     load_preview,
     preview_import,
@@ -23,7 +20,8 @@ from server.services.excel_import_service import (
 
 
 REQUIRED_COLUMNS = ("供应商内容编号", "活动主题", "平台", "标题", "正文")
-NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期")
+OPTIMIZED_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "优化后版本")
 
 
 def write_workbook(
@@ -51,12 +49,11 @@ def write_workbook(
 def valid_row(
     external_id: object = "content-1",
     *,
-    image: object = None,
     publish_time: object = None,
     title: object = " 标题 ",
     body: object = " 正文 ",
 ) -> list[object]:
-    return [external_id, " 活动主题 ", " 小红书 ", title, body, image, publish_time, " 备注 "]
+    return [external_id, " 活动主题 ", " 小红书 ", title, body, publish_time, " 备注 "]
 
 
 def write_zip(path: Path, entries: list[tuple[object, ...]]) -> Path:
@@ -97,23 +94,19 @@ def test_default_preview_root_registry_path_is_not_cwd_dependent(tmp_path: Path,
 def test_build_import_template_has_exact_chinese_columns() -> None:
     workbook = load_workbook(BytesIO(build_import_template()), read_only=True)
 
-    assert workbook.sheetnames == ["内容清单", "测试场景", "字段说明"]
+    assert workbook.sheetnames == ["内容清单", "字段说明"]
     assert tuple(cell.value for cell in next(workbook["内容清单"].iter_rows())) == NEW_CONTENT_COLUMNS
-    assert tuple(cell.value for cell in next(workbook["测试场景"].iter_rows())) == (
-        "供应商内容编号", "测试场景编号", "测试结论", "测试指令", "实际返回结果", "测试城市", "测试时间", "百度地图版本", "设备", "操作系统", "网络环境", "证据文件名",
-    )
 
 
 def test_preview_accepts_exact_new_headers_maps_fields_and_derives_stable_id(tmp_path: Path) -> None:
     xlsx = write_workbook(
         tmp_path / "new-template.xlsx",
-        [[" 新标题 ", " 新内容 ", " 图文 ", " 小红书 ", " 地图作者 ", date(2026, 7, 20), " cover.png "]],
+        [[" 新标题 ", " 新内容 ", " 图文 ", " 小红书 ", " 地图作者 ", date(2026, 7, 20)]],
         NEW_CONTENT_COLUMNS,
     )
-    archive = write_zip(tmp_path / "media.zip", [("cover.png", b"image")])
 
-    first = preview_import(xlsx, archive, tmp_path / "first")
-    second = preview_import(xlsx, archive, tmp_path / "second")
+    first = preview_import(xlsx, None, tmp_path / "first")
+    second = preview_import(xlsx, None, tmp_path / "second")
 
     assert first.valid_count == 1
     assert first.error_count == 0
@@ -125,7 +118,6 @@ def test_preview_accepts_exact_new_headers_maps_fields_and_derives_stable_id(tmp
         "platform": "小红书",
         "title": "新标题",
         "body": "新内容",
-        "image_filename": "cover.png",
         "publish_time": "2026-07-20",
         "note": None,
     }
@@ -136,8 +128,8 @@ def test_new_format_identical_title_and_author_rows_receive_distinct_ids(tmp_pat
     xlsx = write_workbook(
         tmp_path / "new-duplicate-input.xlsx",
         [
-            ["同标题", "内容一", "图文", "微博", "同作者", None, None],
-            ["同标题", "内容二", "图文", "微博", "同作者", None, None],
+            ["同标题", "内容一", "图文", "微博", "同作者", None],
+            ["同标题", "内容二", "图文", "微博", "同作者", None],
         ],
         NEW_CONTENT_COLUMNS,
     )
@@ -148,13 +140,29 @@ def test_new_format_identical_title_and_author_rows_receive_distinct_ids(tmp_pat
     assert len({row.normalized["external_id"] for row in preview.rows}) == 2
 
 
+def test_preview_accepts_actual_project_headers_with_optimized_body(tmp_path: Path) -> None:
+    xlsx = write_workbook(
+        tmp_path / "optimized-template.xlsx",
+        [["标题", "原始内容", "UGC", "小红书", "作者", "46293", "优化后内容"]],
+        OPTIMIZED_CONTENT_COLUMNS,
+    )
+
+    preview = preview_import(xlsx, None, tmp_path / "imports")
+
+    assert preview.valid_count == 1
+    row = preview.rows[0].normalized
+    assert row["body"] == "优化后内容"
+    assert row["publish_time"] == "2026-09-28"
+    assert row["note"] == "导入时使用“优化后版本”作为审核正文"
+
+
 def test_preview_rejects_duplicate_derived_ids_within_batch(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(excel_import_service, "_derive_external_id", lambda *_: "excel:collision")
     xlsx = write_workbook(
         tmp_path / "derived-collision.xlsx",
         [
-            ["标题一", "内容一", "图文", "微博", "作者一", None, None],
-            ["标题二", "内容二", "图文", "微博", "作者二", None, None],
+            ["标题一", "内容一", "图文", "微博", "作者一", None],
+            ["标题二", "内容二", "图文", "微博", "作者二", None],
         ],
         NEW_CONTENT_COLUMNS,
     )
@@ -185,7 +193,6 @@ def test_preview_parses_only_first_worksheet_and_trims_required_values(tmp_path:
         "platform": "小红书",
         "title": "标题",
         "body": "正文",
-        "image_filename": None,
         "publish_time": None,
         "note": "备注",
     }
@@ -211,7 +218,6 @@ def test_preview_accepts_workbook_with_only_required_headers(tmp_path: Path) -> 
 
     assert preview.total_count == 1
     assert preview.valid_count == 1
-    assert preview.rows[0].normalized["image_filename"] is None
     assert preview.rows[0].normalized["publish_time"] is None
     assert preview.rows[0].normalized["note"] is None
 
@@ -318,156 +324,20 @@ def test_preview_marks_invalid_date_as_row_error(tmp_path: Path) -> None:
     assert_has_error(preview, "计划发布时间")
 
 
-def test_preview_allows_only_one_safe_image_filename_per_row(tmp_path: Path) -> None:
-    xlsx = write_workbook(
-        tmp_path / "image-names.xlsx",
-        [valid_row("many", image="a.jpg,b.jpg"), valid_row("path", image="folder/a.jpg")],
-    )
+def test_preview_rejects_zip_in_text_only_mode(tmp_path: Path) -> None:
+    xlsx = write_workbook(tmp_path / "text-only.xlsx", [valid_row()])
+    archive = write_zip(tmp_path / "media.zip", [("cover.jpg", b"image")])
 
-    preview = preview_import(xlsx, None, tmp_path / "imports")
-
-    assert_has_error(preview, "一张", 0)
-    assert_has_error(preview, "文件名", 1)
-
-
-def test_zip_is_optional_unless_an_image_is_referenced(tmp_path: Path) -> None:
-    no_image = preview_import(
-        write_workbook(tmp_path / "no-image.xlsx", [valid_row()]), None, tmp_path / "no-image"
-    )
-    assert no_image.rows[0].valid is True
-
-    referenced = preview_import(
-        write_workbook(tmp_path / "referenced.xlsx", [valid_row(image="cover.jpg")]),
-        None,
-        tmp_path / "referenced",
-    )
-    assert_has_error(referenced, "ZIP")
-
-
-def test_preview_matches_exact_basename_extracts_only_referenced_and_warns_unreferenced(tmp_path: Path) -> None:
-    xlsx = write_workbook(tmp_path / "images.xlsx", [valid_row(image="Cover.JPG")])
-    archive = write_zip(
-        tmp_path / "images.zip",
-        [("nested/Cover.JPG", b"referenced"), ("unused.png", b"unreferenced")],
-    )
-
-    preview = preview_import(xlsx, archive, tmp_path / "imports")
-
-    assert preview.rows[0].valid is True
-    assert preview.rows[0].normalized["image_filename"] == "Cover.JPG"
-    assert any("unused.png" in warning for warning in preview.warnings)
-    preview_dir = next((tmp_path / "imports").iterdir())
-    extracted_files = [path for path in preview_dir.rglob("*") if path.is_file()]
-    assert any(path.name == "Cover.JPG" and path.read_bytes() == b"referenced" for path in extracted_files)
-    assert not any(path.name == "unused.png" for path in extracted_files)
-
-
-def test_preview_uses_case_sensitive_exact_image_matching(tmp_path: Path) -> None:
-    xlsx = write_workbook(tmp_path / "case.xlsx", [valid_row(image="cover.jpg")])
-    archive = write_zip(tmp_path / "case.zip", [("Cover.JPG", b"image")])
-
-    preview = preview_import(xlsx, archive, tmp_path / "imports")
-
-    assert_has_error(preview, "cover.jpg")
-
-
-def test_preview_marks_missing_referenced_image_as_row_error(tmp_path: Path) -> None:
-    xlsx = write_workbook(tmp_path / "missing-image.xlsx", [valid_row(image="missing.png")])
-    archive = write_zip(tmp_path / "images.zip", [("other.png", b"image")])
-
-    preview = preview_import(xlsx, archive, tmp_path / "imports")
-
-    assert_has_error(preview, "missing.png")
-
-
-@pytest.mark.parametrize("unsafe_name", ["../cover.jpg", "/cover.jpg", "C:\\cover.jpg"])
-def test_preview_rejects_zip_traversal_and_absolute_paths(tmp_path: Path, unsafe_name: str) -> None:
-    xlsx = write_workbook(tmp_path / "unsafe.xlsx", [valid_row()])
-    archive = write_zip(tmp_path / "unsafe.zip", [(unsafe_name, b"image")])
-
-    with pytest.raises(ValueError, match="ZIP.*路径"):
+    with pytest.raises(ValueError, match="仅支持文字"):
         preview_import(xlsx, archive, tmp_path / "imports")
-
-
-def test_preview_rejects_zip_symlinks(tmp_path: Path) -> None:
-    xlsx = write_workbook(tmp_path / "symlink.xlsx", [valid_row()])
-    archive = tmp_path / "symlink.zip"
-    info = ZipInfo("cover.jpg")
-    info.create_system = 3
-    info.external_attr = (stat.S_IFLNK | 0o777) << 16
-    with ZipFile(archive, "w") as output:
-        output.writestr(info, "target.jpg")
-
-    with pytest.raises(ValueError, match="符号链接"):
-        preview_import(xlsx, archive, tmp_path / "imports")
-
-
-def mark_zip_encrypted(path: Path) -> None:
-    data = bytearray(path.read_bytes())
-    local = data.index(b"PK\x03\x04")
-    central = data.index(b"PK\x01\x02")
-    local_flags = struct.unpack_from("<H", data, local + 6)[0] | 0x1
-    central_flags = struct.unpack_from("<H", data, central + 8)[0] | 0x1
-    struct.pack_into("<H", data, local + 6, local_flags)
-    struct.pack_into("<H", data, central + 8, central_flags)
-    path.write_bytes(data)
-
-
-def test_preview_rejects_encrypted_zip_entries(tmp_path: Path) -> None:
-    xlsx = write_workbook(tmp_path / "encrypted.xlsx", [valid_row()])
-    archive = write_zip(tmp_path / "encrypted.zip", [("cover.jpg", b"image")])
-    mark_zip_encrypted(archive)
-
-    with pytest.raises(ValueError, match="加密"):
-        preview_import(xlsx, archive, tmp_path / "imports")
-
-
-def test_preview_rejects_non_image_entries_and_duplicate_basenames(tmp_path: Path) -> None:
-    xlsx = write_workbook(tmp_path / "invalid-entries.xlsx", [valid_row()])
-    non_image = write_zip(tmp_path / "non-image.zip", [("notes.exe", b"text")])
-    duplicate = write_zip(
-        tmp_path / "duplicate.zip",
-        [("a/cover.jpg", b"one"), ("b/cover.jpg", b"two")],
-    )
-
-    with pytest.raises(ValueError, match="图片格式"):
-        preview_import(xlsx, non_image, tmp_path / "non-image")
-    with pytest.raises(ValueError, match="重复.*cover.jpg"):
-        preview_import(xlsx, duplicate, tmp_path / "duplicate")
-
-
-def test_preview_rejects_oversized_zip_and_uncompressed_expansion(tmp_path: Path, monkeypatch) -> None:
-    xlsx = write_workbook(tmp_path / "limits.xlsx", [valid_row()])
-    archive = write_zip(tmp_path / "limits.zip", [("cover.jpg", b"x" * 128, ZIP_STORED)])
-
-    monkeypatch.setattr(excel_import_service, "MAX_ZIP_BYTES", 32)
-    with pytest.raises(ValueError, match="200 MiB"):
-        preview_import(xlsx, archive, tmp_path / "zip-too-large")
-
-    monkeypatch.setattr(excel_import_service, "MAX_ZIP_BYTES", 1024)
-    monkeypatch.setattr(excel_import_service, "MAX_UNCOMPRESSED_BYTES", 64)
-    with pytest.raises(ValueError, match="解压"):
-        preview_import(xlsx, archive, tmp_path / "expansion")
-
-
-def test_preview_rejects_images_larger_than_20_mib(tmp_path: Path, monkeypatch) -> None:
-    xlsx = write_workbook(tmp_path / "large-image.xlsx", [valid_row(image="cover.jpg")])
-    archive = write_zip(tmp_path / "large-image.zip", [("cover.jpg", b"12345", ZIP_STORED)])
-    monkeypatch.setattr(excel_import_service, "MAX_IMAGE_BYTES", 4)
-
-    preview = preview_import(xlsx, archive, tmp_path / "imports")
-
-    assert MAX_IMAGE_BYTES == 20 * 1024 * 1024
-    assert_has_error(preview, "20 MiB")
 
 
 def test_preview_token_is_opaque_and_metadata_is_persisted_without_raw_file_bytes(tmp_path: Path) -> None:
     raw_marker = b"unique raw workbook marker"
     xlsx = write_workbook(tmp_path / "token.xlsx", [valid_row(body=raw_marker.decode())])
-    archive = write_zip(tmp_path / "token.zip", [("unused.png", b"raw zip marker")])
     temp_root = tmp_path / "imports"
 
-    preview = preview_import(xlsx, archive, temp_root)
+    preview = preview_import(xlsx, None, temp_root)
     loaded = load_preview(preview.token)
 
     assert loaded == preview
@@ -478,7 +348,6 @@ def test_preview_token_is_opaque_and_metadata_is_persisted_without_raw_file_byte
     metadata_bytes = manifests[0].read_bytes()
     json.loads(metadata_bytes)
     assert xlsx.read_bytes() not in metadata_bytes
-    assert archive.read_bytes() not in metadata_bytes
 
 
 def _preview_manifest(temp_root: Path, token: str) -> Path:
@@ -561,27 +430,12 @@ def test_formula_cells_are_reported_with_readable_row_and_field_errors(tmp_path:
 
 
 def test_formula_only_rows_still_trigger_500_row_limit(tmp_path: Path) -> None:
-    formula_rows = [[None] * 7 + ["=ROW()"] for _ in range(501)]
+    formula_rows = [[None] * (len(IMPORT_COLUMNS) - 1) + ["=ROW()"] for _ in range(501)]
     xlsx = write_workbook(tmp_path / "formula-overflow.xlsx", formula_rows)
     temp_root = tmp_path / "imports"
 
     with pytest.raises(ValueError, match="500"):
         preview_import(xlsx, None, temp_root)
-
-    assert list(temp_root.iterdir()) == []
-
-
-def test_preview_rejects_more_than_1000_zip_entries_and_cleans_up(tmp_path: Path) -> None:
-    assert excel_import_service.MAX_ZIP_ENTRIES == 1000
-    xlsx = write_workbook(tmp_path / "entries.xlsx", [valid_row()])
-    archive = write_zip(
-        tmp_path / "entries.zip",
-        [(f"image-{index}.jpg", b"") for index in range(1001)],
-    )
-    temp_root = tmp_path / "imports"
-
-    with pytest.raises(ValueError, match="1000"):
-        preview_import(xlsx, archive, temp_root)
 
     assert list(temp_root.iterdir()) == []
 
@@ -667,37 +521,33 @@ def write_named_workbook(path: Path, content_rows: list[list[object]], test_rows
 
 
 def tech_row(external_id: str, body: str = "普通正文") -> list[object]:
-    return [external_id, "活动", "账号", "媒体", "小红书", "标题", body, None, None, None]
+    return [external_id, "活动", "账号", "媒体", "小红书", "标题", body, None, None]
 
 
-def test_trigger_evidence_is_not_required_by_precheck(tmp_path: Path) -> None:
-    # Precheck must NOT reject rows that contain trigger words (亲测/实测) but have
-    # no test cases. Evidence-related validation belongs to the six-Agent semantic
-    # review (run_audit), not to precheck. Both rows should pass precheck.
+def test_trigger_words_are_not_required_by_text_only_precheck(tmp_path: Path) -> None:
+    # Precheck only verifies the uploaded table can be read and has required
+    # fields; semantic claims are handled by later text review.
     xlsx = write_named_workbook(
         tmp_path / "per-content.xlsx",
         [tech_row("triggered", "这是亲测内容"), tech_row("other")],
         [["other", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, "other.png"]],
     )
-    archive = write_zip(tmp_path / "evidence.zip", [("other.png", b"png")])
 
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    preview = preview_import(xlsx, None, tmp_path / "previews")
 
-    # Row with 亲测 trigger word but no test cases must still pass precheck
     assert preview.rows[0].valid is True
     assert not any("证据" in error or "测试场景" in error for error in preview.rows[0].errors)
     assert preview.rows[1].valid is True
 
 
-def test_orphan_test_row_does_not_affect_content_precheck(tmp_path: Path) -> None:
+def test_test_sheet_is_ignored_in_text_only_precheck(tmp_path: Path) -> None:
     xlsx = write_named_workbook(
         tmp_path / "orphan.xlsx",
         [tech_row("content-1")],
         [["missing", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, "proof.png"]],
     )
-    archive = write_zip(tmp_path / "proof.zip", [("proof.png", b"png")])
 
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    preview = preview_import(xlsx, None, tmp_path / "previews")
 
     assert preview.error_count == 0
     assert preview.errors == []
@@ -725,31 +575,6 @@ def test_malformed_xlsx_and_arbitrary_zip_have_stable_errors(tmp_path: Path) -> 
     write_zip(arbitrary, [("random.txt", b"not OOXML")])
     with pytest.raises(ValueError, match="Excel|XLSX"):
         preview_import(arbitrary, None, tmp_path / "arbitrary-previews")
-
-
-
-def test_manifest_rejects_orphan_and_row_test_binding_tampering(tmp_path: Path) -> None:
-    xlsx = write_named_workbook(
-        tmp_path / "manifest.xlsx", [tech_row("content-1")],
-        [["content-1", "case-1", "通过", "指令", "结果", None, None, None, None, None, None, "proof.png"]],
-    )
-    archive = write_zip(tmp_path / "proof.zip", [("proof.png", b"png")])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
-    manifest = _preview_manifest(tmp_path / "previews", preview.token)
-    original = json.loads(manifest.read_text(encoding="utf-8"))
-
-    orphan = json.loads(json.dumps(original))
-    orphan["test_cases"][0]["content_external_id"] = "missing"
-    manifest.write_text(json.dumps(orphan, ensure_ascii=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="预览数据无效"):
-        load_preview(preview.token)
-
-    manifest.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
-    mismatch = json.loads(json.dumps(original))
-    mismatch["rows"][0]["tests"] = []
-    manifest.write_text(json.dumps(mismatch, ensure_ascii=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="预览数据无效"):
-        load_preview(preview.token)
 
 
 def test_preview_identity_round_trips_and_is_strict(tmp_path: Path) -> None:

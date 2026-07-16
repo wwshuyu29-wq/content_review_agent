@@ -28,7 +28,7 @@ from server.models import (
     RuleVersion,
 )
 from server.schemas import ContentItemCreate, ContentItemRead, IssueCreate
-from server.seed import seed_default_project
+from server.seed import DEFAULT_PACKAGE_VERSION, seed_default_project
 
 
 def make_sqlite_engine(tmp_path: Path) -> Engine:
@@ -251,7 +251,7 @@ def test_schema_upgrade_adds_import_token_to_legacy_batches_and_confirm_import_w
     worksheet = workbook.active
     worksheet.title = "内容清单"
     worksheet.append(list(IMPORT_COLUMNS))
-    worksheet.append(["legacy-row", "活动主题", "小红书", "标题", "正文", None, "2026-08-01", "备注"])
+    worksheet.append(["legacy-row", "活动主题", "小红书", "标题", "正文", "2026-08-01", "备注"])
     xlsx = tmp_path / "legacy-import.xlsx"
     workbook.save(xlsx)
     preview = preview_import(xlsx, None, tmp_path / "previews")
@@ -565,7 +565,7 @@ def test_seed_default_project_is_idempotent_and_uses_tech_review_package(tmp_pat
         rules = first.current_rule_version
         assert rules is not None
         assert rules.version == 1
-        assert rules.package_version == "1.1"
+        assert rules.package_version == "1.3"
         assert rules.project_code == "bdmap_xdxx_tech_review_2026"
         assert rules.dimension_standards["metadata"]["content_type"] == "TECH_MEDIA_REVIEW"
         serialized = str({"facts": rules.project_facts, "rules": rules.structured_rules})
@@ -601,7 +601,7 @@ def test_seed_repairs_stale_current_rule_version_pointer(tmp_path: Path) -> None
 
         repaired = seed_default_project(session)
 
-        assert repaired.current_rule_version.package_version == "1.1"
+        assert repaired.current_rule_version.package_version == "1.3"
         assert repaired.current_rule_version.package_digest != "stale"
 
 
@@ -636,9 +636,43 @@ def test_seed_publishes_new_package_version_over_legacy_snapshot(tmp_path: Path)
 
         assert [(version.version, version.package_version) for version in seeded.rule_versions] == [
             (1, "1.0"),
-            (2, "1.1"),
+            (2, "1.3"),
         ]
-        assert seeded.current_rule_version.package_version == "1.1"
+        assert seeded.current_rule_version.package_version == "1.3"
+
+
+def test_seed_preserves_existing_default_version_when_local_files_changed(tmp_path: Path) -> None:
+    engine = make_sqlite_engine(tmp_path)
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        project = Project(
+            name="百度地图小度想想",
+            code="bdmap_xdxx_tech_review_2026",
+            content_type="TECH_MEDIA_REVIEW",
+        )
+        existing = RuleVersion(
+            project=project,
+            version=1,
+            package_version=DEFAULT_PACKAGE_VERSION,
+            package_digest="already-published-digest",
+            business_domain="baidu_maps_marketing_review",
+            document_type="project_standard",
+            project_code=project.code,
+            content_type=project.content_type,
+            dimension_standards={},
+            project_facts={},
+            structured_rules={},
+            prompt_version=f"tech_media_review-{DEFAULT_PACKAGE_VERSION}",
+        )
+        project.current_rule_version = existing
+        session.add(project)
+        session.flush()
+
+        seeded = seed_default_project(session)
+
+        assert seeded.id == project.id
+        assert seeded.current_rule_version.id == existing.id
+        assert seeded.current_rule_version.package_digest == "already-published-digest"
 
 
 def test_get_session_uses_configured_database_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

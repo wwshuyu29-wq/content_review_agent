@@ -115,7 +115,6 @@ def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
         _payload_value(payload, "platform"),
         _payload_value(payload, "account_name"),
         _payload_value(payload, "publish_time"),
-        _payload_value(payload, "image_filename"),
         item.id,
         batch.id,
         _enum_value(item.format_status),

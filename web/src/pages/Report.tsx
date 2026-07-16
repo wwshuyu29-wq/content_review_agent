@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, type Batch, type ContentTableRow, type Project, type ReportData } from "../api";
-import { categoryLabel, decisionLabel, severityLabel, statusLabel } from "../reviewLabels";
+import { categoryLabel, severityLabel } from "../reviewLabels";
 
-function Distribution({ title, values, label }: { title: string; values: Record<string, number>; label: (value: string) => string }) {
+function Distribution({ title, values, label, detail }: { title: string; values: Record<string, number>; label: (value: string) => string; detail?: string }) {
   const entries = Object.entries(values).sort((a, b) => b[1] - a[1]);
   const max = Math.max(1, ...entries.map(([, value]) => value));
   return (
     <section className="report-panel">
       <h3>{title}</h3>
+      {detail && <p className="small">{detail}</p>}
       {entries.length === 0 ? <p className="empty">暂无数据</p> : (
         <div className="metric-list">
           {entries.map(([key, value]) => (
@@ -27,8 +28,9 @@ function Metric({ title, value, detail }: { title: string; value: string; detail
   return <article className="dashboard-kpi"><span>{title}</span><b>{value}</b><small>{detail}</small></article>;
 }
 
-const passStatuses = new Set(["PASSED", "PASSED_WITH_SUGGESTIONS"]);
 const pct = (value: number) => Number.isFinite(value) ? `${Math.round(value * 100)}%` : "—";
+const mvpResultLabel = (value: string) => ({ CLEAR: "未发现明显问题", ATTENTION: "需关注稿件" }[value] || value);
+const analysisProgressLabel = (value: string) => ({ ANALYZED: "已完成分析", PENDING: "待分析" }[value] || value);
 
 export default function Report() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -86,24 +88,24 @@ export default function Report() {
   }, [projectId, batchId]);
 
   const metrics = useMemo(() => {
-    const passed = rows.filter((row) => passStatuses.has(row.review_status)).length;
-    const human = rows.filter((row) => row.open_task_count > 0 || row.review_status === "HUMAN_REVIEW_REQUIRED").length;
-    const dimensions: Record<string, number> = {};
+    const attentionRows = rows.filter((row) => row.issue_count > 0);
+    const clearRows = rows.length - attentionRows.length;
+    const analyzedRows = rows.filter((row) => row.latest_audit_id).length;
+    const issueDimensionCount = Object.values(report?.category_counts || {}).filter((value) => value > 0).length;
     const issueExamples = rows
       .flatMap((row) => row.issues.map((issue) => ({ row, issue })))
       .sort((a, b) => b.issue.confidence - a.issue.confidence)
       .slice(0, 6);
-    rows.flatMap((row) => row.agents).forEach((agent) => {
-      if (agent.status !== "NOT_RUN" && agent.decision) dimensions[agent.decision] = (dimensions[agent.decision] || 0) + 1;
-    });
     return {
-      passed,
-      passRate: rows.length ? passed / rows.length : 0,
-      humanRate: rows.length ? human / rows.length : 0,
-      dimensions,
+      clearRows,
+      passRate: rows.length ? clearRows / rows.length : 0,
+      attentionRows: attentionRows.length,
+      issueDimensionCount,
+      resultCounts: { CLEAR: clearRows, ATTENTION: attentionRows.length },
+      progressCounts: { ANALYZED: analyzedRows, PENDING: Math.max(0, rows.length - analyzedRows) },
       issueExamples,
     };
-  }, [rows]);
+  }, [report?.category_counts, rows]);
 
   if (projectsLoading) return <div><div className="page-heading"><div><h2>审核报告</h2><p>正在读取项目列表...</p></div></div><p className="empty">加载中...</p></div>;
   if (!projects.length) return <div><div className="page-heading"><div><h2>审核报告</h2><p>当前没有可统计的审核项目。</p></div></div>{error && <div className="msg err">{error}</div>}<div className="card empty">当前没有可统计的审核项目。</div></div>;
@@ -126,19 +128,18 @@ export default function Report() {
         <>
           <div className="report-title"><h3>{report.project.name}</h3><span>{report.batch ? `批次：${report.batch.name}` : "全部批次"}</span></div>
           <section className="dashboard-kpi-grid">
-            <Metric title="审核总稿量" value={String(report.totals.contents)} detail="当前筛选范围" />
-            <Metric title="内容通过率" value={pct(metrics.passRate)} detail={`${metrics.passed}/${rows.length} 篇通过`} />
-            <Metric title="人工介入率" value={pct(metrics.humanRate)} detail="待处理或需人工确认稿件" />
-            <Metric title="高频问题数" value={String(report.historical_totals.issues)} detail="用于培训和错题本沉淀" />
+            <Metric title="分析稿量" value={String(report.totals.contents)} detail="当前筛选范围" />
+            <Metric title="初筛通过率" value={pct(metrics.passRate)} detail={`${metrics.clearRows}/${rows.length} 篇未发现明显问题`} />
+            <Metric title="需关注稿件" value={String(metrics.attentionRows)} detail="按稿件去重统计" />
+            <Metric title="主要问题类型" value={String(metrics.issueDimensionCount)} detail="按五个维度聚合" />
           </section>
           <div className="report-grid">
-            <Distribution title="维度评分结论分布" values={metrics.dimensions} label={decisionLabel} />
-            <Distribution title="审核状态" values={report.status_counts} label={statusLabel} />
-            <Distribution title="高频问题类别" values={report.category_counts} label={categoryLabel} />
-            <Distribution title="命中规则排行" values={report.rule_counts} label={(value) => value} />
+            <Distribution title="稿件初筛结果" values={metrics.resultCounts} label={mvpResultLabel} />
+            <Distribution title="分析进度" values={metrics.progressCounts} label={analysisProgressLabel} />
+            <Distribution title="项目问题维度汇总" values={report.category_counts} label={categoryLabel} detail="按当前项目/批次的稿件问题归类汇总" />
           </div>
           <section className="report-panel mistake-book">
-            <div className="section-heading"><div><h3>问题沉淀 / 错题本</h3><p className="small">优先展示置信度较高的问题，用于后续培训和规则优化。</p></div></div>
+            <div className="section-heading"><div><h3>供应商问题沉淀 / 错题本</h3><p className="small">结合脚本内容、命中问题、证据片段和改稿建议，沉淀给供应商复盘的高频问题。</p></div></div>
             {metrics.issueExamples.length === 0 ? <p className="empty">当前筛选范围暂无问题。</p> : metrics.issueExamples.map(({ row, issue }) => (
               <article key={`${row.id}-${issue.id}`}>
                 <div><b>{row.final_title || row.supplier_external_id}</b><span>{categoryLabel(issue.category)} · {severityLabel(issue.severity)}</span></div>

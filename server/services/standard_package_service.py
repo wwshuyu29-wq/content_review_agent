@@ -401,7 +401,7 @@ def _validate_standard_manifest(repository_root: Path, file_paths: dict[str, Pat
 def regenerate_standard_manifest(
     root: Path,
     project_code: str,
-    package_version: str = "1.1",
+    package_version: str = "1.3",
     *,
     repository_root: Optional[Path] = None,
 ) -> Path:
@@ -516,7 +516,7 @@ def _validate_project_schema(root: Path, project_data: Dict[str, Any]) -> None:
 def load_standard_package(
     root: Path,
     project_code: str,
-    package_version: str = "1.1",
+    package_version: str = "1.3",
     *,
     repository_root: Optional[Path] = None,
 ) -> StandardPackage:

@@ -37,7 +37,7 @@ from scripts.text_review.reviewers.base import AgentReviewResult
 from scripts.text_review.reviewers.tech_media import AGENT_ORDER, TechMediaReviewer
 
 
-NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期", "图片/视频")
+NEW_CONTENT_COLUMNS = ("标题", "内容", "类型", "目标平台", "作者", "发布日期")
 
 
 def confirm_import(*args, **kwargs):
@@ -87,11 +87,10 @@ def supplier_row(
     platform: object = "小红书",
     title: object = "原始标题",
     body: object = "原始正文",
-    image_filename: object = None,
     publish_time: object = "2026-07-20",
     note: object = "供应商备注",
 ) -> list[object]:
-    return [external_id, campaign_theme, platform, title, body, image_filename, publish_time, note]
+    return [external_id, campaign_theme, platform, title, body, publish_time, note]
 
 
 def write_content_workbook(path: Path, rows: list[list[object]]) -> Path:
@@ -114,11 +113,10 @@ def content_row(
     platform: object = "小红书",
     title: object = "原始标题",
     body: object = "原始正文",
-    image_filename: object = None,
     publish_time: object = "2026-07-20",
     note: object = "供应商备注",
 ) -> list[object]:
-    return [external_id, campaign_theme, account_name, account_type, platform, title, body, image_filename, publish_time, note]
+    return [external_id, campaign_theme, account_name, account_type, platform, title, body, publish_time, note]
 
 
 def write_zip(path: Path, entries: list[tuple[str, bytes]]) -> Path:
@@ -135,16 +133,15 @@ def payload_by_supplier_id(batch: Batch) -> dict[str, dict]:
     }
 
 
-def test_new_format_confirm_persists_payload_media_and_exports_new_headers(tmp_path: Path) -> None:
+def test_new_format_confirm_persists_text_payload_and_exports_text_headers(tmp_path: Path) -> None:
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = "内容清单"
     worksheet.append(list(NEW_CONTENT_COLUMNS))
-    worksheet.append(["新标题", "新内容", "视频", "抖音", "地图作者", "2026-08-01", "cover.png"])
+    worksheet.append(["新标题", "新内容", "图文", "抖音", "地图作者", "2026-08-01"])
     xlsx = tmp_path / "new-format.xlsx"
     workbook.save(xlsx)
-    archive = write_zip(tmp_path / "new-format.zip", [("cover.png", b"image")])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    preview = preview_import(xlsx, None, tmp_path / "previews")
 
     with make_session(tmp_path) as session:
         project = seed_default_project(session)
@@ -154,29 +151,20 @@ def test_new_format_confirm_persists_payload_media_and_exports_new_headers(tmp_p
 
         assert item.external_id == preview.rows[0].normalized["external_id"]
         assert payload["supplier_external_id"] == item.external_id
-        assert payload["account_type"] == "视频"
+        assert payload["account_type"] == "图文"
         assert payload["platform"] == "抖音"
         assert payload["account_name"] == "地图作者"
         assert payload["publish_time"] == "2026-08-01"
-        assert payload["image_filename"] == "cover.png"
-        assert (tmp_path / "data" / "uploads" / payload["media"]).read_bytes() == b"image"
+        assert "image_filename" not in payload
+        assert "media" not in payload
 
         exported = load_workbook(BytesIO(export_batch(session, batch.id))).active
         headers = [cell.value for cell in exported[1]]
         values = [cell.value for cell in exported[2]]
         assert headers[: len(NEW_CONTENT_COLUMNS)] == list(NEW_CONTENT_COLUMNS)
         assert values[: len(NEW_CONTENT_COLUMNS)] == [
-            "新标题", "新内容", "视频", "抖音", "地图作者", "2026-08-01", "cover.png",
+            "新标题", "新内容", "图文", "抖音", "地图作者", "2026-08-01",
         ]
-
-
-class _VisionTransport:
-    def __init__(self, payload: dict):
-        self.payload = payload
-
-    def chat_json_multimodal(self, prompt: str, image_data_uri: str, schema: object) -> str:
-        import json
-        return json.dumps(self.payload, ensure_ascii=False)
 
 
 class _CapturingPassReviewer(TechMediaReviewer):
@@ -200,67 +188,38 @@ class _CapturingPassReviewer(TechMediaReviewer):
         ]
 
 
-def _new_image_workbook(path: Path, *, title: str, body: str, filename: str = "scene.png") -> Path:
+def _new_text_workbook(path: Path, *, title: str, body: str) -> Path:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "内容清单"
     sheet.append(list(NEW_CONTENT_COLUMNS))
-    sheet.append([title, body, "图文", "小红书", "作者", "2026-08-01", filename])
+    sheet.append([title, body, "图文", "小红书", "作者", "2026-08-01"])
     workbook.save(path)
     return path
 
 
-def test_new_format_image_analysis_persists_and_flows_into_audit_context_and_issue(tmp_path: Path) -> None:
-    png = b"\x89PNG\r\n\x1a\n" + b"test-scene"
-    xlsx = _new_image_workbook(tmp_path / "image-analysis.xlsx", title="路线规划", body="路线规划说明")
-    archive = write_zip(tmp_path / "image-analysis.zip", [("scene.png", png)])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
-    vision = _VisionTransport({
-        "asset_id": "untrusted-model-id", "status": "ANALYZED", "is_test_scene": True,
-        "visible_input": "北京南站到故宫", "visible_result": "三条路线", "visible_product": "百度地图",
-        "detected_text": "北京南站 故宫", "confidence": 0.96,
-        "missing_context": ["app_version", "tested_at"], "reasoning": "可见输入与路线结果",
-    })
+def test_new_format_text_only_import_does_not_create_media_assets(tmp_path: Path) -> None:
+    xlsx = _new_text_workbook(tmp_path / "text-only.xlsx", title="路线规划", body="路线规划说明")
+    preview = preview_import(xlsx, None, tmp_path / "previews")
 
     with make_session(tmp_path) as session:
         project = seed_default_project(session)
-        batch = confirm_import(session, preview.token, project.id, "supplier", "image", image_llm=vision)
+        batch = confirm_import(session, preview.token, project.id, "supplier", "text-only")
         item = batch.content_items[0]
-        asset = session.scalars(select(Asset).where(Asset.content_item_id == item.id)).one()
-        analysis = asset.asset_metadata["image_evidence_analysis"]
-        assert analysis["asset_id"] == asset.asset_id
-        assert analysis["status"] == "ANALYZED"
-        assert analysis["is_test_scene"] is True
-        assert analysis["verified"] is False
+        assert session.scalars(select(Asset).where(Asset.content_item_id == item.id)).all() == []
 
         reviewer = _CapturingPassReviewer()
         audit = run_audit(session, item.id, reviewer=reviewer)
-        assert reviewer.context.image_evidence_analyses == [analysis]
-        assert {issue.rule_id for issue in audit.issues} == {"IMAGE-EVIDENCE-CONTEXT-INCOMPLETE"}
-        assert item.publish_status is PublishStatus.NOT_READY
-
-
-def test_new_format_ordinary_screenshot_without_text_trigger_does_not_require_test_evidence(tmp_path: Path) -> None:
-    png = b"\x89PNG\r\n\x1a\n" + b"ordinary-cover"
-    xlsx = _new_image_workbook(tmp_path / "ordinary.xlsx", title="产品介绍", body="介绍地图产品功能")
-    archive = write_zip(tmp_path / "ordinary.zip", [("scene.png", png)])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
-    vision = _VisionTransport({
-        "asset_id": "ignored", "status": "ANALYZED", "is_test_scene": False,
-        "visible_input": None, "visible_result": None, "visible_product": "百度地图",
-        "detected_text": "百度地图", "confidence": 0.99, "missing_context": [],
-        "reasoning": "普通封面，没有可见测试输入或结果",
-    })
-
-    with make_session(tmp_path) as session:
-        project = seed_default_project(session)
-        batch = confirm_import(session, preview.token, project.id, "supplier", "ordinary", image_llm=vision)
-        item = batch.content_items[0]
-        reviewer = _CapturingPassReviewer()
-        audit = run_audit(session, item.id, reviewer=reviewer)
-        assert reviewer.context.image_evidence_analyses[0]["is_test_scene"] is False
-        assert not any(issue.rule_id.startswith("IMAGE-EVIDENCE") or issue.rule_id == "TEST-EVIDENCE-001" for issue in audit.issues)
+        assert audit.issues == []
         assert item.publish_status is PublishStatus.READY
+
+
+def test_preview_rejects_zip_in_text_only_import(tmp_path: Path) -> None:
+    xlsx = _new_text_workbook(tmp_path / "text-only.xlsx", title="产品介绍", body="介绍地图产品功能")
+    archive = write_zip(tmp_path / "media.zip", [("scene.png", b"\x89PNG\r\n\x1a\nordinary")])
+
+    with pytest.raises(ValueError, match="仅支持文字"):
+        preview_import(xlsx, archive, tmp_path / "previews")
 
 
 def test_confirm_import_retains_rows_missing_id_or_other_required_field(tmp_path: Path) -> None:
@@ -362,47 +321,25 @@ def test_confirm_import_retains_preview_error_rows_with_errors_in_payload(tmp_pa
             assert payload["preview_warnings"] == []
 
 
-def test_confirm_import_copies_referenced_preview_images_by_exact_filename_per_row(tmp_path: Path) -> None:
+def test_confirm_import_rejects_media_zip_in_text_only_mode(tmp_path: Path) -> None:
     xlsx = write_workbook(
         tmp_path / "images.xlsx",
-        [
-            supplier_row("row-second", image_filename="second.png"),
-            supplier_row("row-first", image_filename="first.png"),
-        ],
+        [supplier_row("row-second"), supplier_row("row-first")],
     )
     archive = write_zip(tmp_path / "images.zip", [("first.png", b"first-image"), ("second.png", b"second-image")])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
-    assert preview.valid_count == 2
 
-    with make_session(tmp_path) as session:
-        project = seed_default_project(session)
-        batch = confirm_import(
-            session,
-            preview.token,
-            project_id=project.id,
-            supplier_id="supplier-images",
-            batch_name="图片导入",
-        )
-
-        payloads = payload_by_supplier_id(batch)
-        uploads_dir = tmp_path / "data" / "uploads"
-        assert payloads["row-second"]["image_filename"] == "second.png"
-        assert payloads["row-first"]["image_filename"] == "first.png"
-        assert (uploads_dir / payloads["row-second"]["media"]).read_bytes() == b"second-image"
-        assert (uploads_dir / payloads["row-first"]["media"]).read_bytes() == b"first-image"
-        assert Path(payloads["row-second"]["media"]).name == payloads["row-second"]["media"]
-        assert Path(payloads["row-first"]["media"]).name == payloads["row-first"]["media"]
+    with pytest.raises(ValueError, match="仅支持文字"):
+        preview_import(xlsx, archive, tmp_path / "previews")
 
 
-def test_confirm_import_keeps_committed_media_when_refresh_fails_after_commit(
+def test_confirm_import_keeps_committed_text_batch_when_refresh_fails_after_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     xlsx = write_workbook(
         tmp_path / "refresh-failure.xlsx",
-        [supplier_row("row-with-image", image_filename="photo.png")],
+        [supplier_row("row-with-text")],
     )
-    archive = write_zip(tmp_path / "refresh-failure.zip", [("photo.png", b"durable-image")])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    preview = preview_import(xlsx, None, tmp_path / "previews")
 
     with make_session(tmp_path) as session:
         project = seed_default_project(session)
@@ -423,28 +360,26 @@ def test_confirm_import_keeps_committed_media_when_refresh_fails_after_commit(
                 session,
                 preview.token,
                 project_id=project.id,
-                supplier_id="supplier-images",
-                batch_name="图片导入",
+                supplier_id="supplier-text",
+                batch_name="文字导入",
             )
 
         committed = session.scalar(select(Batch).where(Batch.import_token == preview.token))
         assert committed is not None
-        payload = payload_by_supplier_id(committed)["row-with-image"]
-        media_path = tmp_path / "data" / "uploads" / payload["media"]
-        assert media_path.read_bytes() == b"durable-image"
+        payload = payload_by_supplier_id(committed)["row-with-text"]
+        assert "media" not in payload
         assert (tmp_path / "previews" / preview.token).exists()
 
         retry = confirm_import(
             session,
             preview.token,
             project_id=project.id,
-            supplier_id="supplier-images",
-            batch_name="图片导入",
+            supplier_id="supplier-text",
+            batch_name="文字导入",
         )
 
         assert retry.id == committed.id
         assert session.scalar(select(func.count(Batch.id))) == 1
-        assert media_path.read_bytes() == b"durable-image"
 
 
 def test_confirm_import_is_idempotent_for_same_token_without_duplicate_content(tmp_path: Path) -> None:
@@ -489,10 +424,9 @@ def test_confirm_import_returns_existing_batch_after_concurrent_import_token_con
 
     xlsx = write_workbook(
         tmp_path / "integrity-conflict.xlsx",
-        [supplier_row("losing-row", image_filename="photo.png")],
+        [supplier_row("losing-row")],
     )
-    archive = write_zip(tmp_path / "integrity-conflict.zip", [("photo.png", b"losing-image")])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
+    preview = preview_import(xlsx, None, tmp_path / "previews")
     winner_id: int | None = None
 
     with Session(engine) as session:
@@ -558,7 +492,6 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
                 platform="抖音",
                 title="供应商标题",
                 body="供应商正文",
-                image_filename=None,
                 publish_time="2026-08-01",
                 note="导出备注",
             )
@@ -662,7 +595,6 @@ def test_export_batch_returns_xlsx_with_supplier_and_review_columns(tmp_path: Pa
         assert values["目标平台"] == "抖音"
         assert values["作者"] == "地图测评号"
         assert values["发布日期"] == "2026-08-01"
-        assert values["图片/视频"] is None
         assert values["系统内容编号"] == item.id
         assert values["批次编号"] == batch.id
         assert values["格式校验"] == "PASSED"
@@ -708,7 +640,6 @@ def test_export_batch_sanitizes_formula_like_strings(tmp_path: Path) -> None:
             "platform": "-platform",
             "title": "@title",
             "body": "\tbody",
-            "image_filename": "\rimage.png",
             "publish_time": "=2026-08-01",
             "note": "+note",
         }
@@ -769,7 +700,6 @@ def test_export_batch_sanitizes_formula_like_strings(tmp_path: Path) -> None:
             "目标平台": "'-platform",
             "作者": "'=account-name",
             "发布日期": "'=2026-08-01",
-            "图片/视频": "'\rimage.png",
             "问题分类": "'-category",
             "命中规则": "'+RULE-1",
             "问题原因": "'=reason",
@@ -798,7 +728,7 @@ def _named_shared_evidence_workbook(path: Path, filenames: list[str]) -> Path:
     content = workbook.active
     content.title = "内容清单"
     content.append(list(excel_import_service.CONTENT_COLUMNS))
-    content.append(["content-1", "活动", "账号", "媒体", "小红书", "标题", "普通正文", None, None, None])
+    content.append(["content-1", "活动", "账号", "媒体", "小红书", "标题", "普通正文", None, None])
     tests = workbook.create_sheet("测试场景")
     tests.append(list(excel_import_service.TEST_CASE_COLUMNS))
     for index, filename in enumerate(filenames, 1):
@@ -811,15 +741,8 @@ def _named_shared_evidence_workbook(path: Path, filenames: list[str]) -> Path:
 def test_confirm_reuses_shared_evidence_asset_and_copies_once(tmp_path: Path) -> None:
     xlsx = _named_shared_evidence_workbook(tmp_path / "shared.xlsx", ["proof.png", "proof.png"])
     archive = write_zip(tmp_path / "shared.zip", [("proof.png", b"shared")])
-    preview = preview_import(xlsx, archive, tmp_path / "previews")
-    with make_session(tmp_path) as session:
-        project = seed_default_project(session)
-        batch = confirm_import(session, preview.token, project.id, "supplier", "batch")
-        item = batch.content_items[0]
-        assert len(item.assets) == 1
-        assert len(item.test_cases) == 2
-        assert {binding.asset_id for test in item.test_cases for binding in test.evidence} == {item.assets[0].id}
-        assert len(list((tmp_path / "data" / "uploads").iterdir())) == 1
+    with pytest.raises(ValueError, match="仅支持文字"):
+        preview_import(xlsx, archive, tmp_path / "previews")
 
 
 @pytest.mark.parametrize(
@@ -829,13 +752,8 @@ def test_confirm_reuses_shared_evidence_asset_and_copies_once(tmp_path: Path) ->
 def test_confirm_maps_evidence_asset_kind_and_mime(tmp_path: Path, filename: str, kind: str, mime: str) -> None:
     xlsx = _named_shared_evidence_workbook(tmp_path / f"{kind}.xlsx", [filename])
     archive = write_zip(tmp_path / f"{kind}.zip", [(filename, b"evidence")])
-    preview = preview_import(xlsx, archive, tmp_path / f"previews-{kind}")
-    with make_session(tmp_path) as session:
-        project = seed_default_project(session)
-        batch = confirm_import(session, preview.token, project.id, "supplier", kind)
-        asset = batch.content_items[0].assets[0]
-        assert asset.kind.value == kind
-        assert asset.mime_type == mime
+    with pytest.raises(ValueError, match="仅支持文字"):
+        preview_import(xlsx, archive, tmp_path / f"previews-{kind}")
 
 
 def test_shared_severity_helper_ranks_critical_and_unknown_safely() -> None:
