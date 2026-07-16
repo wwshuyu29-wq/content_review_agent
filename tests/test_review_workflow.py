@@ -661,6 +661,37 @@ def test_unavailable_only_audit_can_be_superseded_without_deleting_history(tmp_p
         assert item.review_status is ReviewStatus.PASSED
 
 
+def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        item = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="legacy-unavailable",
+            name="旧协议不可用审核重试",
+            contents=[{
+                "external_id": "legacy-unavailable-1",
+                "title": "路线规划体验",
+                "body": "路线规划步骤清晰，正文信息完整。",
+                "payload": {"platform": "xiaohongshu"},
+            }],
+        ).content_items[0]
+        unavailable = run_audit(session, item.id, reviewer=TechMediaReviewer())
+        for result in unavailable.agent_results:
+            result.score = 0
+            result.raw_result["score"] = 0
+        brand = next(result for result in unavailable.agent_results if result.agent_id == "BRAND")
+        for issue in list(brand.issues):
+            session.delete(issue)
+        session.commit()
+
+        replacement = run_audit(session, item.id, reviewer=ProtocolReviewer())
+
+        assert unavailable.status == "SUPERSEDED"
+        assert replacement.status == "COMPLETED"
+        assert all(task.status == "SUPERSEDED" for task in unavailable.review_tasks)
+
+
 def test_valid_audit_prevents_newer_unavailable_history_from_being_superseded(tmp_path: Path) -> None:
     calls = 0
 

@@ -115,17 +115,26 @@ def _review_key(content_version_id: int, rule_version_id: int) -> str:
     return f"v1:{content_version_id}:{rule_version_id}"
 
 
+def _is_unavailable_agent_result(result: AgentResult) -> bool:
+    raw_issues = result.raw_result.get("issues") if isinstance(result.raw_result, dict) else None
+    if isinstance(raw_issues, list) and raw_issues:
+        return all(
+            isinstance(issue, dict) and issue.get("rule_id") == "SYSTEM-LLM-UNAVAILABLE"
+            for issue in raw_issues
+        )
+    return (
+        result.score is None
+        and bool(result.issues)
+        and all(issue.rule_id == "SYSTEM-LLM-UNAVAILABLE" for issue in result.issues)
+    )
+
+
 def _is_unavailable_only_audit(audit: AuditRun) -> bool:
     agent_results = list(audit.agent_results)
     return (
         audit.status == "COMPLETED"
         and [result.agent_id for result in agent_results] == list(AGENT_ORDER)
-        and all(
-            result.score is None
-            and bool(result.issues)
-            and all(issue.rule_id == "SYSTEM-LLM-UNAVAILABLE" for issue in result.issues)
-            for result in agent_results
-        )
+        and all(_is_unavailable_agent_result(result) for result in agent_results)
     )
 
 
