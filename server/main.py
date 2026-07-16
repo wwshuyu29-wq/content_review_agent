@@ -436,7 +436,8 @@ def logout(
     _user: User = Depends(require_csrf),
     session: Session = Depends(get_session),
 ):
-    auth_session = session.get(UserSession, request.state.auth_session.id)
+    auth_session_id = getattr(request.state.auth_session, "id", None)
+    auth_session = session.get(UserSession, auth_session_id) if auth_session_id is not None else None
     if auth_session is not None and auth_session.revoked_at is None:
         auth_session.revoked_at = datetime.utcnow()
         session.commit()

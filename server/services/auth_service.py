@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -32,6 +34,17 @@ class SessionSecrets:
     session_token: str
     csrf_token: str
     expires_at: datetime
+
+
+@dataclass(frozen=True)
+class StatelessSession:
+    id: None
+    user: User
+    csrf_hash: str
+    session_version: int
+    expires_at: datetime
+    revoked_at: None
+    last_used_at: datetime
 
 
 def normalize_username(username: str) -> str:
@@ -75,6 +88,47 @@ def _secret_hash(value: str) -> str:
     return hmac.new(_session_secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _base64url_encode(payload: bytes) -> str:
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(payload: str) -> bytes:
+    padding = "=" * (-len(payload) % 4)
+    return base64.urlsafe_b64decode((payload + padding).encode("ascii"))
+
+
+def _signed_session_token(user: User, expires_at: datetime) -> str:
+    payload = {
+        "uid": user.id,
+        "username": user.username,
+        "session_version": user.session_version,
+        "expires_at": int(expires_at.timestamp()),
+        "nonce": secrets.token_urlsafe(16),
+    }
+    encoded_payload = _base64url_encode(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    )
+    signature = _secret_hash(f"stateless-session:{encoded_payload}")
+    return f"v1.{encoded_payload}.{signature}"
+
+
+def _decode_signed_session_token(session_token: str) -> Optional[dict[str, object]]:
+    parts = session_token.split(".")
+    if len(parts) != 3 or parts[0] != "v1":
+        return None
+    _, encoded_payload, supplied_signature = parts
+    expected_signature = _secret_hash(f"stateless-session:{encoded_payload}")
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return None
+    try:
+        payload = json.loads(_base64url_decode(encoded_payload).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def csrf_token_for_session(session_token: str) -> str:
     return hmac.new(
         _session_secret(), f"csrf:{session_token}".encode("utf-8"), hashlib.sha256
@@ -90,9 +144,10 @@ def create_session(
     if ttl.total_seconds() <= 0:
         raise ValueError("Session ttl must be positive")
     session_token = secrets.token_urlsafe(48)
-    csrf_token = csrf_token_for_session(session_token)
     now = datetime.utcnow()
     expires_at = now + ttl
+    session_token = _signed_session_token(user, expires_at)
+    csrf_token = csrf_token_for_session(session_token)
     session.add(
         UserSession(
             user=user,
@@ -122,8 +177,39 @@ def lookup_session(session: Session, session_token: str) -> Optional[UserSession
         or not record.user.is_active
         or record.session_version != record.user.session_version
     ):
-        return None
+        return _lookup_stateless_session(session, session_token)
     return record
+
+
+def _lookup_stateless_session(session: Session, session_token: str) -> Optional[StatelessSession]:
+    payload = _decode_signed_session_token(session_token)
+    if payload is None:
+        return None
+    try:
+        user_id = int(payload["uid"])
+        username = str(payload["username"])
+        session_version = int(payload["session_version"])
+        expires_at = datetime.utcfromtimestamp(int(payload["expires_at"]))
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if expires_at <= datetime.utcnow():
+        return None
+    user = session.scalar(select(User).where(User.id == user_id, User.username == username))
+    if (
+        user is None
+        or not user.is_active
+        or user.session_version != session_version
+    ):
+        return None
+    return StatelessSession(
+        id=None,
+        user=user,
+        csrf_hash=_secret_hash(csrf_token_for_session(session_token)),
+        session_version=session_version,
+        expires_at=expires_at,
+        revoked_at=None,
+        last_used_at=datetime.utcnow(),
+    )
 
 
 def authenticate_request(request: Request, session: Session) -> User:
@@ -134,13 +220,14 @@ def authenticate_request(request: Request, session: Session) -> User:
     if record is None:
         raise HTTPException(status_code=401, detail="Authentication required")
     user = record.user
-    now = datetime.utcnow()
-    session.execute(
-        update(UserSession).where(UserSession.id == record.id).values(last_used_at=now)
-    )
-    session.commit()
-    session.refresh(record)
-    session.refresh(user)
+    if isinstance(record, UserSession):
+        now = datetime.utcnow()
+        session.execute(
+            update(UserSession).where(UserSession.id == record.id).values(last_used_at=now)
+        )
+        session.commit()
+        session.refresh(record)
+        session.refresh(user)
     request.state.auth_session = record
     request.state.auth_user = user
     return user

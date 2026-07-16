@@ -340,6 +340,30 @@ def test_login_sets_secure_aware_http_only_same_site_cookie_and_me_works(auth_ap
     assert me.json()["csrf_token"] == response.json()["csrf_token"]
 
 
+def test_signed_session_cookie_survives_missing_local_session_record(auth_api) -> None:
+    from server.models import UserSession
+
+    client, engine = auth_api
+    response = login(client)
+    csrf = response.json()["csrf_token"]
+
+    with Session(engine) as session:
+        for record in session.scalars(select(UserSession)):
+            session.delete(record)
+        session.commit()
+
+    me = client.get("/api/auth/me")
+    mutation = client.put(
+        "/api/config",
+        headers={"Origin": "http://testserver", "X-CSRF-Token": csrf},
+        json={"reviewer": "heuristic", "model": ""},
+    )
+
+    assert me.status_code == 200
+    assert me.json()["user"]["username"] == "admin"
+    assert mutation.status_code == 200
+
+
 def test_production_cookie_uses_secure_attribute(
     auth_api, monkeypatch: pytest.MonkeyPatch
 ) -> None:
