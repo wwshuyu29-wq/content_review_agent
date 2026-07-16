@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
+from scripts.text_review.reviewers.tech_media import AGENT_ORDER
 from server.db import Base, create_db_engine
 from server.models import Asset, AuditRun, ContentVersion, Issue, ReviewStatus, RuleVersion, TestCase as EvidenceTestCase
 from server.seed import seed_default_project
@@ -104,23 +105,23 @@ def test_arbiter_routes_required_outcomes():
     result = arbitrate_review([], [low], safe_auto_fix_rule_ids={"BRAND-REPLACE-001"})
     assert result.review_status == ReviewStatus.AUTO_FIX_PENDING
     assert result.ai_proposal_allowed is True
-    assert arbitrate_review([{"agent_id": agent_id, "decision": "PASS"} for agent_id in (
-        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-    )], [], campaign_score=45, suggestions=["优化开头"]).review_status == ReviewStatus.PASSED_WITH_SUGGESTIONS
+    assert arbitrate_review(
+        [{"agent_id": agent_id, "decision": "PASS"} for agent_id in AGENT_ORDER],
+        [],
+        campaign_score=45,
+        suggestions=["优化开头"],
+    ).review_status == ReviewStatus.PASSED_WITH_SUGGESTIONS
     assert arbitrate_review([{"decision": "PASS"}], []).review_status == ReviewStatus.HUMAN_REVIEW_REQUIRED
-    assert arbitrate_review([{"agent_id": agent_id, "decision": "PASS"} for agent_id in (
-        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-    )], []).review_status == ReviewStatus.PASSED
+    assert arbitrate_review(
+        [{"agent_id": agent_id, "decision": "PASS"} for agent_id in AGENT_ORDER],
+        [],
+    ).review_status == ReviewStatus.PASSED
 
 
 def test_text_only_claim_issue_requires_supplier_revision_not_human_review():
     agent_results = [
         {"agent_id": agent_id, "decision": "PASS"}
-        for agent_id in (
-            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-        )
+        for agent_id in AGENT_ORDER
     ]
     finding = issue(
         "CLAIM-UNSUPPORTED-ABSOLUTE-001", "MEDIUM",
@@ -138,13 +139,10 @@ def test_arbiter_preserves_supplier_revision_task_under_human_review_precedence(
     agent_results = [
         {"agent_id": agent_id, "decision": decision}
         for agent_id, decision in zip(
-            (
-                "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-                "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-            ),
+            AGENT_ORDER,
             (
                 "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS", "HUMAN_REVIEW",
-                "HUMAN_REVIEW", "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS",
+                "HUMAN_REVIEW", "PASS_WITH_SUGGESTIONS",
             ),
         )
     ]

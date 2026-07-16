@@ -83,7 +83,10 @@ class BatchRead(OrmSchema):
     project_id: int
     supplier_id: str
     name: str
+    project_type: Optional[str] = None
+    owner_name: Optional[str] = None
     status: str
+    review_brief: Optional[str] = None
     created_at: datetime
 
 
@@ -407,6 +410,8 @@ class ImportConfirm(BaseModel):
     project_id: int = Field(gt=0)
     supplier_id: str = Field(min_length=1, max_length=200)
     batch_name: str = Field(min_length=1, max_length=200)
+    project_type: Optional[str] = Field(default=None, max_length=200)
+    owner_name: Optional[str] = Field(default=None, max_length=200)
 
     @field_validator("supplier_id", "batch_name")
     @classmethod
@@ -415,6 +420,14 @@ class ImportConfirm(BaseModel):
         if not value:
             raise ValueError("import identity cannot be blank")
         return value
+
+    @field_validator("project_type", "owner_name")
+    @classmethod
+    def strip_optional_import_identity(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
 
 class ImportTestPreviewRead(BaseModel):
@@ -458,6 +471,10 @@ class ImportPreviewRead(BaseModel):
     package_version: str
     supplier_id: str
     batch_name: str
+    project_type: str
+    owner_name: str
+    review_brief: str
+    brief_summary: str
 
 
 class ContentTableAgent(BaseModel):

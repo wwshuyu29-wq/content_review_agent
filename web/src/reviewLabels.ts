@@ -1,18 +1,18 @@
 import type { AgentId, Issue } from "./api";
 
-const AGENTS: Record<string, string> = { COMPLIANCE: "合规审核", BRAND: "品牌一致性", PRODUCT_ACCURACY: "产品准确性", TEST_CREDIBILITY: "实测可信度", CONTENT_QUALITY: "内容质量", CAMPAIGN_EFFECTIVENESS: "传播有效性" };
+const AGENTS: Record<string, string> = { CONTENT_QUALITY: "基础内容校对", COMPLIANCE: "合规审核", BRAND: "品牌一致性", PRODUCT_ACCURACY: "产品准确性", CAMPAIGN_EFFECTIVENESS: "传播有效性" };
 const DECISIONS: Record<string, string> = { PASS: "通过", PASS_WITH_SUGGESTIONS: "通过但有建议", NEED_TEXT_FIX: "需要修改", HUMAN_REVIEW: "需要人工确认", BLOCK: "阻断" };
-const STATUSES: Record<string, string> = { QUEUED: "排队中", COMPLETED: "已完成", COMPLETED_WITH_ERRORS: "完成但有异常", RUNNING: "审核中", PENDING: "待审核", FAILED: "审核失败", INTERRUPTED: "已中断", SKIPPED: "已跳过", NOT_RUN: "未运行", NOT_STARTED: "未开始", AI_REVIEWING: "AI 审核中", HUMAN_REVIEW_REQUIRED: "需人工确认", SUPPLIER_REVISION_REQUIRED: "需供应商修改", AUTO_FIX_PENDING: "待确认修复", PASSED: "已通过", PASSED_WITH_SUGGESTIONS: "通过但有建议", BLOCKED: "已阻断", REJECTED: "已拒绝", OPEN: "待处理", CLOSED: "已处理" };
+const STATUSES: Record<string, string> = { QUEUED: "排队中", COMPLETED: "已完成", COMPLETED_WITH_ERRORS: "完成但有异常", RUNNING: "审核中", PENDING: "待审核", FAILED: "审核失败", INTERRUPTED: "已中断", SKIPPED: "已跳过", NOT_RUN: "未运行", NOT_STARTED: "未开始", AI_REVIEWING: "AI 审核中", HUMAN_REVIEW_REQUIRED: "需人工确认", SUPPLIER_REVISION_REQUIRED: "需内容修改", AUTO_FIX_PENDING: "待确认修复", PASSED: "已通过", PASSED_WITH_SUGGESTIONS: "通过但有建议", BLOCKED: "已阻断", REJECTED: "已拒绝", OPEN: "待处理", CLOSED: "已处理" };
 const SEVERITIES: Record<string, string> = { CRITICAL: "严重", HIGH: "高风险", MEDIUM: "中风险", LOW: "低风险", NONE: "无风险" };
-const CATEGORIES: Record<string, string> = { COMPLIANCE: "合规", BRAND: "品牌", PRODUCT_ACCURACY: "产品准确性", TEST_CREDIBILITY: "实测可信度", CONTENT_QUALITY: "内容质量", CAMPAIGN_EFFECTIVENESS: "传播有效性", ADVERTISING: "广告表达", CLAIM: "宣传主张" };
+const CATEGORIES: Record<string, string> = { CONTENT_QUALITY: "基础内容校对", COMPLIANCE: "合规", BRAND: "品牌", PRODUCT_ACCURACY: "产品准确性", CAMPAIGN_EFFECTIVENESS: "传播有效性", ADVERTISING: "广告表达", CLAIM: "宣传主张" };
 const FIELDS: Record<string, string> = { title: "标题", body: "正文", image: "图片", video: "视频", account_name: "账号名称", platform: "发布平台" };
 const PUBLISH: Record<string, string> = { READY: "可发布", NOT_READY: "暂不可发布", PUBLISHED: "已发布" };
 const FORMAT: Record<string, string> = { PENDING: "待检查", PASSED: "格式正常", INCOMPLETE: "信息不完整", INVALID: "格式无效" };
 const ASSETS: Record<string, string> = { IMAGE: "图片", VIDEO: "视频", SCREENSHOT: "截图", SCREEN_RECORDING: "录屏", TEST_LOG: "测试日志" };
-const CONTENT_SOURCES: Record<string, string> = { SUPPLIER: "供应商提交", AI_PROPOSED: "AI 修订建议", HUMAN_CONFIRMED: "人工确认" };
-const TASKS: Record<string, string> = { AUTO_FIX_PROPOSAL: "自动修复确认", HUMAN_REVIEW: "人工审核", BLOCK_REVIEW: "阻断复核", SUPPLIER_REVISION: "供应商修改" };
+const CONTENT_SOURCES: Record<string, string> = { SUPPLIER: "原稿提交", AI_PROPOSED: "AI 修订建议", HUMAN_CONFIRMED: "人工确认" };
+const TASKS: Record<string, string> = { AUTO_FIX_PROPOSAL: "自动修复确认", HUMAN_REVIEW: "人工审核", BLOCK_REVIEW: "阻断复核", SUPPLIER_REVISION: "内容修改" };
 
-export const agentLabel = (value?: string | null) => AGENTS[value || ""] || "审核维度";
+export const agentLabel = (value?: string | null) => AGENTS[value || ""] || "评分维度";
 export const decisionLabel = (value?: string | null) => DECISIONS[value || ""] || "未给出结论";
 export const statusLabel = (value?: string | null) => STATUSES[value || ""] || "未知状态";
 export const severityLabel = (value?: string | null) => SEVERITIES[value || ""] || "未知风险";
@@ -30,5 +30,5 @@ export const sourceLabel = (agentId?: AgentId | string | null) => agentLabel(age
 export type AgentDetail = { summary: string; evidence: string; reason: string; suggestion: string; confidence: string; source: string };
 export function agentDetail(result: { id?: number; agent_id?: string | null; summary?: string | null }, issues: Issue[]): AgentDetail {
   const issue = issues.find((entry) => entry.agent_result_id === result.id);
-  return { summary: result.summary || "未提供审核摘要", evidence: issue?.evidence_quote || "未提供证据摘录", reason: issue?.reason || "未发现结构化问题", suggestion: issue?.suggestion || "暂无修改建议", confidence: issue ? `${Math.round(issue.confidence * 100)}%` : "未评分", source: `来源：${sourceLabel(result.agent_id)}` };
+  return { summary: result.summary || "未提供评分摘要", evidence: issue?.evidence_quote || "未提供证据摘录", reason: issue?.reason || "未发现结构化问题", suggestion: issue?.suggestion || "暂无修改建议", confidence: issue ? `${Math.round(issue.confidence * 100)}%` : "未评分", source: `维度：${sourceLabel(result.agent_id)}` };
 }

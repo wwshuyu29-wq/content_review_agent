@@ -1,70 +1,63 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "review_result.schema.json",
-  "title": "AgentReviewResult",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "agent_id",
-    "agent_version",
-    "decision",
-    "summary",
-    "score",
-    "confidence",
-    "issues"
-  ],
-  "properties": {
-    "agent_id": {
-      "type": "string",
-      "enum": [
-        "COMPLIANCE",
-        "BRAND",
-        "PRODUCT_ACCURACY",
-        "TEST_CREDIBILITY",
-        "CONTENT_QUALITY",
-        "CAMPAIGN_EFFECTIVENESS"
-      ]
-    },
-    "agent_version": {"type": "string"},
-    "decision": {
-      "type": "string",
-      "enum": [
-        "PASS",
-        "PASS_WITH_SUGGESTIONS",
-        "NEED_TEXT_FIX",
-        "HUMAN_REVIEW",
-        "BLOCK"
-      ]
-    },
-    "summary": {"type": "string"},
-    "score": {
-      "anyOf": [
-        {"type": "integer", "minimum": 0, "maximum": 100},
-        {"type": "null"}
-      ]
-    },
-    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-    "issues": {
-      "type": "array",
-      "items": {"$ref": "#/$defs/AgentIssue"}
-    }
-  },
   "$defs": {
-    "EvidenceSpan": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["quote"],
-      "properties": {
-        "quote": {"type": "string"},
-        "start": {"type": ["integer", "null"]},
-        "end": {"type": ["integer", "null"]},
-        "asset_id": {"type": ["string", "null"]},
-        "timestamp": {"type": ["string", "null"]}
-      }
-    },
     "AgentIssue": {
-      "type": "object",
       "additionalProperties": false,
+      "properties": {
+        "rule_id": {
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "category": {
+          "title": "Category",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH",
+            "CRITICAL"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "field": {
+          "title": "Field",
+          "type": "string"
+        },
+        "evidence": {
+          "$ref": "#/$defs/EvidenceSpan"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "suggestion": {
+          "title": "Suggestion",
+          "type": "string"
+        },
+        "source_reference": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Source Reference",
+          "type": "array"
+        },
+        "auto_fixable": {
+          "title": "Auto Fixable",
+          "type": "boolean"
+        },
+        "human_required": {
+          "title": "Human Required",
+          "type": "boolean"
+        },
+        "confidence": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "number"
+        }
+      },
       "required": [
         "rule_id",
         "category",
@@ -78,25 +71,140 @@
         "human_required",
         "confidence"
       ],
+      "title": "AgentIssue",
+      "type": "object"
+    },
+    "EvidenceSpan": {
+      "additionalProperties": false,
       "properties": {
-        "rule_id": {"type": "string"},
-        "category": {"type": "string"},
-        "severity": {
-          "type": "string",
-          "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        "quote": {
+          "title": "Quote",
+          "type": "string"
         },
-        "field": {"type": "string"},
-        "evidence": {"$ref": "#/$defs/EvidenceSpan"},
-        "reason": {"type": "string"},
-        "suggestion": {"type": "string"},
-        "source_reference": {
-          "type": "array",
-          "items": {"type": "string"}
+        "start": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
         },
-        "auto_fixable": {"type": "boolean"},
-        "human_required": {"type": "boolean"},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
-      }
+        "end": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        },
+        "asset_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Asset Id"
+        },
+        "timestamp": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Timestamp"
+        }
+      },
+      "required": [
+        "quote"
+      ],
+      "title": "EvidenceSpan",
+      "type": "object"
     }
-  }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "agent_id": {
+      "enum": [
+        "CONTENT_QUALITY",
+        "COMPLIANCE",
+        "BRAND",
+        "PRODUCT_ACCURACY",
+        "CAMPAIGN_EFFECTIVENESS"
+      ],
+      "title": "Agent Id",
+      "type": "string"
+    },
+    "agent_version": {
+      "title": "Agent Version",
+      "type": "string"
+    },
+    "decision": {
+      "enum": [
+        "PASS",
+        "PASS_WITH_SUGGESTIONS",
+        "NEED_TEXT_FIX",
+        "HUMAN_REVIEW",
+        "BLOCK"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    },
+    "score": {
+      "anyOf": [
+        {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Score"
+    },
+    "confidence": {
+      "maximum": 1,
+      "minimum": 0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "issues": {
+      "items": {
+        "$ref": "#/$defs/AgentIssue"
+      },
+      "title": "Issues",
+      "type": "array"
+    }
+  },
+  "required": [
+    "agent_id",
+    "agent_version",
+    "decision",
+    "summary",
+    "score",
+    "confidence",
+    "issues"
+  ],
+  "title": "AgentReviewResult",
+  "type": "object"
 }

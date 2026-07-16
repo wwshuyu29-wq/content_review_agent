@@ -43,7 +43,13 @@ def _load_job(session: Session, job_id: int) -> Optional[BatchAuditJob]:
     )
 
 
-def create_or_get_active_job(session: Session, batch_id: int, model: str) -> ActiveJobResult:
+def create_or_get_active_job(
+    session: Session,
+    batch_id: int,
+    model: str,
+    *,
+    created_by_user_id: int | None = None,
+) -> ActiveJobResult:
     """Create a complete progress tree or return the batch's existing active job.
 
     ``active_key`` is non-null only for non-terminal jobs. Its database uniqueness
@@ -77,6 +83,7 @@ def create_or_get_active_job(session: Session, batch_id: int, model: str) -> Act
         batch_id=batch.id,
         active_key=key,
         model=model,
+        created_by_user_id=created_by_user_id,
         total_count=len(content_items),
         heartbeat_at=now,
     )

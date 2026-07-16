@@ -43,10 +43,7 @@ class FakeReviewer:
 
     def review_structured(self, row, standards):
         self.received_standards = standards
-        agent_ids = [
-            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-        ]
+        agent_ids = AGENT_ORDER
         if self.results and self.results[0].get("agent_id"):
             return self.results
         normalized = []
@@ -114,15 +111,12 @@ class ProtocolReviewer:
     name = "protocol-test"
 
     def __init__(self, *, decisions=None, ids=None, version="tech-media-v1"):
-        self.decisions = decisions or ["PASS"] * 6
+        self.decisions = decisions or ["PASS"] * len(AGENT_ORDER)
         self.ids = ids
         self.version = version
 
     def review_structured(self, row, standards):
-        ids = self.ids or [
-            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-        ]
+        ids = self.ids or AGENT_ORDER
         return [
             {
                 "agent_name": agent_id,
@@ -210,24 +204,29 @@ def test_tech_media_progress_callback_reports_retries_and_terminal_transitions(
     tmp_path: Path,
 ) -> None:
     context, profile = tech_media_context_and_profile(tmp_path)
-    attempts = {agent_id: 0 for agent_id in AGENT_ORDER}
+    attempts = 0
     events = []
 
     class RetryingLLM:
         def chat_json(self, prompt, _response_model):
-            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
-            attempts[agent_id] += 1
-            if agent_id == "COMPLIANCE" and attempts[agent_id] < 3:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
                 raise RuntimeError("Authorization: Bearer secret retry failure")
-            return AgentReviewResult(
-                agent_id=agent_id,
-                agent_version="tech-media-v1",
-                decision="PASS",
-                summary="通过",
-                score=90,
-                confidence=0.9,
-                issues=[],
-            ).model_dump(mode="json")
+            return {
+                "results": [
+                    AgentReviewResult(
+                        agent_id=agent_id,
+                        agent_version="tech-media-v1",
+                        decision="PASS",
+                        summary="通过",
+                        score=90,
+                        confidence=0.9,
+                        issues=[],
+                    ).model_dump(mode="json")
+                    for agent_id in AGENT_ORDER
+                ],
+            }
 
     results = TechMediaReviewer(llm=RetryingLLM()).review_structured(
         context,
@@ -255,16 +254,20 @@ def test_completed_callback_failure_does_not_retry_a_valid_model_response(tmp_pa
         def chat_json(self, prompt, _response_model):
             nonlocal calls
             calls += 1
-            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
-            return AgentReviewResult(
-                agent_id=agent_id,
-                agent_version="tech-media-v1",
-                decision="PASS",
-                summary="通过",
-                score=90,
-                confidence=0.9,
-                issues=[],
-            ).model_dump(mode="json")
+            return {
+                "results": [
+                    AgentReviewResult(
+                        agent_id=agent_id,
+                        agent_version="tech-media-v1",
+                        decision="PASS",
+                        summary="通过",
+                        score=90,
+                        confidence=0.9,
+                        issues=[],
+                    ).model_dump(mode="json")
+                    for agent_id in AGENT_ORDER
+                ],
+            }
 
     def callback(event, **_payload):
         if event == "agent_completed":
@@ -336,16 +339,13 @@ def test_run_audit_rejects_configured_project_with_mismatched_snapshot_identity(
             run_audit(session, item.id, reviewer=FakeReviewer([]), model="model-v1")
 
 
-def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Path) -> None:
+def test_default_tech_media_audit_persists_active_agent_protocol(tmp_path: Path) -> None:
     with make_session(tmp_path) as session:
         _, _, item = submit_valid_content(session)
         audit = run_audit(session, item.id)
 
-        assert [result.agent_id for result in audit.agent_results] == [
-            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-        ]
-        assert [result.decision for result in audit.agent_results[:-1]] == ["HUMAN_REVIEW"] * 5
+        assert [result.agent_id for result in audit.agent_results] == list(AGENT_ORDER)
+        assert [result.decision for result in audit.agent_results[:-1]] == ["HUMAN_REVIEW"] * (len(AGENT_ORDER) - 1)
         assert audit.agent_results[-1].decision == "PASS_WITH_SUGGESTIONS"
         assert audit.agent_results[-1].score is None
         assert all(result.agent_version == "tech-media-v1" for result in audit.agent_results)
@@ -359,8 +359,8 @@ def test_default_tech_media_audit_persists_fixed_six_agent_protocol(tmp_path: Pa
         assert not any(finding.rule_id == "SYSTEM-AGENT-PROTOCOL" for finding in audit.issues)
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
-        assert len(audit.issues) == 7
-        assert sum(issue.human_required for issue in audit.issues) == 5
+        assert len(audit.issues) == 6
+        assert sum(issue.human_required for issue in audit.issues) == len(AGENT_ORDER) - 1
 
 
 def test_unavailable_campaign_null_score_does_not_become_protocol_error(tmp_path: Path) -> None:
@@ -390,7 +390,7 @@ def test_unavailable_campaign_null_score_does_not_become_protocol_error(tmp_path
 def test_blocking_agent_decision_with_zero_issues_never_approves(tmp_path: Path, decision: str) -> None:
     with make_session(tmp_path) as session:
         _, _, item = submit_valid_content(session)
-        audit = run_audit(session, item.id, reviewer=ProtocolReviewer(decisions=[decision] + ["PASS"] * 5))
+        audit = run_audit(session, item.id, reviewer=ProtocolReviewer(decisions=[decision] + ["PASS"] * (len(AGENT_ORDER) - 1)))
         expected = ReviewStatus.BLOCKED if decision == "BLOCK" else ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.review_status is expected
         assert item.publish_status is PublishStatus.NOT_READY
@@ -400,8 +400,8 @@ def test_blocking_agent_decision_with_zero_issues_never_approves(tmp_path: Path,
 @pytest.mark.parametrize(
     "reviewer",
     [
-        ProtocolReviewer(ids=["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY"]),
-        ProtocolReviewer(ids=["COMPLIANCE", "BRAND", "BRAND", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]),
+        ProtocolReviewer(ids=["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY"]),
+        ProtocolReviewer(ids=["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "BRAND", "CAMPAIGN_EFFECTIVENESS"]),
         ProtocolReviewer(version="wrong-version"),
     ],
 )
@@ -424,10 +424,7 @@ def test_invalid_agent_protocol_never_approves(tmp_path: Path, reviewer: Protoco
 def test_role_boundary_violations_fail_closed_without_becoming_explicit_blocks(
     tmp_path: Path, agent_id: str, decision: str, category: str,
 ) -> None:
-    ids = [
-        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-    ]
+    ids = AGENT_ORDER
     results = []
     for current in ids:
         findings = []
@@ -455,10 +452,7 @@ def test_role_boundary_violations_fail_closed_without_becoming_explicit_blocks(
 
 
 def test_brand_fact_conflict_remains_a_valid_human_review_decision(tmp_path: Path) -> None:
-    ids = [
-        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
-    ]
+    ids = AGENT_ORDER
     results = []
     for current in ids:
         findings = []
@@ -503,7 +497,7 @@ def test_all_pass_and_pass_with_suggestions_are_eligible_for_clear_approval(tmp_
         run_audit(
             session,
             second.id,
-            reviewer=ProtocolReviewer(decisions=["PASS_WITH_SUGGESTIONS"] * 6),
+            reviewer=ProtocolReviewer(decisions=["PASS_WITH_SUGGESTIONS"] * len(AGENT_ORDER)),
         )
         assert second.review_status is ReviewStatus.PASSED_WITH_SUGGESTIONS
         assert second.publish_status is PublishStatus.READY
@@ -529,9 +523,42 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert "小度想想" in reviewer.received_standards.project_text
         assert item.review_status is ReviewStatus.PASSED
         assert item.publish_status is PublishStatus.READY
-        assert len(audit.agent_results) == 6
+        assert len(audit.agent_results) == len(AGENT_ORDER)
         assert audit.agent_results[0].raw_result["marker"] == "persisted"
         assert audit.issues == []
+
+
+def test_run_audit_prefers_batch_brief_over_project_brief(tmp_path: Path) -> None:
+    class CapturingTechMediaReviewer(TechMediaReviewer):
+        def __init__(self):
+            super().__init__()
+            self.received_profile = None
+
+        def review_structured(self, context, profile, progress_callback=None):
+            self.received_profile = profile
+            return [
+                AgentReviewResult(
+                    agent_id=agent_id,
+                    agent_version="tech-media-v1",
+                    decision="PASS",
+                    summary="通过",
+                    score=90,
+                    confidence=0.9,
+                    issues=[],
+                )
+                for agent_id in AGENT_ORDER
+            ]
+
+    with make_session(tmp_path) as session:
+        project, batch, item = submit_valid_content(session)
+        project.description = "项目长期 Brief：允许旧功能。"
+        batch.review_brief = "本批次 Brief：只允许路线规划，不允许自动订酒店。"
+        reviewer = CapturingTechMediaReviewer()
+
+        run_audit(session, item.id, reviewer=reviewer)
+
+        assert reviewer.received_profile.project_facts["review_brief"] == batch.review_brief
+        assert reviewer.received_profile.project_facts["batch_review_brief"] == batch.review_brief
 
 
 def test_deterministic_issue_is_persisted_in_audit_before_reviewer_results(tmp_path: Path) -> None:
@@ -570,11 +597,10 @@ def test_representative_fixture_audit_keeps_revision_and_human_tasks_open(tmp_pa
         )
 
     decisions_and_issues = [
+        ("CONTENT_QUALITY", "NEED_TEXT_FIX", [protocol_issue("QUALITY-TYPO", "MEDIUM")]),
         ("COMPLIANCE", "NEED_TEXT_FIX", [protocol_issue("COMPLIANCE-ABSOLUTE", "MEDIUM")]),
         ("BRAND", "PASS_WITH_SUGGESTIONS", [protocol_issue("BRAND-TONE", "LOW")]),
         ("PRODUCT_ACCURACY", "HUMAN_REVIEW", [protocol_issue("PENDING-HOTEL", "HIGH", human_required=True)]),
-        ("TEST_CREDIBILITY", "HUMAN_REVIEW", [protocol_issue("EVIDENCE-UNBOUND", "HIGH", human_required=True)]),
-        ("CONTENT_QUALITY", "NEED_TEXT_FIX", [protocol_issue("QUALITY-ADLIKE", "MEDIUM")]),
         ("CAMPAIGN_EFFECTIVENESS", "PASS_WITH_SUGGESTIONS", [protocol_issue("CAMPAIGN-HOOK", "LOW")]),
     ]
     results = [
@@ -597,7 +623,7 @@ def test_representative_fixture_audit_keeps_revision_and_human_tasks_open(tmp_pa
 
         assert {finding.rule_id for finding in audit.issues} >= {
             "TEST-COUNT-001", "TEST-EVIDENCE-001", "CLAIM-UNSUPPORTED-ABSOLUTE-001",
-            "CLAIM-PENDING-001", "COMPLIANCE-ABSOLUTE", "PENDING-HOTEL", "EVIDENCE-UNBOUND",
+            "CLAIM-PENDING-001", "QUALITY-TYPO", "COMPLIANCE-ABSOLUTE", "PENDING-HOTEL",
         }
         assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
         assert item.publish_status is PublishStatus.NOT_READY
@@ -614,7 +640,7 @@ def test_low_risk_auto_fixable_issues_persist_and_create_unapproved_v2(tmp_path:
 
         audit = run_audit(session, item.id, reviewer=reviewer, model="model-v1")
 
-        assert len(audit.agent_results) == 6
+        assert len(audit.agent_results) == len(AGENT_ORDER)
         assert len(audit.issues) == 1
         saved_issue = audit.issues[0]
         assert saved_issue.rule_id == "REPLACE-001"

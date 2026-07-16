@@ -337,26 +337,29 @@ def test_submit_returns_while_worker_commits_agent_transitions(
     from server.services import audit_executor_service
 
     engine = configure_worker_database(tmp_path, monkeypatch)
-    block_brand = Event()
-    brand_started = Event()
+    block_scoring = Event()
+    scoring_started = Event()
     factory_threads = []
     caller_thread = get_ident()
 
     class BlockingLLM:
         def chat_json(self, prompt, _response_model):
-            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
-            if agent_id == "BRAND":
-                brand_started.set()
-                assert block_brand.wait(5)
-            return AgentReviewResult(
-                agent_id=agent_id,
-                agent_version="tech-media-v1",
-                decision="PASS",
-                summary="通过",
-                score=90,
-                confidence=0.9,
-                issues=[],
-            ).model_dump(mode="json")
+            scoring_started.set()
+            assert block_scoring.wait(5)
+            return {
+                "results": [
+                    AgentReviewResult(
+                        agent_id=agent_id,
+                        agent_version="tech-media-v1",
+                        decision="PASS",
+                        summary="通过",
+                        score=90,
+                        confidence=0.9,
+                        issues=[],
+                    ).model_dump(mode="json")
+                    for agent_id in AGENT_ORDER
+                ],
+            }
 
     def reviewer_factory():
         factory_threads.append(get_ident())
@@ -371,7 +374,7 @@ def test_submit_returns_while_worker_commits_agent_transitions(
             job_id = job.id
 
             audit_executor_service.submit_audit_job(job_id)
-            assert brand_started.wait(5), "submission should return while the reviewer is blocked"
+            assert scoring_started.wait(5), "submission should return while the reviewer is blocked"
 
             with Session(engine) as polling_session:
                 visible = polling_session.get(BatchAuditJob, job_id)
@@ -385,14 +388,13 @@ def test_submit_returns_while_worker_commits_agent_transitions(
                 ))
                 assert visible.status == "RUNNING"
                 assert manuscript.status == "RUNNING"
-                assert agents[0].status == "COMPLETED"
+                assert all(agent.status == "RUNNING" for agent in agents)
                 assert agents[0].attempt_count == 1
-                assert agents[1].status == "RUNNING"
-                assert visible.current_agent_id == "BRAND"
+                assert visible.current_agent_id == AGENT_ORDER[-1]
 
         assert factory_threads and factory_threads[0] != caller_thread
     finally:
-        block_brand.set()
+        block_scoring.set()
         audit_executor_service.wait_for_audit_jobs()
         reset_db_resources()
 

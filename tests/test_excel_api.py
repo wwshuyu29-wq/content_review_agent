@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 import pytest
@@ -99,15 +100,39 @@ def zip_bytes(filename: str, content: bytes = b"evidence") -> bytes:
     return output.getvalue()
 
 
+def docx_bytes(text: str) -> bytes:
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        f"<w:p><w:r><w:t>{escape(text)}</w:t></w:r></w:p>"
+        "</w:body>"
+        "</w:document>"
+    )
+    output = BytesIO()
+    with ZipFile(output, "w") as archive:
+        archive.writestr("word/document.xml", document)
+    return output.getvalue()
+
+
 def project(client: TestClient) -> dict:
     return client.get("/api/projects").json()[0]
 
 
-def preview_request(client: TestClient, project_id: int, *, xlsx: bytes | None = None, zip_content: bytes | None = None, supplier: str = "supplier", batch: str = "batch"):
+def preview_request(client: TestClient, project_id: int, *, xlsx: bytes | None = None, zip_content: bytes | None = None, supplier: str = "supplier", batch: str = "batch", brief: str = "本批次 Brief：只允许路线规划和沿途信息查询，不允许写自动订酒店。"):
     files = {"excel_file": ("input.xlsx", xlsx or workbook_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
     if zip_content is not None:
         files["evidence_zip"] = ("evidence.zip", zip_content, "application/zip")
-    return client.post("/api/imports/preview", data={"project_id": str(project_id), "supplier_id": supplier, "batch_name": batch}, files=files)
+    return client.post(
+        "/api/imports/preview",
+        data={
+            "project_id": str(project_id),
+            "supplier_id": supplier,
+            "batch_name": batch,
+            "review_brief": brief,
+        },
+        files=files,
+    )
 
 
 def test_template_route_has_attachment_and_exact_sheets(excel_api) -> None:
@@ -190,8 +215,74 @@ def test_preview_multipart_returns_typed_identity_rows_and_tests(excel_api) -> N
     assert payload["project_id"] == current["id"]
     assert payload["supplier_id"] == "supplier"
     assert payload["batch_name"] == "batch"
+    assert payload["project_type"] == current["name"]
+    assert payload["owner_name"] == "supplier"
     assert payload["rows"][0]["tests"][0]["external_test_case_id"] == "case-1"
     assert payload["errors"] == []
+
+
+def test_preview_and_confirm_persist_batch_specific_brief(excel_api) -> None:
+    client, _, _ = excel_api
+    current = project(client)
+    brief = "2026 春季口径：仅允许多点路线规划，不允许出现自动订酒店。"
+    response = preview_request(client, current["id"], brief=brief)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["review_brief"] == brief
+    assert "自动订酒店" in payload["brief_summary"]
+
+    confirmed = client.post(
+        f"/api/imports/{payload['token']}/confirm",
+        json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["review_brief"] == brief
+    assert confirmed.json()["project_type"] == current["name"]
+    assert confirmed.json()["owner_name"] == "supplier"
+
+
+def test_preview_accepts_docx_brief_file_and_persists_identity(excel_api) -> None:
+    client, _, _ = excel_api
+    current = project(client)
+    files = {
+        "excel_file": ("input.xlsx", workbook_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "brief_file": (
+            "brief.docx",
+            docx_bytes("Word Brief：本批次只允许写新路线功能，不允许写旧活动口径。"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    }
+    response = client.post(
+        "/api/imports/preview",
+        data={
+            "project_id": str(current["id"]),
+            "supplier_id": "owner-a",
+            "batch_name": "2026-春季-01",
+            "project_type": "新品功能稿",
+            "owner_name": "owner-a",
+        },
+        files=files,
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert "新路线功能" in payload["review_brief"]
+    assert payload["project_type"] == "新品功能稿"
+    assert payload["owner_name"] == "owner-a"
+
+    confirmed = client.post(
+        f"/api/imports/{payload['token']}/confirm",
+        json={
+            "project_id": current["id"],
+            "supplier_id": "owner-a",
+            "batch_name": "2026-春季-01",
+            "project_type": "新品功能稿",
+            "owner_name": "owner-a",
+        },
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    body = confirmed.json()
+    assert body["project_type"] == "新品功能稿"
+    assert body["owner_name"] == "owner-a"
 
 
 def test_preview_rejects_non_tech_bad_suffix_malformed_and_oversize(excel_api, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -201,7 +292,7 @@ def test_preview_rejects_non_tech_bad_suffix_malformed_and_oversize(excel_api, m
         session.add(other); session.commit(); other_id = other.id
     assert preview_request(client, other_id).status_code == 422
     current = project(client)
-    bad_suffix = client.post("/api/imports/preview", data={"project_id": current["id"], "supplier_id": "s", "batch_name": "b"}, files={"excel_file": ("input.xls", b"x", "application/octet-stream")})
+    bad_suffix = client.post("/api/imports/preview", data={"project_id": current["id"], "supplier_id": "s", "batch_name": "b", "review_brief": "批次 Brief"}, files={"excel_file": ("input.xls", b"x", "application/octet-stream")})
     assert bad_suffix.status_code == 422
     assert preview_request(client, current["id"], xlsx=b"not-xlsx").status_code == 422
     monkeypatch.setattr(main, "MAX_EXCEL_UPLOAD_BYTES", 4)
@@ -313,7 +404,7 @@ def test_contents_table_contract_filters_severity_agents_and_missing_media(excel
     with Session(engine) as session:
         item = session.get(main.ContentItem, content_id)
         audit = AuditRun(content_item=item, content_version=item.versions[0], rule_version=item.project.current_rule_version, model="m", prompt_version="p", status="COMPLETED")
-        for agent_id in reversed(["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]):
+        for agent_id in reversed(["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS"]):
             audit.agent_results.append(AgentResult(agent_name=agent_id, agent_id=agent_id, agent_version="v1", decision="PASS", summary=agent_id, score=90, status="COMPLETED", raw_result={}))
         audit.issues.extend([
             Issue(rule_id="LOW", category="quality", severity="LOW", field="body", evidence_quote="", reason="low", suggestion="s1", auto_fixable=False, human_required=False, confidence=1),
@@ -326,18 +417,18 @@ def test_contents_table_contract_filters_severity_agents_and_missing_media(excel
     assert row["supplier_external_id"] == "content-1"
     assert row["original_title"] == "原始标题" and row["final_title"] == "原始标题"
     assert row["highest_severity"] == "CRITICAL"
-    assert [agent["agent_id"] for agent in row["agents"]] == ["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]
+    assert [agent["agent_id"] for agent in row["agents"]] == ["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS"]
     assert row["media_url"] is None
     assert client.get("/api/contents/table", params={"review_status": "INVALID"}).status_code == 422
 
 
-def test_contents_table_always_returns_six_canonical_agent_slots(excel_api) -> None:
+def test_contents_table_always_returns_active_canonical_agent_slots(excel_api) -> None:
     client, _, _ = excel_api
     current = project(client)
     token = preview_request(client, current["id"]).json()["token"]
     client.post(f"/api/imports/{token}/confirm", json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"})
     row = client.get("/api/contents/table").json()[0]
-    assert [agent["agent_id"] for agent in row["agents"]] == ["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]
+    assert [agent["agent_id"] for agent in row["agents"]] == ["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS"]
     assert all(agent["status"] == "NOT_RUN" for agent in row["agents"])
 
 

@@ -36,12 +36,19 @@ def _default_reviewer_factory() -> Any:
     return TechMediaReviewer()
 
 
-_reviewer_factory: Callable[[], Any] = _default_reviewer_factory
+_reviewer_factory: Callable[..., Any] = _default_reviewer_factory
 
 
-def set_reviewer_factory(factory: Callable[[], Any]) -> None:
+def set_reviewer_factory(factory: Callable[..., Any]) -> None:
     global _reviewer_factory
     _reviewer_factory = factory
+
+
+def _create_reviewer(factory: Callable[..., Any], session: Session, job: BatchAuditJob) -> Any:
+    try:
+        return factory(session, job)
+    except TypeError:
+        return factory()
 
 
 def _safe_error(_error: BaseException) -> str:
@@ -144,7 +151,7 @@ def _progress_callback(
     return record
 
 
-def run_audit_job(job_id: int, reviewer_factory: Callable[[], Any]) -> None:
+def run_audit_job(job_id: int, reviewer_factory: Callable[..., Any]) -> None:
     """Run one persisted audit job with worker-owned resources.
 
     Manuscripts are deliberately sequential. Every externally observable state
@@ -162,7 +169,7 @@ def run_audit_job(job_id: int, reviewer_factory: Callable[[], Any]) -> None:
             return
 
         try:
-            reviewer = reviewer_factory()
+            reviewer = _create_reviewer(reviewer_factory, session, job)
 
             for manuscript in job.manuscripts:
                 if manuscript.status in {"COMPLETED", "SKIPPED"}:
@@ -211,6 +218,7 @@ def run_audit_job(job_id: int, reviewer_factory: Callable[[], Any]) -> None:
                         manuscript.content_item_id,
                         reviewer=reviewer,
                         model=job.model,
+                        created_by_user_id=job.created_by_user_id,
                         progress_callback=_progress_callback(session, job, manuscript),
                     )
                 except Exception as error:

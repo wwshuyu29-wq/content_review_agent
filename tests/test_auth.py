@@ -234,6 +234,41 @@ def test_initial_admin_is_created_once_without_changing_existing_review_data(
         assert len(list(session.scalars(select(User)))) == 1
 
 
+def test_existing_initial_admin_password_is_refreshed_from_bootstrap_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.models import User
+    from server.services.auth_service import create_session, ensure_initial_admin, hash_password, lookup_session, verify_password
+
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'refresh-bootstrap-admin.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setenv("INITIAL_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("INITIAL_ADMIN_PASSWORD", "admin-password-123")
+    monkeypatch.setenv("SESSION_SECRET", "bootstrap-session-secret-with-32-bytes")
+
+    with Session(engine) as session:
+        admin = User(
+            username="admin",
+            display_name="admin",
+            password_hash=hash_password("old-admin-password"),
+            role="ADMIN",
+            is_active=True,
+        )
+        session.add(admin)
+        session.flush()
+        old_session = create_session(session, admin)
+        session.commit()
+
+        refreshed = ensure_initial_admin(session)
+        session.commit()
+
+        assert refreshed is not None
+        assert refreshed.username == "admin"
+        assert verify_password(refreshed.password_hash, "admin-password-123")
+        assert not verify_password(refreshed.password_hash, "old-admin-password")
+        assert lookup_session(session, old_session.session_token) is None
+
+
 def test_missing_bootstrap_secrets_fail_only_when_no_users_exist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -250,6 +285,25 @@ def test_missing_bootstrap_secrets_fail_only_when_no_users_exist(
         session.add(User(username="existing", display_name="Existing", password_hash=hash_password("existing password")))
         session.commit()
         ensure_initial_admin(session)
+
+
+def test_existing_users_do_not_require_bootstrap_credentials_when_only_session_secret_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.models import User
+    from server.services.auth_service import ensure_initial_admin, hash_password
+
+    engine = create_db_engine(f"sqlite:///{tmp_path / 'existing-users-session-secret.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.delenv("INITIAL_ADMIN_USERNAME", raising=False)
+    monkeypatch.delenv("INITIAL_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("SESSION_SECRET", "existing-users-session-secret-with-32-bytes")
+
+    with Session(engine) as session:
+        session.add(User(username="existing", display_name="Existing", password_hash=hash_password("existing password")))
+        session.commit()
+
+        assert ensure_initial_admin(session) is None
 
 
 def test_username_normalization_is_shared_by_bootstrap_and_admin_creation(auth_api) -> None:
@@ -517,6 +571,45 @@ def test_admin_can_list_disable_and_reset_users_and_sessions_are_invalidated(aut
     assert disabled.status_code == 200
     client.cookies.clear()
     assert login(client, "reviewer", "new password value").status_code == 401
+
+
+def test_team_member_api_config_is_saved_per_account_without_plaintext_key(auth_api) -> None:
+    from server.models import User
+
+    client, engine = auth_api
+    admin_login = login(client)
+    created = client.post(
+        "/api/admin/users",
+        headers=csrf_headers(admin_login),
+        json={
+            "username": "member",
+            "display_name": "团队成员",
+            "password": "member password value",
+            "role": "REVIEWER",
+        },
+    )
+    assert created.status_code == 201
+
+    client.cookies.clear()
+    member_login = login(client, "member", "member password value")
+    headers = csrf_headers(member_login)
+    saved = client.put(
+        "/api/config",
+        headers=headers,
+        json={"reviewer": "oneapi", "model": "GPT 5.6 SOL", "api_key": "sk-member-secret"},
+    )
+
+    assert saved.status_code == 200
+    assert saved.json() == {"reviewer": "oneapi", "model": "GPT 5.6 SOL", "key_set": True}
+    assert client.get("/api/config").json() == saved.json()
+
+    with Session(engine) as session:
+        member = session.scalar(select(User).where(User.username == "member"))
+        admin = session.scalar(select(User).where(User.username == "admin"))
+        assert member.oneapi_model == "GPT 5.6 SOL"
+        assert member.oneapi_key_ciphertext
+        assert "sk-member-secret" not in member.oneapi_key_ciphertext
+        assert admin.oneapi_key_ciphertext is None
 
 
 def test_csrf_origin_requires_exact_scheme_and_effective_port(auth_api) -> None:

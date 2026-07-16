@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from scripts.text_review.reviewers.base import AgentIssue, AgentReviewResult, EvidenceSpan
+from scripts.text_review.reviewers.base import AgentIssue, AgentReviewResult, DimensionReviewBatch, EvidenceSpan
 from scripts.text_review.reviewers.llm import OpenAICompatLLM, oneapi_strict_schema
 from scripts.text_review.reviewers.tech_media import AGENT_ORDER, AGENT_VERSION, TechMediaReviewer, validate_agent_result
 from server.models import PublishStatus, ReviewStatus
@@ -73,7 +73,7 @@ def representative_context_and_profile():
     return context, get_review_profile(version)
 
 
-def test_all_six_agents_return_strict_results_in_fixed_order():
+def test_all_active_agents_return_strict_results_in_fixed_order():
     results = TechMediaReviewer().review_structured(CONTEXT, PROFILE)
     assert tuple(result.agent_id for result in results) == AGENT_ORDER
     assert all(isinstance(result, AgentReviewResult) for result in results)
@@ -113,7 +113,7 @@ def test_specialist_prompts_slice_standards_and_never_include_artist_rules():
     prompt_text = json.dumps(prompts, ensure_ascii=False)
     assert "范丞丞" not in prompt_text
     assert all(term not in prompt_text.lower() for term in ("celebrity", "artist", "明星", "艺人"))
-    assert "test_cases" in prompts["TEST_CREDIBILITY"]
+    assert "test_cases" not in prompt_text
     assert "test_cases" not in prompts["BRAND"]
     assert "官方支持多点出行" in prompts["PRODUCT_ACCURACY"]
     assert "小度想想可以自动筛选、比较酒店并判断最划算" in prompts["PRODUCT_ACCURACY"]
@@ -156,16 +156,15 @@ def test_production_prompts_use_configured_public_specialist_and_one_primary_sta
     context, profile = representative_context_and_profile
     prompts = TechMediaReviewer().build_prompts(context, profile)
     standard_markers = {
+        "CONTENT_QUALITY": "[QUAL-TITLE-001]",
         "COMPLIANCE": "[COM-ABS-001]",
         "BRAND": "[BRAND-NAME-001]",
         "PRODUCT_ACCURACY": "[ACC-FUNC-001]",
-        "TEST_CREDIBILITY": "[TEST-TRIGGER-001]",
-        "CONTENT_QUALITY": "[QUAL-TITLE-001]",
         "CAMPAIGN_EFFECTIVENESS": "[CAM-GOAL-001]",
     }
 
     for agent_id, prompt in prompts.items():
-        assert "六个审核 Agent 公共约束" in prompt
+        assert "五个评分维度公共约束" in prompt
         assert profile.agent_prompts[agent_id].splitlines()[0] in prompt
         assert standard_markers[agent_id] in prompt
         assert sum(marker in prompt for marker in standard_markers.values()) == 1
@@ -174,7 +173,7 @@ def test_production_prompts_use_configured_public_specialist_and_one_primary_sta
 def test_v1_prompt_building_rejects_missing_configured_binding() -> None:
     profile = PROFILE.model_copy(update={"package_version": "1.1"})
 
-    with pytest.raises(ValueError, match="configured.*binding|binding.*configured"):
+    with pytest.raises(ValueError, match="active Agent binding"):
         TechMediaReviewer().build_prompts(CONTEXT, profile)
 
 
@@ -224,7 +223,7 @@ def test_authorization_relevance_metadata_loads_supplement_for_compliance_and_br
 
     assert "[AUTH-" in prompts["COMPLIANCE"]
     assert "[AUTH-" in prompts["BRAND"]
-    assert all("[AUTH-" not in prompts[agent_id] for agent_id in AGENT_ORDER[2:])
+    assert all("[AUTH-" not in prompts[agent_id] for agent_id in AGENT_ORDER if agent_id not in {"COMPLIANCE", "BRAND"})
 
 
 def test_authorization_standard_is_conditionally_supplemental_for_compliance_and_brand_only(
@@ -236,7 +235,7 @@ def test_authorization_standard_is_conditionally_supplemental_for_compliance_and
 
     assert "[AUTH-" in prompts["COMPLIANCE"]
     assert "[AUTH-" in prompts["BRAND"]
-    assert all("[AUTH-" not in prompts[agent_id] for agent_id in AGENT_ORDER[2:])
+    assert all("[AUTH-" not in prompts[agent_id] for agent_id in AGENT_ORDER if agent_id not in {"COMPLIANCE", "BRAND"})
 
 
 def test_representative_prompts_encode_non_overlapping_role_boundaries(representative_context_and_profile):
@@ -246,8 +245,7 @@ def test_representative_prompts_encode_non_overlapping_role_boundaries(represent
     assert "unsupported absolute or superlative claims require NEED_TEXT_FIX" in prompts["COMPLIANCE"]
     assert "tone or editorial-independence concerns alone use PASS_WITH_SUGGESTIONS" in prompts["BRAND"]
     assert "pending hotel capabilities or comparisons require HUMAN_REVIEW" in prompts["PRODUCT_ACCURACY"]
-    assert "unbound 亲测/实测 claims and missing test conditions or boundaries require HUMAN_REVIEW" in prompts["TEST_CREDIBILITY"]
-    assert "ad-like unsupported conclusions may require NEED_TEXT_FIX" in prompts["CONTENT_QUALITY"]
+    assert "Run the first-pass basic content proofreading before specialist review" in prompts["CONTENT_QUALITY"]
     assert "suggestions-only and cannot independently block" in prompts["CAMPAIGN_EFFECTIVENESS"]
 
 
@@ -281,18 +279,19 @@ def test_representative_valid_protocol_preserves_revision_and_human_review(repre
         )
 
     outputs = {
+        "CONTENT_QUALITY": result("CONTENT_QUALITY", "NEED_TEXT_FIX", [finding("QUALITY-TYPO", "MEDIUM", "content_quality.md")]),
         "COMPLIANCE": result("COMPLIANCE", "NEED_TEXT_FIX", [finding("COMPLIANCE-ABSOLUTE", "MEDIUM", "compliance.md")]),
         "BRAND": result("BRAND", "PASS_WITH_SUGGESTIONS", [finding("BRAND-TONE", "LOW", "brand_consistency.md")]),
         "PRODUCT_ACCURACY": result("PRODUCT_ACCURACY", "HUMAN_REVIEW", [finding("PENDING-HOTEL", "HIGH", "PENDING-002", human_required=True)]),
-        "TEST_CREDIBILITY": result("TEST_CREDIBILITY", "HUMAN_REVIEW", [finding("EVIDENCE-UNBOUND", "HIGH", "test_credibility.md", human_required=True)]),
-        "CONTENT_QUALITY": result("CONTENT_QUALITY", "NEED_TEXT_FIX", [finding("QUALITY-ADLIKE", "MEDIUM", "content_quality.md")]),
         "CAMPAIGN_EFFECTIVENESS": result("CAMPAIGN_EFFECTIVENESS", "PASS_WITH_SUGGESTIONS", [finding("CAMPAIGN-HOOK", "LOW", "campaign_effectiveness.md")]),
     }
 
     class LLM:
         def chat_json(self, prompt, schema):
-            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
-            return outputs[agent_id]
+            assert schema is DimensionReviewBatch
+            return {
+                "results": [json.loads(outputs[agent_id]) for agent_id in AGENT_ORDER],
+            }
 
     agent_results = TechMediaReviewer(llm=LLM()).review_structured(context, profile)
     deterministic = evaluate_rules(profile, context)
@@ -300,8 +299,8 @@ def test_representative_valid_protocol_preserves_revision_and_human_review(repre
 
     assert [item.agent_id for item in agent_results] == list(AGENT_ORDER)
     assert [item.decision for item in agent_results] == [
-        "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS", "HUMAN_REVIEW",
-        "HUMAN_REVIEW", "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS",
+        "NEED_TEXT_FIX", "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS",
+        "HUMAN_REVIEW", "PASS_WITH_SUGGESTIONS",
     ]
     assert arbitration.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
     assert arbitration.publish_status is PublishStatus.NOT_READY
@@ -319,34 +318,37 @@ def test_adversarial_role_decisions_are_rejected_without_losing_legitimate_speci
         )
 
     outputs = {
+        "CONTENT_QUALITY": ("PASS", []),
         "COMPLIANCE": ("BLOCK", [finding("COMPLIANCE", "compliance")]),
         "BRAND": ("HUMAN_REVIEW", [finding("BRAND", "brand_tone")]),
         "PRODUCT_ACCURACY": ("HUMAN_REVIEW", [finding("PRODUCT_ACCURACY", "product_fact")]),
-        "TEST_CREDIBILITY": ("HUMAN_REVIEW", [finding("TEST_CREDIBILITY", "test_evidence")]),
-        "CONTENT_QUALITY": ("PASS", []),
         "CAMPAIGN_EFFECTIVENESS": ("BLOCK", [finding("CAMPAIGN_EFFECTIVENESS", "campaign")]),
     }
 
     class LLM:
         def chat_json(self, prompt, schema):
-            agent_id = next(agent for agent in AGENT_ORDER if f"Specialist: {agent}" in prompt)
-            calls[agent_id] += 1
-            decision, issues = outputs[agent_id]
-            return AgentReviewResult(
-                agent_id=agent_id, agent_version=AGENT_VERSION, decision=decision,
-                summary="adversarial", score=50, confidence=0.9, issues=issues,
-            ).model_dump_json()
+            assert schema is DimensionReviewBatch
+            for agent_id in AGENT_ORDER:
+                calls[agent_id] += 1
+            return {
+                "results": [
+                    AgentReviewResult(
+                        agent_id=agent_id, agent_version=AGENT_VERSION, decision=outputs[agent_id][0],
+                        summary="adversarial", score=50, confidence=0.9, issues=outputs[agent_id][1],
+                    ).model_dump(mode="json")
+                    for agent_id in AGENT_ORDER
+                ],
+            }
 
     results = TechMediaReviewer(llm=LLM()).review_structured(CONTEXT, PROFILE)
     by_agent = {result.agent_id: result for result in results}
 
     assert by_agent["COMPLIANCE"].decision == "BLOCK"
     assert by_agent["PRODUCT_ACCURACY"].decision == "HUMAN_REVIEW"
-    assert by_agent["TEST_CREDIBILITY"].decision == "HUMAN_REVIEW"
     assert by_agent["BRAND"].decision == "PASS_WITH_SUGGESTIONS"
     assert by_agent["CAMPAIGN_EFFECTIVENESS"].decision == "PASS_WITH_SUGGESTIONS"
-    assert calls["BRAND"] == 3
-    assert calls["CAMPAIGN_EFFECTIVENESS"] == 3
+    assert calls["BRAND"] == 1
+    assert calls["CAMPAIGN_EFFECTIVENESS"] == 1
 
 
 def test_brand_fact_conflict_can_legitimately_escalate():
@@ -368,7 +370,7 @@ def test_brand_fact_conflict_can_legitimately_escalate():
 
 def test_heuristic_mode_returns_nonblocking_campaign_fallback_and_human_review_for_required_roles():
     results = TechMediaReviewer().review_structured(CONTEXT, PROFILE)
-    assert len(results) == 6
+    assert len(results) == len(AGENT_ORDER)
     assert all(result.decision == "HUMAN_REVIEW" for result in results[:-1])
     assert results[-1].decision == "PASS_WITH_SUGGESTIONS"
     assert all(result.issues for result in results)
@@ -502,15 +504,20 @@ def test_llm_parse_retry_succeeds_on_third_call():
 
         def chat(self, prompt):
             self.calls += 1
-            return "not json" if self.calls < 3 else AgentReviewResult(
-                agent_id="COMPLIANCE", agent_version=AGENT_VERSION, decision="PASS",
-                summary="ok", score=90, confidence=0.9, issues=[]
+            return "not json" if self.calls < 3 else DimensionReviewBatch(
+                results=[
+                    AgentReviewResult(
+                        agent_id=agent_id, agent_version=AGENT_VERSION, decision="PASS",
+                        summary="ok", score=90, confidence=0.9, issues=[],
+                    )
+                    for agent_id in AGENT_ORDER
+                ]
             ).model_dump_json()
 
     llm = LLM()
     results = TechMediaReviewer(llm=llm).review_structured(CONTEXT, PROFILE)
-    assert llm.calls == 18
-    assert results[0].decision == "PASS"
+    assert llm.calls == 3
+    assert all(result.decision == "PASS" for result in results)
 
 
 def test_oneapi_schema_recursively_requires_all_properties_and_preserves_nullable_optionals():

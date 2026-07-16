@@ -88,6 +88,63 @@ def _secret_hash(value: str) -> str:
     return hmac.new(_session_secret(), value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _secret_stream(nonce: bytes, length: int) -> bytes:
+    chunks = []
+    counter = 0
+    while sum(len(chunk) for chunk in chunks) < length:
+        chunks.append(
+            hmac.new(
+                _session_secret(),
+                b"oneapi-key-stream:" + nonce + counter.to_bytes(4, "big"),
+                hashlib.sha256,
+            ).digest()
+        )
+        counter += 1
+    return b"".join(chunks)[:length]
+
+
+def encrypt_secret(value: str) -> str:
+    if not value:
+        raise ValueError("Secret must not be empty")
+    nonce = secrets.token_bytes(16)
+    plaintext = value.encode("utf-8")
+    stream = _secret_stream(nonce, len(plaintext))
+    ciphertext = bytes(left ^ right for left, right in zip(plaintext, stream))
+    signature = hmac.new(
+        _session_secret(),
+        b"oneapi-key:v1:" + nonce + ciphertext,
+        hashlib.sha256,
+    ).digest()
+    return ".".join(
+        (
+            "v1",
+            _base64url_encode(nonce),
+            _base64url_encode(ciphertext),
+            _base64url_encode(signature),
+        )
+    )
+
+
+def decrypt_secret(value: str) -> str:
+    parts = value.split(".")
+    if len(parts) != 4 or parts[0] != "v1":
+        raise ValueError("Invalid secret envelope")
+    _, encoded_nonce, encoded_ciphertext, encoded_signature = parts
+    nonce = _base64url_decode(encoded_nonce)
+    ciphertext = _base64url_decode(encoded_ciphertext)
+    supplied_signature = _base64url_decode(encoded_signature)
+    expected_signature = hmac.new(
+        _session_secret(),
+        b"oneapi-key:v1:" + nonce + ciphertext,
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        raise ValueError("Invalid secret signature")
+    stream = _secret_stream(nonce, len(ciphertext))
+    plaintext = bytes(left ^ right for left, right in zip(ciphertext, stream))
+    return plaintext.decode("utf-8")
+
+
 def _base64url_encode(payload: bytes) -> str:
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
@@ -379,9 +436,12 @@ def _verified_initial_admin(session: Session, username: str) -> User:
 
 def ensure_initial_admin(session: Session) -> Optional[User]:
     _acquire_initial_admin_lock(session)
-    if session.scalar(select(func.count(User.id))) > 0:
-        return None
+    user_count = session.scalar(select(func.count(User.id)))
     required_names = ("INITIAL_ADMIN_USERNAME", "INITIAL_ADMIN_PASSWORD", "SESSION_SECRET")
+    bootstrap_names = ("INITIAL_ADMIN_USERNAME", "INITIAL_ADMIN_PASSWORD")
+    configured_bootstrap_names = [name for name in bootstrap_names if os.environ.get(name)]
+    if user_count > 0 and not configured_bootstrap_names:
+        return None
     missing = [name for name in required_names if not os.environ.get(name)]
     if missing:
         raise RuntimeError(f"Missing required bootstrap settings: {', '.join(missing)}")
@@ -393,6 +453,23 @@ def ensure_initial_admin(session: Session) -> Optional[User]:
     if len(password) < 12:
         raise RuntimeError("INITIAL_ADMIN_PASSWORD must contain at least 12 characters")
     _session_secret()
+    existing = session.scalar(select(User).where(User.username == username))
+    if existing is not None:
+        changed = False
+        if existing.role != "ADMIN":
+            existing.role = "ADMIN"
+            changed = True
+        if not existing.is_active:
+            existing.is_active = True
+            changed = True
+        if not verify_password(existing.password_hash, password):
+            existing.password_hash = hash_password(password)
+            changed = True
+        if changed:
+            existing.session_version += 1
+            revoke_user_sessions(session, existing)
+            session.flush()
+        return existing
     admin = User(
         username=username,
         display_name=username,

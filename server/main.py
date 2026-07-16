@@ -9,8 +9,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zipfile import BadZipFile, ZipFile
+import xml.etree.ElementTree as ET
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,6 +82,8 @@ from server.services.auth_service import (
     authenticate_request,
     create_session,
     csrf_token_for_session,
+    decrypt_secret,
+    encrypt_secret,
     ensure_initial_admin,
     hash_password,
     normalize_username,
@@ -109,9 +114,11 @@ ALLOWED_IMAGE_TYPES = {
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_EXCEL_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_EVIDENCE_ZIP_UPLOAD_BYTES = 200 * 1024 * 1024
-AGENT_ORDER = ("COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS")
+MAX_BRIEF_UPLOAD_BYTES = 5 * 1024 * 1024
+AGENT_ORDER = ("CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS")
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 DEFAULT_CONFIG = {"reviewer": "heuristic", "model": ""}
+DEFAULT_TEAM_MODEL = "GPT 5.6 SOL"
 SUPPORTED_REVIEWERS = {"heuristic", "oneapi", "ernie"}
 
 
@@ -164,6 +171,42 @@ def get_audit_reviewer() -> Any:
     return TechMediaReviewer(llm=get_llm(config["reviewer"]))
 
 
+def _call_llm_factory(backend: str, **kwargs: Any) -> Any:
+    try:
+        return get_llm(backend, **kwargs)
+    except TypeError:
+        return get_llm(backend)
+
+
+def _config_for_user(user: User) -> Dict[str, str]:
+    fallback = _load_config()
+    reviewer = user.reviewer_backend or fallback["reviewer"]
+    model = user.oneapi_model or fallback["model"]
+    return {"reviewer": reviewer, "model": model}
+
+
+def _user_oneapi_key(user: User) -> str:
+    if user.oneapi_key_ciphertext:
+        return decrypt_secret(user.oneapi_key_ciphertext)
+    return os.environ.get("ONEAPI_KEY", "")
+
+
+def get_audit_reviewer_for_user(user: User) -> Any:
+    config = _validated_config(_config_for_user(user))
+    api_key = _user_oneapi_key(user) if config["reviewer"] == "oneapi" else None
+    llm = _call_llm_factory(config["reviewer"], model=config["model"] or None, api_key=api_key)
+    return TechMediaReviewer(llm=llm)
+
+
+def get_audit_job_reviewer(session: Session, job: BatchAuditJob) -> Any:
+    if job.created_by_user_id is None:
+        return get_audit_reviewer()
+    user = session.get(User, job.created_by_user_id)
+    if user is None:
+        return get_audit_reviewer()
+    return get_audit_reviewer_for_user(user)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _data_dir().mkdir(parents=True, exist_ok=True)
@@ -179,7 +222,7 @@ async def lifespan(_app: FastAPI):
         stale_seconds = max(1, int(os.environ.get("AUDIT_JOB_STALE_SECONDS", "300")))
         interrupt_stale_jobs(session, datetime.utcnow() - timedelta(seconds=stale_seconds))
         session.commit()
-    set_reviewer_factory(get_audit_reviewer)
+    set_reviewer_factory(get_audit_job_reviewer)
     yield
 
 
@@ -211,6 +254,13 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=True,
 )
+
+
+def get_request_audit_reviewer(request: Request, user: User = Depends(require_user)) -> Any:
+    override = app.dependency_overrides.get(get_audit_reviewer)
+    if override is not None:
+        return override()
+    return get_audit_reviewer_for_user(user)
 
 
 class OrmResponse(BaseModel):
@@ -276,6 +326,18 @@ class RuleVersionPackageInput(BaseModel):
     package_version: str = Field(min_length=1, max_length=50)
 
 
+class ProjectBriefInput(BaseModel):
+    description: str = Field(min_length=1, max_length=5000)
+
+    @field_validator("description")
+    @classmethod
+    def strip_description(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("description must not be blank")
+        return value
+
+
 class ProjectDetail(ProjectRead):
     current_rule_version: Optional[RuleVersionRead] = None
     rule_versions: List[RuleVersionRead] = Field(default_factory=list)
@@ -310,8 +372,10 @@ class TaskResolveInput(BaseModel):
 class ConfigInput(BaseModel):
     reviewer: Optional[str] = None
     model: Optional[str] = None
+    api_key: Optional[str] = None
+    clear_key: bool = False
 
-    @field_validator("reviewer", "model")
+    @field_validator("reviewer", "model", "api_key")
     @classmethod
     def strip_value(cls, value: Optional[str]) -> Optional[str]:
         return value.strip() if value is not None else None
@@ -334,6 +398,66 @@ class ConfigResponse(BaseModel):
     reviewer: str
     model: str
     key_set: bool
+
+
+class DashboardMonthMetrics(BaseModel):
+    month: str
+    uploaded_count: int
+    audit_started_count: int
+    human_decision_count: int
+
+
+class DashboardWorkloadRow(BaseModel):
+    user_id: int
+    username: str
+    display_name: str
+    months: List[DashboardMonthMetrics]
+
+
+class DashboardBatchQuality(BaseModel):
+    batch_id: int
+    batch_name: str
+    total_count: int
+    passed_count: int
+    pass_rate: float
+
+
+class DashboardQuality(BaseModel):
+    total_count: int
+    passed_count: int
+    pass_rate: float
+    batches: List[DashboardBatchQuality]
+
+
+class DashboardProjectQuality(BaseModel):
+    project_id: int
+    project_name: str
+    total_count: int
+    passed_count: int
+    pass_rate: float
+
+
+class DashboardIssueManuscript(BaseModel):
+    content_id: int
+    title: str
+    severity: str
+    reason: str
+
+
+class DashboardIssueCluster(BaseModel):
+    category: str
+    issue_count: int
+    manuscript_count: int
+    high_count: int
+    manuscripts: List[DashboardIssueManuscript]
+
+
+class DashboardOverview(BaseModel):
+    month: str
+    workload: List[DashboardWorkloadRow]
+    quality: DashboardQuality
+    project_quality: List[DashboardProjectQuality]
+    issue_clusters: List[DashboardIssueCluster]
 
 
 class BatchAuditItemResult(BaseModel):
@@ -570,6 +694,26 @@ def get_project(project_id: int, session: Session = Depends(get_session)):
     )
 
 
+@app.patch(
+    "/api/projects/{project_id}/brief",
+    response_model=ProjectRead,
+    dependencies=[Depends(require_csrf)],
+)
+def update_project_brief(
+    project_id: int,
+    payload: ProjectBriefInput,
+    _user: User = Depends(require_user),
+    session: Session = Depends(get_session),
+):
+    project = session.get(Project, project_id)
+    if project is None:
+        raise _not_found("Project", project_id)
+    project.description = payload.description
+    session.commit()
+    session.refresh(project)
+    return project
+
+
 @app.get("/api/projects/{project_id}/rule-versions", response_model=List[RuleVersionRead])
 def list_rule_versions(project_id: int, session: Session = Depends(get_session)):
     if session.get(Project, project_id) is None:
@@ -695,6 +839,55 @@ async def _save_excel_upload(upload: UploadFile, directory: Path, allowed: set[s
     return path
 
 
+async def _read_brief_upload(upload: UploadFile) -> str:
+    suffix = Path(upload.filename or "").suffix.lower()
+    if suffix not in {".txt", ".md", ".docx"}:
+        raise HTTPException(status_code=422, detail="Brief 文件仅支持 .docx、.txt 或 .md")
+    data = await upload.read(MAX_BRIEF_UPLOAD_BYTES + 1)
+    if len(data) > MAX_BRIEF_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Brief 文件不能超过 5 MiB")
+    if suffix == ".docx":
+        return _extract_docx_text(data)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Brief 文件必须使用 UTF-8 编码") from exc
+
+
+def _extract_docx_text(data: bytes) -> str:
+    try:
+        with ZipFile(BytesIO(data)) as archive:
+            names = set(archive.namelist())
+            document_names = ["word/document.xml"]
+            document_names.extend(sorted(name for name in names if name.startswith("word/header") and name.endswith(".xml")))
+            document_names.extend(sorted(name for name in names if name.startswith("word/footer") and name.endswith(".xml")))
+            paragraphs: List[str] = []
+            namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            for name in document_names:
+                if name not in names:
+                    continue
+                root = ET.fromstring(archive.read(name))
+                for paragraph in root.findall(".//w:p", namespace):
+                    pieces: List[str] = []
+                    for node in paragraph.iter():
+                        tag = node.tag.rsplit("}", 1)[-1]
+                        if tag == "t" and node.text:
+                            pieces.append(node.text)
+                        elif tag == "tab":
+                            pieces.append("\t")
+                        elif tag in {"br", "cr"}:
+                            pieces.append("\n")
+                    line = "".join(pieces).strip()
+                    if line:
+                        paragraphs.append(line)
+    except (BadZipFile, ET.ParseError, KeyError, OSError) as exc:
+        raise HTTPException(status_code=422, detail="Brief Word 文件解析失败") from exc
+    text = "\n".join(paragraphs).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Brief Word 文件未解析到文本")
+    return text
+
+
 def _evidence_trigger_terms(project: Project) -> tuple[str, ...]:
     structured = project.current_rule_version.structured_rules if project.current_rule_version else {}
     evidence = structured.get("evidence_requirements", {}).get("evidence_requirements", [])
@@ -733,28 +926,37 @@ def _validated_tech_project(session: Session, project_id: int) -> Project:
 @app.post("/api/imports/preview", response_model=ImportPreviewRead)
 async def preview_excel_import(
     project_id: int = Form(...), supplier_id: str = Form(...), batch_name: str = Form(...),
+    project_type: str = Form(""), owner_name: str = Form(""),
+    review_brief: str = Form(""),
     excel_file: UploadFile = File(...), evidence_zip: Optional[UploadFile] = File(None),
+    brief_file: Optional[UploadFile] = File(None),
     session: Session = Depends(get_session),
 ):
     project = _validated_tech_project(session, project_id)
     supplier_id = supplier_id.strip()
     batch_name = batch_name.strip()
+    project_type = project_type.strip() or project.name
+    owner_name = owner_name.strip() or supplier_id
     if not supplier_id or not batch_name:
         raise HTTPException(status_code=422, detail="supplier_id and batch_name are required")
     identity = PreviewIdentity(
         project_id=project.id, project_code=project.code, content_type=project.content_type,
         package_version=project.current_rule_version.package_version,
-        supplier_id=supplier_id, batch_name=batch_name,
+        supplier_id=supplier_id, batch_name=batch_name, project_type=project_type, owner_name=owner_name,
     )
     root = _data_dir() / "import-previews"
     temp = root / f"upload-{uuid.uuid4().hex}"
     try:
+        brief_text = review_brief
+        if brief_file is not None:
+            uploaded_brief = await _read_brief_upload(brief_file)
+            brief_text = f"{brief_text.strip()}\n\n{uploaded_brief.strip()}".strip() if brief_text.strip() else uploaded_brief
         xlsx = await _save_excel_upload(excel_file, temp, {".xlsx"}, MAX_EXCEL_UPLOAD_BYTES)
         zip_path = None
         if evidence_zip is not None:
             zip_path = await _save_excel_upload(evidence_zip, temp, {".zip"}, MAX_EVIDENCE_ZIP_UPLOAD_BYTES)
         result = preview_import(
-            xlsx, zip_path, root, identity=identity,
+            xlsx, zip_path, root, identity=identity, review_brief=brief_text,
             trigger_terms=_evidence_trigger_terms(project),
         )
         return ImportPreviewRead(
@@ -763,7 +965,8 @@ async def preview_excel_import(
             tests=[test.__dict__ for test in result.test_cases], errors=result.errors,
             warnings=result.warnings, total_count=result.total_count,
             valid_count=result.valid_count, error_count=result.error_count,
-            test_count=result.test_count, **identity.__dict__,
+            test_count=result.test_count, review_brief=result.review_brief,
+            brief_summary=result.brief_summary, **identity.__dict__,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -776,7 +979,8 @@ def confirm_excel_import_endpoint(
     token: str,
     payload: ImportConfirm,
     session: Session = Depends(get_session),
-    reviewer: Any = Depends(get_audit_reviewer),
+    user: User = Depends(require_user),
+    reviewer: Any = Depends(get_request_audit_reviewer),
 ):
     _validated_tech_project(session, payload.project_id)
     try:
@@ -786,7 +990,10 @@ def confirm_excel_import_endpoint(
             payload.project_id,
             payload.supplier_id,
             payload.batch_name,
+            project_type=payload.project_type,
+            owner_name=payload.owner_name,
             image_llm=getattr(reviewer, "llm", None),
+            uploaded_by_user_id=user.id,
         )
         return BatchDetail(
             **BatchRead.model_validate(batch).model_dump(), content_count=len(batch.content_items),
@@ -831,13 +1038,28 @@ def _batch_with_project(session: Session, batch_id: int) -> Optional[Batch]:
     status_code=202,
     dependencies=[Depends(require_csrf)],
 )
-def start_audit_job(batch_id: int, session: Session = Depends(get_session)):
+def start_audit_job(
+    batch_id: int,
+    user: User = Depends(require_user),
+    session: Session = Depends(get_session),
+):
     batch = _batch_with_project(session, batch_id)
     if batch is None:
         raise _not_found("Batch", batch_id)
-    config = _validated_config(_load_config())
+    config = _validated_config(_config_for_user(user))
     try:
-        result = create_or_get_active_job(session, batch.id, config["model"] or config["reviewer"])
+        job_model = config["model"] or config["reviewer"]
+        try:
+            result = create_or_get_active_job(
+                session,
+                batch.id,
+                job_model,
+                created_by_user_id=user.id,
+            )
+        except TypeError as error:
+            if "created_by_user_id" not in str(error):
+                raise
+            result = create_or_get_active_job(session, batch.id, job_model)
         session.commit()
         job, created = result.job, result.created
         job_id, status = job.id, job.status
@@ -893,8 +1115,11 @@ async def create_batch(
     project_id: int = Form(...),
     supplier_id: str = Form(...),
     name: str = Form(...),
+    project_type: str = Form(""),
+    owner_name: str = Form(""),
     contents: str = Form(...),
     files: Optional[List[UploadFile]] = File(None),
+    user: User = Depends(require_user),
     session: Session = Depends(get_session),
 ):
     rows = await _parse_contents(contents)
@@ -906,6 +1131,9 @@ async def create_batch(
             supplier_id=supplier_id,
             name=name,
             contents=rows,
+            project_type=project_type,
+            owner_name=owner_name or supplier_id,
+            uploaded_by_user_id=user.id,
         )
     except IntegrityError as error:
         session.rollback()
@@ -1049,12 +1277,19 @@ def get_content_test_cases(content_id: int, session: Session = Depends(get_sessi
 @app.post("/api/contents/{content_id}/audit", response_model=AuditDetail)
 def audit_content(
     content_id: int,
+    user: User = Depends(require_user),
     session: Session = Depends(get_session),
-    reviewer: Any = Depends(get_audit_reviewer),
+    reviewer: Any = Depends(get_request_audit_reviewer),
 ):
-    config = _load_config()
+    config = _config_for_user(user)
     try:
-        audit = run_audit(session, content_id, reviewer=reviewer, model=config["model"] or None)
+        audit = run_audit(
+            session,
+            content_id,
+            reviewer=reviewer,
+            model=config["model"] or None,
+            created_by_user_id=user.id,
+        )
     except ValueError as error:
         session.rollback()
         raise _service_error(error) from error
@@ -1064,20 +1299,27 @@ def audit_content(
 @app.post("/api/batches/{batch_id}/audit", response_model=BatchAuditResponse)
 def audit_batch(
     batch_id: int,
+    user: User = Depends(require_user),
     session: Session = Depends(get_session),
-    reviewer: Any = Depends(get_audit_reviewer),
+    reviewer: Any = Depends(get_request_audit_reviewer),
 ):
     batch = session.scalar(
         select(Batch).where(Batch.id == batch_id).options(selectinload(Batch.content_items))
     )
     if batch is None:
         raise _not_found("Batch", batch_id)
-    config = _load_config()
+    config = _config_for_user(user)
     audit_ids = []
     results = []
     for item in batch.content_items:
         try:
-            audit = run_audit(session, item.id, reviewer=reviewer, model=config["model"] or None)
+            audit = run_audit(
+                session,
+                item.id,
+                reviewer=reviewer,
+                model=config["model"] or None,
+                created_by_user_id=user.id,
+            )
         except ValueError as error:
             session.rollback()
             results.append(BatchAuditItemResult(content_id=item.id, status="error", error=str(error)))
@@ -1130,6 +1372,7 @@ def list_review_tasks(
 def resolve_review_task(
     task_id: int,
     payload: TaskResolveInput,
+    user: User = Depends(require_user),
     session: Session = Depends(get_session),
 ):
     try:
@@ -1138,6 +1381,7 @@ def resolve_review_task(
             task_id,
             decision=payload.decision,
             reviewer=payload.reviewer,
+            reviewer_user_id=user.id,
             note=payload.note,
             payload=payload.payload,
         )
@@ -1159,26 +1403,215 @@ def get_report(
 
 
 @app.get("/api/config", response_model=ConfigResponse)
-def get_config():
-    return ConfigResponse(**_load_config(), key_set=bool(os.environ.get("ONEAPI_KEY")))
+def get_config(user: User = Depends(require_user)):
+    config = _config_for_user(user)
+    return ConfigResponse(
+        **config,
+        key_set=bool(user.oneapi_key_ciphertext or os.environ.get("ONEAPI_KEY")),
+    )
 
 
 @app.put("/api/config", response_model=ConfigResponse)
-def put_config(payload: Dict[str, Any]):
-    if set(payload) - set(DEFAULT_CONFIG):
+def put_config(
+    payload: Dict[str, Any],
+    user: User = Depends(require_user),
+    session: Session = Depends(get_session),
+):
+    supported_fields = set(DEFAULT_CONFIG) | {"api_key", "clear_key"}
+    if set(payload) - supported_fields:
         raise HTTPException(status_code=422, detail="Unsupported configuration field")
     try:
         validated = ConfigInput.model_validate(payload)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="Invalid configuration") from error
-    config = _load_config()
-    config.update(validated.model_dump(exclude_none=True))
+    stored_user = session.get(User, user.id)
+    if stored_user is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    config = _config_for_user(stored_user)
+    if validated.reviewer is not None:
+        config["reviewer"] = validated.reviewer
+    if validated.model is not None:
+        config["model"] = validated.model
     try:
         config = _validated_config(config)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="Invalid configuration") from error
-    _save_config(config)
-    return ConfigResponse(**config, key_set=bool(os.environ.get("ONEAPI_KEY")))
+    stored_user.reviewer_backend = config["reviewer"]
+    stored_user.oneapi_model = config["model"]
+    if validated.clear_key:
+        stored_user.oneapi_key_ciphertext = None
+    if validated.api_key is not None:
+        if not validated.api_key:
+            raise HTTPException(status_code=422, detail="Invalid configuration")
+        stored_user.oneapi_key_ciphertext = encrypt_secret(validated.api_key)
+    session.commit()
+    session.refresh(stored_user)
+    return ConfigResponse(
+        **_config_for_user(stored_user),
+        key_set=bool(stored_user.oneapi_key_ciphertext or os.environ.get("ONEAPI_KEY")),
+    )
+
+
+def _parse_dashboard_month(month: Optional[str]) -> str:
+    raw = month or datetime.utcnow().strftime("%Y-%m")
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m")
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="month must use YYYY-MM") from error
+    return parsed.strftime("%Y-%m")
+
+
+def _month_key(value: datetime) -> str:
+    return value.strftime("%Y-%m")
+
+
+@app.get("/api/dashboard/overview", response_model=DashboardOverview)
+def dashboard_overview(
+    month: Optional[str] = None,
+    _user: User = Depends(require_user),
+    session: Session = Depends(get_session),
+):
+    selected_month = _parse_dashboard_month(month)
+    users = list(session.scalars(select(User).order_by(User.id)))
+    workload_counts: Dict[int, Dict[str, int]] = {
+        user.id: {"uploaded_count": 0, "audit_started_count": 0, "human_decision_count": 0}
+        for user in users
+    }
+
+    batches = list(
+        session.scalars(
+            select(Batch)
+            .options(selectinload(Batch.content_items))
+            .order_by(Batch.id)
+        )
+    )
+    for batch in batches:
+        if batch.uploaded_by_user_id in workload_counts and _month_key(batch.created_at) == selected_month:
+            workload_counts[batch.uploaded_by_user_id]["uploaded_count"] += len(batch.content_items)
+
+    audit_runs = list(session.scalars(select(AuditRun)))
+    for audit in audit_runs:
+        if audit.created_by_user_id in workload_counts and _month_key(audit.created_at) == selected_month:
+            workload_counts[audit.created_by_user_id]["audit_started_count"] += 1
+
+    decisions = list(session.scalars(select(HumanDecision)))
+    for decision in decisions:
+        if decision.reviewer_user_id in workload_counts and _month_key(decision.created_at) == selected_month:
+            workload_counts[decision.reviewer_user_id]["human_decision_count"] += 1
+
+    workload = [
+        DashboardWorkloadRow(
+            user_id=user.id,
+            username=user.username,
+            display_name=user.display_name,
+            months=[DashboardMonthMetrics(month=selected_month, **workload_counts[user.id])],
+        )
+        for user in users
+    ]
+
+    monthly_items = list(
+        session.scalars(
+            select(ContentItem)
+            .where(
+                ContentItem.created_at >= datetime.strptime(selected_month, "%Y-%m"),
+                ContentItem.created_at < (
+                    datetime.strptime(selected_month, "%Y-%m") + timedelta(days=32)
+                ).replace(day=1),
+            )
+            .options(selectinload(ContentItem.batch))
+        )
+    )
+    passed_statuses = {ReviewStatus.PASSED, ReviewStatus.PASSED_WITH_SUGGESTIONS}
+    total_count = len(monthly_items)
+    passed_count = sum(1 for item in monthly_items if item.review_status in passed_statuses)
+    batch_quality = []
+    for batch in batches:
+        items = [item for item in monthly_items if item.batch_id == batch.id]
+        if not items:
+            continue
+        batch_passed = sum(1 for item in items if item.review_status in passed_statuses)
+        batch_quality.append(
+            DashboardBatchQuality(
+                batch_id=batch.id,
+                batch_name=batch.name,
+                total_count=len(items),
+                passed_count=batch_passed,
+                pass_rate=round(batch_passed / len(items), 4),
+            )
+        )
+    project_lookup = {project.id: project.name for project in session.scalars(select(Project).order_by(Project.id))}
+    project_quality = []
+    for current_project_id, project_name in project_lookup.items():
+        items = [item for item in monthly_items if item.project_id == current_project_id]
+        if not items:
+            continue
+        project_passed = sum(1 for item in items if item.review_status in passed_statuses)
+        project_quality.append(
+            DashboardProjectQuality(
+                project_id=current_project_id,
+                project_name=project_name,
+                total_count=len(items),
+                passed_count=project_passed,
+                pass_rate=round(project_passed / len(items), 4),
+            )
+        )
+    project_quality.sort(key=lambda item: (-item.total_count, item.project_name))
+
+    issues = list(
+        session.scalars(
+            select(Issue)
+            .where(
+                Issue.created_at >= datetime.strptime(selected_month, "%Y-%m"),
+                Issue.created_at < (
+                    datetime.strptime(selected_month, "%Y-%m") + timedelta(days=32)
+                ).replace(day=1),
+            )
+            .options(selectinload(Issue.audit_run).selectinload(AuditRun.content_item))
+        )
+    )
+    clusters: Dict[str, Dict[str, Any]] = {}
+    for issue in issues:
+        cluster = clusters.setdefault(
+            issue.category,
+            {"issue_count": 0, "high_count": 0, "manuscripts": {}},
+        )
+        cluster["issue_count"] += 1
+        if issue.severity.upper() in {"HIGH", "UNKNOWN"}:
+            cluster["high_count"] += 1
+        item = issue.audit_run.content_item
+        cluster["manuscripts"].setdefault(
+            item.id,
+            DashboardIssueManuscript(
+                content_id=item.id,
+                title=item.title,
+                severity=issue.severity,
+                reason=issue.reason,
+            ),
+        )
+    issue_clusters = [
+        DashboardIssueCluster(
+            category=category,
+            issue_count=payload["issue_count"],
+            manuscript_count=len(payload["manuscripts"]),
+            high_count=payload["high_count"],
+            manuscripts=list(payload["manuscripts"].values())[:8],
+        )
+        for category, payload in clusters.items()
+    ]
+    issue_clusters.sort(key=lambda cluster: (-cluster.issue_count, cluster.category))
+
+    return DashboardOverview(
+        month=selected_month,
+        workload=workload,
+        quality=DashboardQuality(
+            total_count=total_count,
+            passed_count=passed_count,
+            pass_rate=round(passed_count / total_count, 4) if total_count else 0,
+            batches=batch_quality,
+        ),
+        project_quality=project_quality,
+        issue_clusters=issue_clusters,
+    )
 
 
 @app.get("/api/health")

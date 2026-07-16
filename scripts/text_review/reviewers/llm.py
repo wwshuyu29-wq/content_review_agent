@@ -201,9 +201,15 @@ class ErnieLLM:
         return data.get("result", "")
 
 
-def get_llm(backend: str, *, model: str | None = None, vision_model: str | None = None):
+def get_llm(
+    backend: str,
+    *,
+    model: str | None = None,
+    vision_model: str | None = None,
+    api_key: str | None = None,
+):
     if backend == "oneapi":
-        return OpenAICompatLLM(model=model, vision_model=vision_model)
+        return OpenAICompatLLM(model=model, vision_model=vision_model, api_key=api_key)
     if backend == "ernie":
         return ErnieLLM()
     return None

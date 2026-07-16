@@ -44,27 +44,24 @@ _CANONICAL_GLOBAL_FILES = (
     "舆情与素材授权.md",
 )
 _EXPECTED_AGENT_IDS = {
+    "CONTENT_QUALITY",
     "COMPLIANCE",
     "BRAND",
     "PRODUCT_ACCURACY",
-    "TEST_CREDIBILITY",
-    "CONTENT_QUALITY",
     "CAMPAIGN_EFFECTIVENESS",
 }
 _EXPECTED_PRIMARY_PATHS = {
+    "CONTENT_QUALITY": "data/standards/global/内容质量.md",
     "COMPLIANCE": "data/standards/global/合规与广告表达.md",
     "BRAND": "data/standards/global/品牌一致性.md",
     "PRODUCT_ACCURACY": "data/standards/global/内容准确性.md",
-    "TEST_CREDIBILITY": "data/standards/global/实测可信度.md",
-    "CONTENT_QUALITY": "data/standards/global/内容质量.md",
     "CAMPAIGN_EFFECTIVENESS": "data/standards/global/传播有效性.md",
 }
 _EXPECTED_PROMPT_PATHS = {
+    "CONTENT_QUALITY": "prompts/内容质量审核Agent.md",
     "COMPLIANCE": "prompts/合规与广告表达审核Agent.md",
     "BRAND": "prompts/品牌一致性审核Agent.md",
     "PRODUCT_ACCURACY": "prompts/产品功能准确性审核Agent.md",
-    "TEST_CREDIBILITY": "prompts/实测可信度审核Agent.md",
-    "CONTENT_QUALITY": "prompts/内容质量审核Agent.md",
     "CAMPAIGN_EFFECTIVENESS": "prompts/传播有效性审核Agent.md",
 }
 _PUBLIC_PROMPT_LOGICAL_PATH = "prompts/公共审核约束.md"
@@ -139,7 +136,7 @@ def _load_agent_config(repository_root: Path = _REPO_ROOT) -> tuple[dict[str, Ag
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid Agent config: {exc}") from exc
     if set(config.agents) != _EXPECTED_AGENT_IDS:
-        raise ValueError("Agent config must contain the exact six internal Agent IDs")
+        raise ValueError("Agent config must contain the exact active internal Agent IDs")
     if config.public_prompt != _PUBLIC_PROMPT_LOGICAL_PATH:
         raise ValueError("公共Prompt path must be canonical")
     _configured_path(repository_root, config.public_prompt, _PUBLIC_PROMPT_LOGICAL_PATH)

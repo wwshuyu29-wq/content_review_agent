@@ -1,26 +1,25 @@
-"""Structured six-agent protocol for technology media product reviews."""
+"""Structured five-dimension scoring protocol for technology media product reviews."""
 from __future__ import annotations
 
 import json
 from typing import Any, Callable, Mapping, Optional, TYPE_CHECKING
 
-from .base import AgentIssue, AgentReviewResult, EvidenceSpan, allows_unavailable_score
+from .base import AgentIssue, AgentReviewResult, DimensionReviewBatch, EvidenceSpan, allows_unavailable_score
 
 if TYPE_CHECKING:
     from server.services.deterministic_rule_service import ReviewContext
     from server.services.review_profile_service import ReviewProfile
 
 AGENT_ORDER = (
+    "CONTENT_QUALITY",
     "COMPLIANCE",
     "BRAND",
     "PRODUCT_ACCURACY",
-    "TEST_CREDIBILITY",
-    "CONTENT_QUALITY",
     "CAMPAIGN_EFFECTIVENESS",
 )
 AGENT_VERSION = "tech-media-v1"
 
-_SHARED_RULES = """You are a structured technology-media review agent.
+_SHARED_RULES = """You are a structured technology-media content scoring reviewer.
 Distinguish these four evidence classes and never merge them:
 1. official product facts: claims explicitly supported by the supplied project facts or official sources;
 2. actual test observations: what the supplied test cases and evidence manifest record as observed;
@@ -28,7 +27,7 @@ Distinguish these four evidence classes and never merge them:
 4. unsupported industry conclusions: broad market/industry claims without supplied authoritative support.
 Never invent features, results, tests, quotes, assets, sources, or evidence. If the basis for a material conclusion
 is missing, use HUMAN_REVIEW and explain what basis is missing. Do not infer a test result from a product fact or opinion.
-Return exactly one JSON object and no markdown, prose, code fence, or explanation outside that object.
+Return exactly the requested JSON object and no markdown, prose, code fence, or explanation outside that object.
 The object must contain only: agent_id, agent_version, decision, summary, score, confidence, issues.
 Each issue must contain only the fields defined by the issue schema, including an evidence object.
 """
@@ -46,13 +45,10 @@ _AGENT_INSTRUCTIONS = {
         "Check product features and capabilities only against supplied official product facts; pending hotel capabilities or comparisons "
         "require HUMAN_REVIEW. Never infer or invent unknown product behavior."
     ),
-    "TEST_CREDIBILITY": (
-        "Check whether test methodology, observed results, and evidence assets support every test claim; unbound 亲测/实测 claims and "
-        "missing test conditions or boundaries require HUMAN_REVIEW. Use the full version-specific test/evidence context."
-    ),
     "CONTENT_QUALITY": (
-        "Check clarity, structure, completeness, title/body consistency, and readable expression; ad-like unsupported conclusions may "
-        "require NEED_TEXT_FIX. Do not invent factual or semantic findings."
+        "Run the first-pass basic content proofreading before specialist review: catch typos, wrong brand names, punctuation, "
+        "obvious grammar, title/body consistency, duplicate or broken wording, and low-level readability defects. Do not invent "
+        "factual or semantic findings."
     ),
     "CAMPAIGN_EFFECTIVENESS": (
         "Check whether the content communicates the supplied campaign objective and platform requirements. This role is suggestions-only "
@@ -143,9 +139,9 @@ def validate_agent_result(result: Any, expected_agent_id: str, known_references:
 
 
 class TechMediaReviewer:
-    """Runs the fixed six-agent protocol in heuristic or controlled LLM mode."""
+    """Runs the fixed five-dimension scoring protocol in heuristic or controlled LLM mode."""
 
-    name = "tech-media-six-agent-v1"
+    name = "tech-media-five-agent-v1"
 
     def __init__(self, llm=None):
         self.llm = llm
@@ -155,7 +151,6 @@ class TechMediaReviewer:
             "COMPLIANCE": ("COMPLIANCE", "CLAIM", "LEGAL"),
             "BRAND": ("BRAND",),
             "PRODUCT_ACCURACY": ("PRODUCT", "CLAIM", "FACT"),
-            "TEST_CREDIBILITY": ("TEST", "EVIDENCE"),
             "CONTENT_QUALITY": ("CONTENT", "QUALITY"),
             "CAMPAIGN_EFFECTIVENESS": ("CAMPAIGN", "PLATFORM"),
         }[agent_id]
@@ -217,11 +212,11 @@ class TechMediaReviewer:
     def build_prompts(self, context: ReviewContext, profile: ReviewProfile) -> dict[str, str]:
         if self._is_v1(profile):
             if (
-                set(profile.agent_standard_bindings) != set(AGENT_ORDER)
-                or set(profile.agent_prompts) != set(AGENT_ORDER)
+                not set(AGENT_ORDER).issubset(set(profile.agent_standard_bindings))
+                or not set(AGENT_ORDER).issubset(set(profile.agent_prompts))
                 or not profile.public_prompt
             ):
-                raise ValueError("V1 prompt building requires every configured Agent binding and prompt")
+                raise ValueError("V1 prompt building requires every active Agent binding and prompt")
         common = {
             "identity": {
                 "business_domain": profile.business_domain,
@@ -242,7 +237,6 @@ class TechMediaReviewer:
             "COMPLIANCE": "compliance",
             "BRAND": "brand_consistency",
             "PRODUCT_ACCURACY": "content_accuracy",
-            "TEST_CREDIBILITY": "test_credibility",
             "CONTENT_QUALITY": "content_quality",
             "CAMPAIGN_EFFECTIVENESS": "campaign_effectiveness",
         }
@@ -269,12 +263,6 @@ class TechMediaReviewer:
                 "standard": primary_standard("PRODUCT_ACCURACY"),
                 "project_facts": dict(profile.project_facts),
                 **claims,
-            },
-            "TEST_CREDIBILITY": {
-                "standard": primary_standard("TEST_CREDIBILITY"),
-                "evidence_requirements": list(profile.evidence_requirements),
-                "test_cases": list(context.test_cases),
-                "evidence_manifest": list(context.evidence) + list(context.evidence_assets),
             },
             "CONTENT_QUALITY": {
                 "standard": primary_standard("CONTENT_QUALITY"),
@@ -313,6 +301,51 @@ class TechMediaReviewer:
                 + _json(payload)
             )
         return prompts
+
+    def build_scoring_prompt(self, context: ReviewContext, profile: ReviewProfile) -> str:
+        prompts = self.build_prompts(context, profile)
+        dimension_payloads: dict[str, dict[str, Any]] = {}
+        for dimension_id, prompt in prompts.items():
+            marker = "Supplied context (the only permissible basis for findings):\n"
+            _, _, payload_json = prompt.partition(marker)
+            dimension_payloads[dimension_id] = json.loads(payload_json)
+        dimension_descriptions = {
+            "CONTENT_QUALITY": "基础内容校对：错别字、品牌名、语病、重复表达、标题正文一致性。",
+            "COMPLIANCE": "合规表达：绝对化、保证式、无依据宣传主张。",
+            "BRAND": "品牌一致性：产品名、品牌事实、定位和口径一致性。",
+            "PRODUCT_ACCURACY": "产品准确性：功能、能力和未确认口径是否被扩写。",
+            "CAMPAIGN_EFFECTIVENESS": "传播有效性：是否表达清楚项目Brief中的营销点，只给非阻断建议。",
+        }
+        payload = {
+            "dimensions": [
+                {
+                    "dimension_id": dimension_id,
+                    "name": dimension_descriptions[dimension_id],
+                    "instruction": _AGENT_INSTRUCTIONS[dimension_id],
+                    "context": dimension_payloads[dimension_id],
+                }
+                for dimension_id in AGENT_ORDER
+            ],
+            "required_order": list(AGENT_ORDER),
+            "output_contract": {
+                "top_level": "Return one object with key results.",
+                "results": "Array of exactly five dimension result objects in required_order.",
+                "internal_field_note": "Use agent_id and agent_version only as stable internal field names; treat each object as a scoring dimension, not as a separate agent.",
+                "score": "0-100. Higher means the draft is stronger on that dimension.",
+                "campaign_boundary": "CAMPAIGN_EFFECTIVENESS may only return PASS or PASS_WITH_SUGGESTIONS.",
+            },
+        }
+        return (
+            (profile.public_prompt + "\n" if profile.public_prompt else "")
+            + _SHARED_RULES
+            + "\nScore this manuscript once across the five dimensions. Do not split this into separate model tasks.\n"
+            + "Use the batch/project review_brief as the current product-function and marketing-positioning source of truth. "
+            + "Every issue suggestion must be specific to that brief and explain what wording or capability boundary should change.\n"
+            + "Set agent_version exactly to " + AGENT_VERSION + " for every result.\n"
+            + "Use only the exact allowed_source_references values for every non-system issue source_reference.\n"
+            + "Supplied scoring packet:\n"
+            + _json(payload)
+        )
 
     @staticmethod
     def _heuristic(agent_id: str) -> AgentReviewResult:
@@ -414,6 +447,49 @@ class TechMediaReviewer:
             progress_callback("agent_failed", agent_id=agent_id, attempt=3, result=result)
         return result
 
+    def _llm_batch_results(
+        self,
+        prompt: str,
+        profile: ReviewProfile,
+        progress_callback: Optional[Callable[..., None]] = None,
+    ) -> list[AgentReviewResult]:
+        last_error = "no response"
+        if progress_callback is not None:
+            for dimension_id in AGENT_ORDER:
+                progress_callback("agent_started", agent_id=dimension_id, attempt=1)
+        for attempt in range(1, 4):
+            try:
+                if callable(getattr(self.llm, "chat_json", None)):
+                    raw = self.llm.chat_json(prompt, DimensionReviewBatch)
+                else:
+                    raw = self.llm.chat(prompt)
+                data = raw if isinstance(raw, Mapping) else json.loads((raw or "").strip())
+                batch = DimensionReviewBatch.model_validate(data)
+                results: list[AgentReviewResult] = []
+                for result in batch.results:
+                    error = validate_agent_result(result, result.agent_id, set(profile.known_source_references))
+                    results.append(self._unavailable(result.agent_id, error) if error else result)
+            except Exception as exc:  # transport, JSON, and protocol failures all require retry/human review
+                last_error = str(exc)
+                if progress_callback is not None and attempt < 3:
+                    for dimension_id in AGENT_ORDER:
+                        progress_callback("agent_retry", agent_id=dimension_id, attempt=attempt)
+                continue
+            if progress_callback is not None:
+                for result in results:
+                    progress_callback(
+                        "agent_completed",
+                        agent_id=result.agent_id,
+                        attempt=attempt,
+                        result=result,
+                    )
+            return results
+        results = [self._unavailable(dimension_id, last_error) for dimension_id in AGENT_ORDER]
+        if progress_callback is not None:
+            for result in results:
+                progress_callback("agent_failed", agent_id=result.agent_id, attempt=3, result=result)
+        return results
+
     def review_structured(
         self,
         context: ReviewContext,
@@ -431,10 +507,11 @@ class TechMediaReviewer:
                     progress_callback("agent_failed", agent_id=agent_id, attempt=1, result=result)
                 results.append(result)
             return results
-        return [
-            self._llm_result(agent_id, prompts[agent_id], profile, progress_callback)
-            for agent_id in AGENT_ORDER
-        ]
+        return self._llm_batch_results(
+            self.build_scoring_prompt(context, profile),
+            profile,
+            progress_callback,
+        )
 
     def rewrite(self, row: dict, standards) -> tuple[str, str]:
         """Keep compatibility with the legacy workflow without inventing an edit."""

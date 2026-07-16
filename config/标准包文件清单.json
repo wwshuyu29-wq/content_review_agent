@@ -1,7 +1,7 @@
 {
   "版本": "1.0",
   "文件SHA256": {
-    "config/审核Agent配置.json": "c12d313aff7949b886ed8d2cac11c65f700310510b83e9141bde634457c3d115",
+    "config/审核Agent配置.json": "835a3316ef1299e0c77072b53e0b910dfa4dd0bcee9e6a28cb3f2066636711af",
     "data/standards/global/传播有效性.md": "733a19648d0c0b8321dcae6328ced67b20a490a4a4e3df20e09efeb3b92df7b9",
     "data/standards/global/内容准确性.md": "eb93d0c1ddc361e42a3a09e8192eff884dd4ea22bc556da4796644ae60363a44",
     "data/standards/global/内容质量.md": "b6ecb5c7f653236062bb6c9ec65ea78eb0f7f6f3b70bfd9bd60ca2a9ba21de6d",
@@ -18,14 +18,13 @@
     "data/standards/rules/replacement_rules.json": "fe233e9170e6d71940ee82b72bcb7e03cd4dfd72d139a005f89a8b8ae5ae0f48",
     "data/standards/rules/term_dictionary.json": "2f87eec8107f3b0223fe295b23c3be7a86bae12d274978ef4d3e79c5ee11b647",
     "data/standards/schemas/project_standard.schema.json": "748eb6d7df33e5f82149de8a65bcc7953a22eb5b881e07a9381dd04c04a135c7",
-    "data/standards/schemas/review_result.schema.json": "c4fee5ca15e87ba9af49adf683807155e995d35ae961f10ada0266327e543587",
+    "data/standards/schemas/review_result.schema.json": "40c3bab78317021c699a0e6de208b82244701ce164e265fb351c2689073f1aef",
     "data/standards/schemas/test_case.schema.json": "e1fed3c9e65f3e68bf1f1258a9171e945721712e9369f47de2add60071c560ae",
-    "prompts/产品功能准确性审核Agent.md": "899a5cab170cb2c37c29cfe75340d9a37cf96730acae116aef90026cb836e088",
-    "prompts/传播有效性审核Agent.md": "0a0e5bf49cbcbd6024b90ab093cbf8f8cc385981061bfe1bd0a49513a0465291",
-    "prompts/公共审核约束.md": "f7a4170a5af983fe530c5fee3f94c9e26980e0d7cb603b8f466247535ae9ed5a",
-    "prompts/内容质量审核Agent.md": "03e52df5316d85faada44f7d03c30f549c652b6b24893ed324d5422f7b057617",
-    "prompts/合规与广告表达审核Agent.md": "a28e1d6f2715573e8697b1de65e3dfb5f932855961e30faf8fd3f7729f4467c1",
-    "prompts/品牌一致性审核Agent.md": "2cf2dbf282b49a7fa8f164b099ede485e8de11d656a891911fc8a241f9780821",
-    "prompts/实测可信度审核Agent.md": "26a882ce07d67446f3e08383d5401739fb8e7b5427c4520b2927d11ca40a797b"
+    "prompts/产品功能准确性审核Agent.md": "7e1509aa50efebbdbe31edad9da672d401af770bf85518fb9fb1eb89bbffde66",
+    "prompts/传播有效性审核Agent.md": "8e406fbaa802784fb98af1dc4eafc4e3ceb113e4bfdcdde1ded95f5177bc72df",
+    "prompts/公共审核约束.md": "000fc26da2fac91a2ed48e649a05be7ed12e8d106bb2a984d55aa368bb4ef4a1",
+    "prompts/内容质量审核Agent.md": "468441a9eb90f316b499924fc67202f3640434389ecd220e33f087c5af1ff328",
+    "prompts/合规与广告表达审核Agent.md": "b87bd9eb512199030990533a85d9aa4bcee4721d7c5a5e5ff94f3fbf10d0e7ae",
+    "prompts/品牌一致性审核Agent.md": "74321849e146f63a573adc14f344d39a475e293a55050eb39d890c7f1824a46d"
   }
 }

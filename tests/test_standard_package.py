@@ -33,11 +33,10 @@ CANONICAL_GLOBAL_FILES = {
     "舆情与素材授权.md",
 }
 EXPECTED_AGENT_IDS = {
+    "CONTENT_QUALITY",
     "COMPLIANCE",
     "BRAND",
     "PRODUCT_ACCURACY",
-    "TEST_CREDIBILITY",
-    "CONTENT_QUALITY",
     "CAMPAIGN_EFFECTIVENESS",
 }
 
@@ -143,7 +142,7 @@ def test_loader_rejects_invalid_review_result_schema(standards_root: Path) -> No
         lambda schema: schema["$defs"]["AgentIssue"]["properties"]["source_reference"]["items"].update({"type": "integer"}),
         lambda schema: schema["properties"]["confidence"].update({"maximum": 0.5}),
         lambda schema: schema["$defs"]["AgentIssue"]["properties"]["confidence"].update({"minimum": 0.1}),
-        lambda schema: schema["$defs"]["EvidenceSpan"]["properties"]["start"].update({"type": "integer"}),
+        lambda schema: schema["$defs"]["EvidenceSpan"]["properties"]["start"]["anyOf"][0].update({"type": "string"}),
     ],
 )
 def test_loader_rejects_runtime_significant_schema_mutations(standards_root: Path, mutation) -> None:
@@ -157,13 +156,13 @@ def test_loader_rejects_runtime_significant_schema_mutations(standards_root: Pat
         load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
 
 
-def test_agent_standard_config_has_exact_six_unique_global_bindings() -> None:
+def test_agent_standard_config_has_exact_active_unique_global_bindings() -> None:
     bindings = standard_package_service.AGENT_STANDARD_CONFIG
 
     assert set(bindings) == EXPECTED_AGENT_IDS
     global_files = [binding.global_standard for binding in bindings.values()]
-    assert len(global_files) == len(set(global_files)) == 6
-    assert set(global_files) == CANONICAL_GLOBAL_FILES - {"舆情与素材授权.md"}
+    assert len(global_files) == len(set(global_files)) == len(EXPECTED_AGENT_IDS)
+    assert set(global_files) == CANONICAL_GLOBAL_FILES - {"舆情与素材授权.md", "实测可信度.md"}
 
 
 def test_authorization_is_supplemental_only_for_compliance_and_brand() -> None:
@@ -182,12 +181,12 @@ def test_authorization_is_supplemental_only_for_compliance_and_brand() -> None:
     [
         (lambda config: config.update({"额外字段": True}), "extra|额外字段"),
         (lambda config: config.update({"配置版本": "1.1"}), "配置版本"),
-        (lambda config: config["审核Agent"].pop("BRAND"), "exact six"),
+        (lambda config: config["审核Agent"].pop("BRAND"), "exact active"),
         (
             lambda config: config["审核Agent"].update(
                 {"UNKNOWN": config["审核Agent"].pop("BRAND")}
             ),
-            "exact six",
+            "exact active",
         ),
         (
             lambda config: config["审核Agent"]["COMPLIANCE"].update(

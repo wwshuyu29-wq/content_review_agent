@@ -74,10 +74,17 @@ class User(TimestampMixin, Base):
     role: Mapped[str] = mapped_column(String(20), default="REVIEWER", nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     session_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    reviewer_backend: Mapped[Optional[str]] = mapped_column(String(50))
+    oneapi_model: Mapped[Optional[str]] = mapped_column(String(200))
+    oneapi_key_ciphertext: Mapped[Optional[str]] = mapped_column(Text)
 
     sessions: Mapped[List["UserSession"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    uploaded_batches: Mapped[List["Batch"]] = relationship(back_populates="uploaded_by_user")
+    audit_jobs: Mapped[List["BatchAuditJob"]] = relationship(back_populates="created_by_user")
+    audit_runs: Mapped[List["AuditRun"]] = relationship(back_populates="created_by_user")
+    human_decisions: Mapped[List["HumanDecision"]] = relationship(back_populates="reviewer_user")
 
 
 class UserSession(TimestampMixin, Base):
@@ -152,10 +159,15 @@ class Batch(TimestampMixin, Base):
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True, nullable=False)
     supplier_id: Mapped[str] = mapped_column(String(200), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    project_type: Mapped[Optional[str]] = mapped_column(String(200))
+    owner_name: Mapped[Optional[str]] = mapped_column(String(200), index=True)
     status: Mapped[str] = mapped_column(String(50), default="SUBMITTED", nullable=False)
     import_token: Mapped[Optional[str]] = mapped_column(String(128), unique=True)
+    review_brief: Mapped[Optional[str]] = mapped_column(Text)
+    uploaded_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), index=True)
 
     project: Mapped[Project] = relationship(back_populates="batches")
+    uploaded_by_user: Mapped[Optional[User]] = relationship(back_populates="uploaded_batches")
     content_items: Mapped[List["ContentItem"]] = relationship(
         back_populates="batch", cascade="all, delete-orphan"
     )
@@ -218,6 +230,7 @@ class BatchAuditJob(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True, nullable=False)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), index=True)
     active_key: Mapped[Optional[str]] = mapped_column(String(200), unique=True)
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="QUEUED", index=True, nullable=False)
@@ -235,6 +248,7 @@ class BatchAuditJob(TimestampMixin, Base):
     error_summary: Mapped[Optional[str]] = mapped_column(Text)
 
     batch: Mapped[Batch] = relationship(back_populates="audit_jobs")
+    created_by_user: Mapped[Optional[User]] = relationship(back_populates="audit_jobs")
     manuscripts: Mapped[List["ManuscriptAuditJob"]] = relationship(
         back_populates="audit_job",
         cascade="all, delete-orphan",
@@ -363,6 +377,7 @@ class AuditRun(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     content_item_id: Mapped[int] = mapped_column(ForeignKey("content_items.id"), index=True, nullable=False)
+    created_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), index=True)
     content_version_id: Mapped[int] = mapped_column(ForeignKey("content_versions.id"), index=True, nullable=False)
     rule_version_id: Mapped[int] = mapped_column(ForeignKey("rule_versions.id"), index=True, nullable=False)
     review_key: Mapped[Optional[str]] = mapped_column(String(200), unique=True, index=True)
@@ -372,6 +387,7 @@ class AuditRun(TimestampMixin, Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     content_item: Mapped[ContentItem] = relationship(back_populates="audit_runs")
+    created_by_user: Mapped[Optional[User]] = relationship(back_populates="audit_runs")
     content_version: Mapped[ContentVersion] = relationship(back_populates="audit_runs")
     rule_version: Mapped[RuleVersion] = relationship(back_populates="audit_runs")
     agent_results: Mapped[List["AgentResult"]] = relationship(
@@ -491,12 +507,14 @@ class HumanDecision(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     review_task_id: Mapped[int] = mapped_column(ForeignKey("review_tasks.id"), index=True, nullable=False)
+    reviewer_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), index=True)
     decision: Mapped[str] = mapped_column(String(100), nullable=False)
     reviewer: Mapped[str] = mapped_column(String(200), nullable=False)
     note: Mapped[Optional[str]] = mapped_column(Text)
     payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     review_task: Mapped[ReviewTask] = relationship(back_populates="human_decisions")
+    reviewer_user: Mapped[Optional[User]] = relationship(back_populates="human_decisions")
 
 
 def _reject_version_update(mapper, _connection, target) -> None:

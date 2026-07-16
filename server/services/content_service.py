@@ -65,6 +65,10 @@ def submit_batch(
     contents: Sequence[Mapping[str, Any]],
     format_status: FormatStatus | str | None = None,
     import_token: str | None = None,
+    review_brief: str | None = None,
+    project_type: str | None = None,
+    owner_name: str | None = None,
+    uploaded_by_user_id: int | None = None,
     commit: bool = True,
 ) -> Batch:
     project = session.get(Project, project_id)
@@ -73,6 +77,9 @@ def submit_batch(
     if not supplier_id.strip() or not name.strip():
         raise ValueError("supplier_id and name are required")
     normalized_import_token = import_token.strip() if import_token is not None else None
+    normalized_review_brief = review_brief.strip() if isinstance(review_brief, str) and review_brief.strip() else None
+    normalized_project_type = project_type.strip() if isinstance(project_type, str) and project_type.strip() else None
+    normalized_owner_name = owner_name.strip() if isinstance(owner_name, str) and owner_name.strip() else None
     if import_token is not None and not normalized_import_token:
         raise ValueError("import_token cannot be blank")
 
@@ -80,7 +87,11 @@ def submit_batch(
         project=project,
         supplier_id=supplier_id.strip(),
         name=name.strip(),
+        project_type=normalized_project_type,
+        owner_name=normalized_owner_name,
         import_token=normalized_import_token,
+        review_brief=normalized_review_brief,
+        uploaded_by_user_id=uploaded_by_user_id,
     )
     for content in contents:
         explicit_status = content.get("format_status", format_status)

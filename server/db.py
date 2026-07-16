@@ -127,7 +127,23 @@ def ensure_schema_upgrades(engine: Engine) -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_agent_results_audit_agent_version "
                 "ON agent_results (audit_run_id, agent_id, agent_version)"
             )
+        if "users" in table_names:
+            user_columns = {column["name"] for column in database_inspector.get_columns("users")}
+            for column, sql_type in (
+                ("reviewer_backend", "VARCHAR(50)"),
+                ("oneapi_model", "VARCHAR(200)"),
+                ("oneapi_key_ciphertext", "TEXT"),
+            ):
+                if column not in user_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE users ADD COLUMN {column} {sql_type}")
         if "batch_audit_jobs" in table_names:
+            job_columns = {column["name"] for column in database_inspector.get_columns("batch_audit_jobs")}
+            if "created_by_user_id" not in job_columns:
+                connection.exec_driver_sql("ALTER TABLE batch_audit_jobs ADD COLUMN created_by_user_id INTEGER")
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_batch_audit_jobs_created_by_user_id "
+                    "ON batch_audit_jobs (created_by_user_id)"
+                )
             _raise_duplicate_groups(connection, "batch_audit_jobs", ("active_key",))
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_batch_audit_jobs_active_key "
@@ -137,6 +153,12 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             audit_columns = {column["name"] for column in database_inspector.get_columns("audit_runs")}
             if "review_key" not in audit_columns:
                 connection.exec_driver_sql("ALTER TABLE audit_runs ADD COLUMN review_key VARCHAR(200)")
+            if "created_by_user_id" not in audit_columns:
+                connection.exec_driver_sql("ALTER TABLE audit_runs ADD COLUMN created_by_user_id INTEGER")
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_audit_runs_created_by_user_id "
+                    "ON audit_runs (created_by_user_id)"
+                )
             connection.exec_driver_sql("DROP INDEX IF EXISTS ix_audit_runs_content_rule")
             _raise_duplicate_groups(connection, "audit_runs", ("review_key",))
             connection.exec_driver_sql(
@@ -151,6 +173,14 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_review_tasks_task_key ON review_tasks (task_key)"
             )
+        if "human_decisions" in table_names:
+            decision_columns = {column["name"] for column in database_inspector.get_columns("human_decisions")}
+            if "reviewer_user_id" not in decision_columns:
+                connection.exec_driver_sql("ALTER TABLE human_decisions ADD COLUMN reviewer_user_id INTEGER")
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_human_decisions_reviewer_user_id "
+                    "ON human_decisions (reviewer_user_id)"
+                )
 
         if "issues" in table_names:
             issue_columns = {column["name"] for column in database_inspector.get_columns("issues")}
@@ -170,6 +200,22 @@ def ensure_schema_upgrades(engine: Engine) -> None:
             return
 
         batch_columns = {column["name"] for column in database_inspector.get_columns("batches")}
+        if "uploaded_by_user_id" not in batch_columns:
+            connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN uploaded_by_user_id INTEGER")
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_batches_uploaded_by_user_id "
+                "ON batches (uploaded_by_user_id)"
+            )
+        if "project_type" not in batch_columns:
+            connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN project_type VARCHAR(200)")
+        if "owner_name" not in batch_columns:
+            connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN owner_name VARCHAR(200)")
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_batches_owner_name "
+                "ON batches (owner_name)"
+            )
+        if "review_brief" not in batch_columns:
+            connection.exec_driver_sql("ALTER TABLE batches ADD COLUMN review_brief TEXT")
         has_import_token = "import_token" in batch_columns
         has_unique_import_token = _has_unique_import_token(database_inspector)
         if not has_import_token:

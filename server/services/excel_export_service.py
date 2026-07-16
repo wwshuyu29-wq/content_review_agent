@@ -36,12 +36,11 @@ EXPORT_COLUMNS = (
     "规则版本",
     "审核完成时间",
     "测试数量", "证据数量", "证据状态", "测试摘要",
-    "合规 Agent 决策", "合规 Agent 分数", "合规 Agent 摘要",
-    "品牌 Agent 决策", "品牌 Agent 分数", "品牌 Agent 摘要",
-    "产品准确 Agent 决策", "产品准确 Agent 分数", "产品准确 Agent 摘要",
-    "测试可信 Agent 决策", "测试可信 Agent 分数", "测试可信 Agent 摘要",
-    "内容质量 Agent 决策", "内容质量 Agent 分数", "内容质量 Agent 摘要",
-    "传播效果 Agent 决策", "传播效果 Agent 分数", "传播效果 Agent 摘要",
+    "基础校对维度决策", "基础校对维度分数", "基础校对维度摘要",
+    "合规维度决策", "合规维度分数", "合规维度摘要",
+    "品牌维度决策", "品牌维度分数", "品牌维度摘要",
+    "产品准确维度决策", "产品准确维度分数", "产品准确维度摘要",
+    "传播效果维度决策", "传播效果维度分数", "传播效果维度摘要",
 )
 
 _MANUAL_SEVERITIES = {"mid", "medium", "high", "unknown", "critical"}
@@ -145,7 +144,7 @@ def _row_for_item(batch: Batch, item: ContentItem) -> list[Any]:
 
 
 def _agent_results(audit: Optional[AuditRun]) -> list[Any]:
-    wanted = ["COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS"]
+    wanted = ["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS"]
     values = {result.agent_id or result.agent_name: result for result in (audit.agent_results if audit else [])}
     return [values.get(name, _EmptyAgent()) for name in wanted]
 

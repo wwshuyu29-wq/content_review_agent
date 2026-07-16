@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from server import main
 from server.db import create_db_engine
-from scripts.text_review.reviewers.tech_media import TechMediaReviewer
+from scripts.text_review.reviewers.tech_media import AGENT_ORDER, TechMediaReviewer
 from server.models import Asset, BatchAuditJob, ContentItem, Project, ReviewStatus, TestCase as EvidenceTestCase, TestEvidence as EvidenceBinding
 
 
@@ -20,8 +21,8 @@ class FakeReviewer:
 
     def review_structured(self, row, standards):
         agent_ids = [
-            "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-            "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+            "CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY",
+            "CAMPAIGN_EFFECTIVENESS",
         ]
         return [
             {
@@ -187,6 +188,135 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
     assert report.json()["totals"] == {"contents": 1, "issues": 1, "tasks": 0}
     assert report.json()["historical_totals"] == {"issues": 1, "tasks": 1}
     assert report.json()["status_counts"] == {"PASSED": 1}
+
+
+def test_dashboard_overview_groups_team_workload_quality_and_issue_clusters(api) -> None:
+    from server.models import (
+        AgentResult,
+        AuditRun,
+        Batch,
+        ContentVersion,
+        HumanDecision,
+        Issue,
+        ReviewTask,
+        User,
+    )
+    from server.services.auth_service import hash_password
+
+    client, engine, _ = api
+    project = client.get("/api/projects").json()[0]
+    recorded_at = datetime(2026, 7, 8, 10, 0, 0)
+    with Session(engine) as session:
+        admin = session.scalar(select(User).where(User.username == "test-admin"))
+        member = User(
+            username="reviewer-a",
+            display_name="审核同学 A",
+            password_hash=hash_password("reviewer-a password"),
+            role="REVIEWER",
+        )
+        session.add(member)
+        session.flush()
+
+        batch = Batch(
+            project_id=project["id"],
+            supplier_id="internal",
+            name="7 月科技稿件",
+            uploaded_by_user_id=admin.id,
+            created_at=recorded_at,
+            updated_at=recorded_at,
+        )
+        session.add(batch)
+        session.flush()
+        first = ContentItem(
+            project_id=project["id"],
+            batch_id=batch.id,
+            external_id="draft-1",
+            title="内容准确性问题稿件",
+            format_status="PASSED",
+            review_status=ReviewStatus.PASSED,
+            created_at=recorded_at,
+            updated_at=recorded_at,
+        )
+        second = ContentItem(
+            project_id=project["id"],
+            batch_id=batch.id,
+            external_id="draft-2",
+            title="品牌表达问题稿件",
+            format_status="PASSED",
+            review_status=ReviewStatus.HUMAN_REVIEW_REQUIRED,
+            created_at=recorded_at,
+            updated_at=recorded_at,
+        )
+        session.add_all([first, second])
+        session.flush()
+        first_version = ContentVersion(content_item_id=first.id, version=1, source="SUPPLIER", title=first.title, body="正文", payload={})
+        second_version = ContentVersion(content_item_id=second.id, version=1, source="SUPPLIER", title=second.title, body="正文", payload={})
+        session.add_all([first_version, second_version])
+        session.flush()
+        audit = AuditRun(
+            content_item_id=second.id,
+            content_version_id=second_version.id,
+            rule_version_id=project["current_rule_version_id"],
+            model="GPT 5.6 SOL",
+            prompt_version="test",
+            status="COMPLETED",
+            created_by_user_id=member.id,
+            created_at=recorded_at,
+            updated_at=recorded_at,
+        )
+        session.add(audit)
+        session.flush()
+        agent = AgentResult(audit_run_id=audit.id, agent_name="品牌", agent_id="BRAND", agent_version="v1", decision="REJECT", summary="品牌问题", score=60, status="COMPLETED")
+        session.add(agent)
+        session.flush()
+        issue = Issue(
+            audit_run_id=audit.id,
+            agent_result_id=agent.id,
+            rule_id="BRAND-1",
+            category="BRAND",
+            severity="HIGH",
+            field="body",
+            evidence_quote="错误表述",
+            source_reference=[],
+            reason="品牌表达不一致",
+            suggestion="改成标准表述",
+            auto_fixable=False,
+            human_required=True,
+            confidence=0.9,
+            created_at=recorded_at,
+            updated_at=recorded_at,
+        )
+        session.add(issue)
+        session.flush()
+        task = ReviewTask(
+            content_item_id=second.id,
+            target_content_version_id=second_version.id,
+            audit_run_id=audit.id,
+            issue_id=issue.id,
+            task_type="HUMAN_REVIEW",
+            status="CLOSED",
+        )
+        session.add(task)
+        session.flush()
+        session.add(HumanDecision(review_task_id=task.id, decision="HUMAN_REJECT", reviewer="审核同学 A", reviewer_user_id=member.id, payload={}, created_at=recorded_at, updated_at=recorded_at))
+        session.commit()
+
+    response = client.get("/api/dashboard/overview", params={"month": "2026-07"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["month"] == "2026-07"
+    assert payload["quality"]["total_count"] == 2
+    assert payload["quality"]["passed_count"] == 1
+    assert payload["quality"]["pass_rate"] == 0.5
+    assert payload["workload"][0]["display_name"] == "test-admin"
+    assert payload["workload"][0]["months"][0]["uploaded_count"] == 2
+    reviewer_row = next(row for row in payload["workload"] if row["username"] == "reviewer-a")
+    assert reviewer_row["months"][0]["audit_started_count"] == 1
+    assert reviewer_row["months"][0]["human_decision_count"] == 1
+    assert payload["issue_clusters"][0]["category"] == "BRAND"
+    assert payload["issue_clusters"][0]["issue_count"] == 1
+    assert payload["issue_clusters"][0]["manuscripts"][0]["title"] == "品牌表达问题稿件"
 
 
 def test_content_test_cases_endpoint_returns_bound_evidence(api) -> None:
@@ -411,6 +541,8 @@ def test_reviewer_dependency_rejects_invalid_saved_config(
 def test_reviewer_dependency_applies_non_secret_config(
     api, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from server.models import User
+
     client, _, _ = api
     monkeypatch.setenv("ONEAPI_BASE_URL", "https://trusted.example.test/v1")
     client.put(
@@ -418,6 +550,7 @@ def test_reviewer_dependency_applies_non_secret_config(
         json={
             "reviewer": "oneapi",
             "model": "configured-model",
+            "api_key": "configured-key",
         },
     )
     captured = {}
@@ -425,18 +558,20 @@ def test_reviewer_dependency_applies_non_secret_config(
     class FakeLLM:
         name = "oneapi-test"
 
-    def fake_llm_factory(backend):
+    def fake_llm_factory(backend, **kwargs):
         captured.update(
             backend=backend,
-            model=os.environ.get("ONEAPI_MODEL"),
+            model=kwargs.get("model"),
             base_url=os.environ.get("ONEAPI_BASE_URL"),
-            key=os.environ.get("ONEAPI_KEY"),
+            key=kwargs.get("api_key"),
         )
         return FakeLLM()
 
     monkeypatch.setattr(main, "get_llm", fake_llm_factory)
 
-    reviewer = main.get_audit_reviewer()
+    with Session(api[1]) as session:
+        user = session.scalar(select(User).where(User.username == "test-admin"))
+        reviewer = main.get_audit_reviewer_for_user(user)
 
     assert isinstance(reviewer, TechMediaReviewer)
     assert isinstance(reviewer.llm, FakeLLM)
@@ -444,7 +579,7 @@ def test_reviewer_dependency_applies_non_secret_config(
         "backend": "oneapi",
         "model": "configured-model",
         "base_url": "https://trusted.example.test/v1",
-        "key": "test-secret-key",
+        "key": "configured-key",
     }
 
 
@@ -454,7 +589,7 @@ def test_heuristic_dependency_injects_tech_media_reviewer_without_llm(api) -> No
     assert reviewer.llm is None
 
 
-def test_config_never_exposes_or_accepts_oneapi_key(api) -> None:
+def test_config_accepts_api_key_without_exposing_secret_or_legacy_key_fields(api) -> None:
     client, _, _ = api
 
     initial = client.get("/api/config")
@@ -466,14 +601,26 @@ def test_config_never_exposes_or_accepts_oneapi_key(api) -> None:
     updated = client.put(
         "/api/config",
         json={
+            "reviewer": "oneapi",
+            "model": "GPT 5.6 SOL",
+            "api_key": "must-not-be-exposed",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json() == {"reviewer": "oneapi", "model": "GPT 5.6 SOL", "key_set": True}
+    assert "must-not-be-exposed" not in updated.text
+
+    rejected = client.put(
+        "/api/config",
+        json={
             "reviewer": "multi-agent",
             "model": "review-model",
             "base_url": "https://oneapi.example.test",
             "oneapi_key": "must-not-be-stored",
         },
     )
-    assert updated.status_code == 422
-    assert "must-not-be-stored" not in updated.text
+    assert rejected.status_code == 422
+    assert "must-not-be-stored" not in rejected.text
     assert "base_url" not in initial.json()
 
 
@@ -663,7 +810,7 @@ def test_audit_job_endpoints_start_immediately_reuse_and_restore_progress(api, m
     payload = progress.json()
     assert (payload["total_count"], payload["pending_count"], payload["running_count"]) == (2, 2, 0)
     assert [row["position"] for row in payload["manuscripts"]] == [1, 2]
-    assert len(payload["manuscripts"][0]["agents"]) == 6
+    assert len(payload["manuscripts"][0]["agents"]) == len(AGENT_ORDER)
     assert payload["current_agents"] == []
 
 

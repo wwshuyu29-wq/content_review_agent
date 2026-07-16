@@ -54,6 +54,7 @@ MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_XLSX_ENTRIES = 2000
 MAX_XLSX_ENTRY_BYTES = 50 * 1024 * 1024
 MAX_XLSX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+MAX_REVIEW_BRIEF_LENGTH = 10_000
 DEFAULT_EVIDENCE_TRIGGER_TERMS = ("亲测", "实测", "自用")
 PREVIEW_TTL = timedelta(hours=2)
 PREVIEW_MANIFEST_VERSION = 3
@@ -95,7 +96,8 @@ _PREVIEW_KEYS = frozenset(
         "test_cases",
         "errors",
         "project_id", "project_code", "content_type", "package_version",
-        "supplier_id", "batch_name",
+        "supplier_id", "batch_name", "project_type", "owner_name",
+        "review_brief", "brief_summary",
     }
 )
 _ROW_KEYS = frozenset({"manuscript_index", "row_number", "normalized", "errors", "warnings", "valid", "tests"})
@@ -110,6 +112,8 @@ class PreviewIdentity:
     package_version: str
     supplier_id: str
     batch_name: str
+    project_type: str
+    owner_name: str
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,8 @@ class ImportPreview:
     total_count: int
     valid_count: int
     error_count: int
+    review_brief: str
+    brief_summary: str
     test_cases: List[TestCasePreview] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     identity: Optional[PreviewIdentity] = None
@@ -183,6 +189,7 @@ def preview_import(
     zip_path: Optional[Path],
     temp_root: Path,
     *,
+    review_brief: str = "测试批次 Brief",
     trigger_terms: Tuple[str, ...] = DEFAULT_EVIDENCE_TRIGGER_TERMS,
     identity: Optional[PreviewIdentity] = None,
 ) -> ImportPreview:
@@ -194,6 +201,7 @@ def preview_import(
 
     try:
         preview_dir.mkdir(parents=True, exist_ok=False)
+        brief = _normalize_review_brief(review_brief)
         rows, test_cases = _read_workbook(xlsx_path)
         warnings: List[str] = []
         zip_entries: Dict[str, ZipInfo] = {}
@@ -220,6 +228,8 @@ def preview_import(
             total_count=len(rows),
             valid_count=valid_count,
             error_count=len(rows) - valid_count + len(preview_errors),
+            review_brief=brief,
+            brief_summary=_brief_summary(brief),
             test_cases=test_cases,
             errors=preview_errors,
             identity=identity,
@@ -279,7 +289,10 @@ def confirm_import(
     supplier_id: str,
     batch_name: str,
     *,
+    project_type: str | None = None,
+    owner_name: str | None = None,
     image_llm: Any = None,
+    uploaded_by_user_id: int | None = None,
 ) -> Batch:
     if not isinstance(token, str) or not _TOKEN_PATTERN.fullmatch(token):
         raise ValueError("无效的导入 token")
@@ -290,7 +303,11 @@ def confirm_import(
             version.payload.get("preview_identity")
             for item in existing.content_items for version in item.versions[:1]
         )
-        if identity_bound and (existing.project_id, existing.supplier_id, existing.name) != (project_id, supplier_id, batch_name):
+        normalized_project_type = project_type.strip() if isinstance(project_type, str) and project_type.strip() else existing.project_type
+        normalized_owner_name = owner_name.strip() if isinstance(owner_name, str) and owner_name.strip() else existing.owner_name
+        if identity_bound and (
+            existing.project_id, existing.supplier_id, existing.name, existing.project_type, existing.owner_name,
+        ) != (project_id, supplier_id, batch_name, normalized_project_type, normalized_owner_name):
             raise ValueError("导入确认信息与原批次身份不匹配")
         return existing
 
@@ -309,10 +326,20 @@ def confirm_import(
             raise ValueError(f"Project {project_id} does not exist")
         expected = preview.identity
         current_package = project.current_rule_version.package_version if project.current_rule_version else None
-        actual = (project_id, project.code, project.content_type, current_package, supplier_id, batch_name)
-        bound = (expected.project_id, expected.project_code, expected.content_type, expected.package_version, expected.supplier_id, expected.batch_name)
+        normalized_project_type = (project_type or project.name or "").strip()
+        normalized_owner_name = (owner_name or supplier_id).strip()
+        actual = (
+            project_id, project.code, project.content_type, current_package,
+            supplier_id, batch_name, normalized_project_type, normalized_owner_name,
+        )
+        bound = (
+            expected.project_id, expected.project_code, expected.content_type, expected.package_version,
+            expected.supplier_id, expected.batch_name, expected.project_type, expected.owner_name,
+        )
         if actual != bound:
             raise ValueError("导入确认信息与预览身份不匹配")
+    confirmed_project_type = preview.identity.project_type if preview.identity is not None else project_type
+    confirmed_owner_name = preview.identity.owner_name if preview.identity is not None else owner_name
 
     saved_paths: List[Path] = []
     commit_completed = False
@@ -325,6 +352,10 @@ def confirm_import(
             name=batch_name,
             contents=contents,
             import_token=token,
+            review_brief=preview.review_brief,
+            project_type=confirmed_project_type,
+            owner_name=confirmed_owner_name,
+            uploaded_by_user_id=uploaded_by_user_id,
             commit=False,
         )
         _create_confirmed_media_assets(session, batch, image_llm)
@@ -337,7 +368,9 @@ def confirm_import(
             _delete_saved_paths(saved_paths)
             existing = session.scalar(select(Batch).where(Batch.import_token == token))
             if existing is not None:
-                if preview.identity is not None and (existing.project_id, existing.supplier_id, existing.name) != (project_id, supplier_id, batch_name):
+                if preview.identity is not None and (
+                    existing.project_id, existing.supplier_id, existing.name, existing.project_type, existing.owner_name,
+                ) != (project_id, supplier_id, batch_name, preview.identity.project_type, preview.identity.owner_name):
                     raise ValueError("并发导入批次身份与预览不匹配")
                 return existing
         raise
@@ -1190,7 +1223,7 @@ def _write_preview(path: Path, preview: ImportPreview, expires_at: datetime) -> 
     payload["expires_at"] = expires_at.isoformat()
     payload["test_cases"] = [_test_to_dict(test) for test in (preview.test_cases or [])]
     identity = preview.identity
-    for key in ("project_id", "project_code", "content_type", "package_version", "supplier_id", "batch_name"):
+    for key in ("project_id", "project_code", "content_type", "package_version", "supplier_id", "batch_name", "project_type", "owner_name"):
         payload[key] = getattr(identity, key) if identity is not None else None
     _write_json_atomic(path, payload)
 
@@ -1205,6 +1238,22 @@ def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _normalize_review_brief(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Brief 内容无效")
+    normalized = "\n".join(line.rstrip() for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip()
+    if not normalized:
+        raise ValueError("请上传或填写本批次 Brief")
+    if len(normalized) > MAX_REVIEW_BRIEF_LENGTH:
+        raise ValueError("Brief 不能超过 10000 个字符")
+    return normalized
+
+
+def _brief_summary(value: str) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    return compact[:160] + ("…" if len(compact) > 160 else "")
 
 
 def _preview_to_dict(preview: ImportPreview) -> Dict[str, Any]:
@@ -1222,7 +1271,7 @@ def _test_from_dict(value: Any) -> TestCasePreview:
     return TestCasePreview(**value)
 
 def _preview_identity_from_dict(payload: Dict[str, Any]) -> Optional[PreviewIdentity]:
-    keys = ("project_id", "project_code", "content_type", "package_version", "supplier_id", "batch_name")
+    keys = ("project_id", "project_code", "content_type", "package_version", "supplier_id", "batch_name", "project_type", "owner_name")
     values = [payload[key] for key in keys]
     if all(value is None for value in values):
         return None
@@ -1247,6 +1296,12 @@ def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime
         raise ValueError("预览测试场景数量无效")
     if not _is_string_list(payload["warnings"]) or not _is_string_list(payload["errors"]):
         raise ValueError("预览消息无效")
+    if not isinstance(payload["review_brief"], str) or not payload["review_brief"].strip():
+        raise ValueError("预览 Brief 无效")
+    if len(payload["review_brief"]) > MAX_REVIEW_BRIEF_LENGTH:
+        raise ValueError("预览 Brief 超出长度限制")
+    if not isinstance(payload["brief_summary"], str):
+        raise ValueError("预览 Brief 摘要无效")
 
     rows = [_row_from_dict(row) for row in payload["rows"]]
     tests = [_test_from_dict(item) for item in payload["test_cases"]]
@@ -1288,7 +1343,8 @@ def _preview_from_dict(payload: Dict[str, Any]) -> Tuple[ImportPreview, datetime
     return ImportPreview(
         token=payload["token"], rows=rows, warnings=list(payload["warnings"]),
         total_count=expected_counts[0], valid_count=expected_counts[1],
-        error_count=expected_counts[2], test_cases=tests,
+        error_count=expected_counts[2], review_brief=payload["review_brief"],
+        brief_summary=payload["brief_summary"], test_cases=tests,
         errors=list(payload["errors"]), identity=_preview_identity_from_dict(payload),
     ), expires_at
 

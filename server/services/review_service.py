@@ -381,6 +381,7 @@ def run_audit(
     *,
     reviewer: Any = None,
     model: Optional[str] = None,
+    created_by_user_id: Optional[int] = None,
     progress_callback: Optional[Callable[..., None]] = None,
 ) -> AuditRun:
     item = session.get(ContentItem, content_item_id)
@@ -435,6 +436,17 @@ def run_audit(
         raise ValueError("Content has open review tasks; resolve them before re-audit")
     standards = _standards_from_rule_version(rule_version)
     profile = get_review_profile(rule_version)
+    review_brief = item.batch.review_brief or item.project.description
+    if review_brief:
+        profile = profile.model_copy(
+            update={
+                "project_facts": {
+                    **dict(profile.project_facts),
+                    "review_brief": review_brief,
+                    "batch_review_brief": item.batch.review_brief or "",
+                }
+            }
+        )
     reviewer = reviewer or TechMediaReviewer()
     row = {
         schema.COL_ID: item.external_id,
@@ -450,6 +462,7 @@ def run_audit(
         model=model or getattr(reviewer, "name", reviewer.__class__.__name__),
         prompt_version=rule_version.prompt_version,
         status="RUNNING",
+        created_by_user_id=created_by_user_id,
     )
     item.review_status = ReviewStatus.AI_REVIEWING
     item.publish_status = PublishStatus.NOT_READY
@@ -682,6 +695,7 @@ def resolve_task(
     *,
     decision: str,
     reviewer: str,
+    reviewer_user_id: Optional[int] = None,
     note: Optional[str] = None,
     payload: Optional[Mapping[str, Any]] = None,
 ) -> HumanDecision:
@@ -758,6 +772,7 @@ def resolve_task(
         review_task=task,
         decision=decision,
         reviewer=reviewer.strip(),
+        reviewer_user_id=reviewer_user_id,
         note=note,
         payload=payload,
     )

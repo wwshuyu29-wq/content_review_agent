@@ -1,4 +1,4 @@
-"""维度子 agent 基类与通用工具。"""
+"""评分维度结果模型与通用工具。"""
 from __future__ import annotations
 
 import json
@@ -52,8 +52,8 @@ class AgentReviewResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     agent_id: Literal[
-        "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY",
-        "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+        "CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY",
+        "CAMPAIGN_EFFECTIVENESS",
     ]
     agent_version: str
     decision: Literal["PASS", "PASS_WITH_SUGGESTIONS", "NEED_TEXT_FIX", "HUMAN_REVIEW", "BLOCK"]
@@ -66,6 +66,20 @@ class AgentReviewResult(BaseModel):
     def require_score_for_model_results(self) -> "AgentReviewResult":
         if self.score is None and not allows_unavailable_score(self.decision, self.issues):
             raise ValueError("score may be null only for unavailable system results")
+        return self
+
+
+class DimensionReviewBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    results: list[AgentReviewResult]
+
+    @model_validator(mode="after")
+    def require_complete_dimension_set(self) -> "DimensionReviewBatch":
+        expected = tuple(get_args(AgentReviewResult.model_fields["agent_id"].annotation))
+        actual = tuple(result.agent_id for result in self.results)
+        if actual != expected:
+            raise ValueError(f"results must contain the five scoring dimensions in order: {expected}")
         return self
 
 

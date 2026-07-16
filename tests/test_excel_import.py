@@ -758,6 +758,7 @@ def test_preview_identity_round_trips_and_is_strict(tmp_path: Path) -> None:
     identity = identity_type(
         project_id=1, project_code="tech", content_type="TECH_MEDIA_REVIEW",
         package_version="0.9", supplier_id="supplier", batch_name="batch",
+        project_type="科技媒体测评", owner_name="supplier",
     )
     xlsx = write_named_workbook(tmp_path / "identity.xlsx", [tech_row("content-1")], [])
     preview = preview_import(xlsx, None, tmp_path / "previews", identity=identity)

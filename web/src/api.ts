@@ -11,11 +11,11 @@ export type ReviewStatus =
   | "BLOCKED"
   | "REJECTED";
 export type PublishStatus = "NOT_READY" | "READY" | "PUBLISHED";
-export type AgentId = "COMPLIANCE" | "BRAND" | "PRODUCT_ACCURACY" | "TEST_CREDIBILITY" | "CONTENT_QUALITY" | "CAMPAIGN_EFFECTIVENESS";
+export type AgentId = "CONTENT_QUALITY" | "COMPLIANCE" | "BRAND" | "PRODUCT_ACCURACY" | "CAMPAIGN_EFFECTIVENESS";
 export type EvidenceStatus = "PRESENT" | "MISSING" | "NONE";
 
 export const AGENT_ORDER: AgentId[] = [
-  "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "TEST_CREDIBILITY", "CONTENT_QUALITY", "CAMPAIGN_EFFECTIVENESS",
+  "CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS",
 ];
 
 export interface Project {
@@ -56,7 +56,10 @@ export interface Batch {
   project_id: number;
   supplier_id: string;
   name: string;
+  project_type: string | null;
+  owner_name: string | null;
   status: string;
+  review_brief: string | null;
   created_at: string;
 }
 
@@ -253,6 +256,10 @@ export interface ImportPreview {
   package_version: string;
   supplier_id: string;
   batch_name: string;
+  project_type: string;
+  owner_name: string;
+  review_brief: string;
+  brief_summary: string;
 }
 
 export interface ContentTableRow {
@@ -313,6 +320,20 @@ export interface ReportData {
 }
 
 export interface Config { reviewer: string; model: string; key_set: boolean; }
+export interface DashboardMonthMetrics { month: string; uploaded_count: number; audit_started_count: number; human_decision_count: number; }
+export interface DashboardWorkloadRow { user_id: number; username: string; display_name: string; months: DashboardMonthMetrics[]; }
+export interface DashboardBatchQuality { batch_id: number; batch_name: string; total_count: number; passed_count: number; pass_rate: number; }
+export interface DashboardQuality { total_count: number; passed_count: number; pass_rate: number; batches: DashboardBatchQuality[]; }
+export interface DashboardProjectQuality { project_id: number; project_name: string; total_count: number; passed_count: number; pass_rate: number; }
+export interface DashboardIssueManuscript { content_id: number; title: string; severity: string; reason: string; }
+export interface DashboardIssueCluster { category: string; issue_count: number; manuscript_count: number; high_count: number; manuscripts: DashboardIssueManuscript[]; }
+export interface DashboardOverview {
+  month: string;
+  workload: DashboardWorkloadRow[];
+  quality: DashboardQuality;
+  project_quality: DashboardProjectQuality[];
+  issue_clusters: DashboardIssueCluster[];
+}
 
 export interface AuthUser {
   id: number;
@@ -411,7 +432,7 @@ function handleUnauthorized(): void {
 function buildInit(init?: RequestInit): RequestInit {
   const method = (init?.method || "GET").toUpperCase();
   const headers = new Headers(init?.headers);
-  if ((method === "POST" || method === "PUT" || method === "DELETE") && csrfToken) {
+  if ((method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") && csrfToken) {
     headers.set("X-CSRF-Token", csrfToken);
   }
   return { ...init, headers, credentials: "include" as RequestCredentials };
@@ -478,7 +499,7 @@ async function requestBlob(url: string, init?: RequestInit): Promise<Blob> {
   throw new Error(normalizeApiError(response.status, await errorDetail(response)));
 }
 
-function jsonRequest(method: "POST" | "PUT", body: unknown): RequestInit {
+function jsonRequest(method: "POST" | "PUT" | "PATCH", body: unknown): RequestInit {
   return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
 }
 
@@ -498,11 +519,13 @@ export const api = {
   logout: (): Promise<void> => requestVoid("/api/auth/logout", { method: "POST" }),
   projects: (): Promise<Project[]> => request("/api/projects"),
   project: (id: number): Promise<ProjectDetail> => request(`/api/projects/${id}`),
+  updateProjectBrief: (id: number, description: string): Promise<Project> =>
+    request(`/api/projects/${id}/brief`, jsonRequest("PATCH", { description })),
   batches: (projectId?: number, signal?: AbortSignal): Promise<Batch[]> => request(`/api/batches${query({ project_id: projectId })}`, { signal }),
   createBatch: (body: FormData): Promise<BatchDetail> => request("/api/batches", { method: "POST", body }),
   importTemplate: (): Promise<Blob> => requestBlob("/api/import-template"),
   previewImport: (body: FormData): Promise<ImportPreview> => request("/api/imports/preview", { method: "POST", body }),
-  confirmImport: (token: string, body: { project_id: number; supplier_id: string; batch_name: string }): Promise<BatchDetail> =>
+  confirmImport: (token: string, body: { project_id: number; supplier_id: string; batch_name: string; project_type?: string; owner_name?: string }): Promise<BatchDetail> =>
     request(`/api/imports/${encodeURIComponent(token)}/confirm`, jsonRequest("POST", body)),
   exportBatch: (batchId: number): Promise<Blob> => requestBlob(`/api/batches/${batchId}/export`),
   contents: (filters: Pick<ContentFilters, "project_id" | "batch_id" | "review_status">): Promise<ContentSummary[]> =>
@@ -524,5 +547,6 @@ export const api = {
   publishPackage: (projectId: number, body: { project_code: string; package_version: string }): Promise<RuleVersion> =>
     request(`/api/projects/${projectId}/rule-versions`, jsonRequest("POST", body)),
   config: (): Promise<Config> => request("/api/config"),
-  saveConfig: (body: Partial<Pick<Config, "reviewer" | "model">>): Promise<Config> => request("/api/config", jsonRequest("PUT", body)),
+  saveConfig: (body: Partial<Pick<Config, "reviewer" | "model">> & { api_key?: string; clear_key?: boolean }): Promise<Config> => request("/api/config", jsonRequest("PUT", body)),
+  dashboardOverview: (month?: string): Promise<DashboardOverview> => request(`/api/dashboard/overview${query({ month })}`),
 };
