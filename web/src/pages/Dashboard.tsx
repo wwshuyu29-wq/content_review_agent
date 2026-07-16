@@ -77,10 +77,14 @@ export default function Dashboard() {
           </section>
 
           <div className="dashboard-grid">
-            <WorkloadChart rows={overview.workload} />
-            <ApiSetupCard config={config} onSaved={setConfig} />
-            <QualityPanel quality={overview.quality} />
-            <ProjectQualityPanel projects={overview.project_quality} />
+            <div className="dashboard-main-column">
+              <WorkloadChart rows={overview.workload} />
+              <QualityPanel quality={overview.quality} />
+            </div>
+            <div className="dashboard-side-column">
+              <ApiSetupCard config={config} onSaved={setConfig} />
+              <ProjectQualityPanel projects={overview.project_quality} />
+            </div>
             <IssueClusterPanel clusters={overview.issue_clusters} />
           </div>
         </>

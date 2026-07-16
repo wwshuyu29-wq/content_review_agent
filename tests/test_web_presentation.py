@@ -90,11 +90,15 @@ def test_review_filters_are_compact_without_search_or_blue_top_rule() -> None:
 
 
 def test_dashboard_grid_removes_dead_middle_air() -> None:
+    dashboard = (WEB / "pages" / "Dashboard.tsx").read_text(encoding="utf-8")
     styles = (WEB / "styles.css").read_text(encoding="utf-8")
 
+    assert "dashboard-main-column" in dashboard
+    assert "dashboard-side-column" in dashboard
     assert "dashboard-grid-compact-pass" in styles
     assert "grid-template-columns: minmax(0, 1.3fr) minmax(340px, .7fr)" in styles
-    assert "grid-auto-flow: dense" in styles
+    assert ".dashboard-main-column" in styles
+    assert ".dashboard-side-column" in styles
     assert "min-height: 0" in styles
 
 

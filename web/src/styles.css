@@ -665,25 +665,14 @@ input:focus, textarea:focus, select:focus {
 /* dashboard-grid-compact-pass: remove the empty middle band by letting short right-column cards backfill. */
 .dashboard-grid {
   grid-template-columns: minmax(0, 1.3fr) minmax(340px, .7fr);
-  grid-auto-flow: dense;
   align-items: start;
 }
 
-.dashboard-panel {
+.dashboard-main-column,
+.dashboard-side-column {
+  display: grid;
+  gap: 14px;
   min-height: 0;
-}
-
-.workload-panel {
-  grid-column: 1;
-}
-
-.api-setup-panel,
-.project-quality-panel {
-  grid-column: 2;
-}
-
-.quality-panel {
-  grid-column: 1;
 }
 
 .issue-cluster-panel {
