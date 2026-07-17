@@ -22,6 +22,7 @@ from server.models import (
     ContentItem,
     ManuscriptAuditJob,
     Project,
+    ReviewStatus,
 )
 from server.seed import seed_default_project
 from server.services.content_service import submit_batch
@@ -307,6 +308,37 @@ class PassingReviewer:
         ]
 
 
+class BulkPassingReviewer(TechMediaReviewer):
+    name = "bulk-passing-worker-reviewer"
+
+    def __init__(self):
+        super().__init__(llm=object())
+        self.batch_calls = 0
+        self.single_calls = 0
+
+    def review_structured(self, _row, _standards):
+        self.single_calls += 1
+        return PassingReviewer().review_structured(_row, _standards)
+
+    def review_manuscript_batch_structured(self, manuscripts, _profile):
+        self.batch_calls += 1
+        return {
+            int(manuscript["content_item_id"]): [
+                AgentReviewResult(
+                    agent_id=agent_id,
+                    agent_version="tech-media-v1",
+                    decision="PASS",
+                    summary="通过",
+                    score=90,
+                    confidence=0.9,
+                    issues=[],
+                )
+                for agent_id in AGENT_ORDER
+            ]
+            for manuscript in manuscripts
+        }
+
+
 def test_submit_audit_job_submits_only_integer_job_id(monkeypatch: pytest.MonkeyPatch) -> None:
     from server.services import audit_executor_service
 
@@ -570,6 +602,45 @@ def test_worker_skips_when_any_valid_audit_precedes_newer_invalid_history_withou
             assert session.get(AuditRun, newer_id).status == (
                 "COMPLETED" if newer_history == "UNAVAILABLE" else newer_history
             )
+    finally:
+        reset_db_resources()
+
+
+def test_worker_uses_single_bulk_model_call_for_auditable_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import reset_db_resources
+    from server.services.audit_executor_service import run_audit_job
+
+    engine = configure_worker_database(tmp_path, monkeypatch)
+    reviewer = BulkPassingReviewer()
+
+    with Session(engine) as session:
+        batch = create_auditable_batch(session, item_count=3)
+        job = create_or_get_active_job(session, batch.id, "model")
+        session.commit()
+        job_id = job.id
+
+    try:
+        run_audit_job(job_id, lambda: reviewer)
+        with Session(engine) as session:
+            job = session.get(BatchAuditJob, job_id)
+            manuscripts = list(session.scalars(
+                select(ManuscriptAuditJob)
+                .where(ManuscriptAuditJob.audit_job_id == job_id)
+                .order_by(ManuscriptAuditJob.position)
+            ))
+            agents = list(session.scalars(select(AgentAuditProgress)))
+            assert reviewer.batch_calls == 1
+            assert reviewer.single_calls == 0
+            assert job.status == "COMPLETED"
+            assert job.completed_count == 3
+            assert job.failed_count == 0
+            assert job.active_key is None
+            assert [manuscript.status for manuscript in manuscripts] == ["COMPLETED"] * 3
+            assert all(agent.status == "COMPLETED" for agent in agents)
+            assert len(list(session.scalars(select(AuditRun)))) == 3
+            assert all(item.review_status is ReviewStatus.PASSED for item in session.scalars(select(ContentItem)))
     finally:
         reset_db_resources()
 

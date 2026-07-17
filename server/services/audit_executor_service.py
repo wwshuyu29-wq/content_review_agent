@@ -15,13 +15,14 @@ from server.db import get_db_engine
 from server.models import (
     AgentAuditProgress,
     AuditRun,
+    Batch,
     BatchAuditJob,
     ContentItem,
     ManuscriptAuditJob,
     PublishStatus,
     ReviewStatus,
 )
-from server.services.review_service import has_valid_completed_audit, run_audit
+from server.services.review_service import has_valid_completed_audit, run_audit, run_batch_audit_once
 
 _PUBLIC_ERROR = "审核过程中出现异常，请稍后重试或联系管理员。"
 _MAX_WORKERS = max(1, int(os.environ.get("AUDIT_EXECUTOR_MAX_WORKERS", "1")))
@@ -111,6 +112,131 @@ def _release_partial_audit(session: Session, content_item_id: int) -> None:
         item.publish_status = PublishStatus.NOT_READY
 
 
+def _complete_agent_progress_from_audit(manuscript: ManuscriptAuditJob, audit: AuditRun, now: datetime) -> None:
+    agent_results = {result.agent_id: result for result in audit.agent_results if result.agent_id}
+    for agent in manuscript.agents:
+        result = agent_results.get(agent.agent_id)
+        agent.status = "COMPLETED"
+        agent.attempt_count = max(agent.attempt_count, 1)
+        agent.started_at = agent.started_at or manuscript.started_at or now
+        agent.completed_at = now
+        if agent.started_at is not None:
+            agent.duration_ms = max(0, int((now - agent.started_at).total_seconds() * 1000))
+        if result is not None:
+            agent.decision = result.decision
+            agent.score = result.score
+        agent.error_summary = None
+
+
+def _mark_manuscript_skipped(manuscript: ManuscriptAuditJob, now: datetime, reason: str | None = None) -> None:
+    manuscript.status = "SKIPPED"
+    manuscript.started_at = manuscript.started_at or now
+    manuscript.completed_at = now
+    manuscript.error_summary = reason
+
+
+def _mark_manuscript_failed(manuscript: ManuscriptAuditJob, now: datetime, reason: str | None = None) -> None:
+    manuscript.status = "FAILED"
+    manuscript.started_at = manuscript.started_at or now
+    manuscript.completed_at = now
+    manuscript.error_summary = reason or _PUBLIC_ERROR
+    for agent in manuscript.agents:
+        agent.status = "FAILED"
+        agent.attempt_count = max(agent.attempt_count, 1)
+        agent.started_at = agent.started_at or manuscript.started_at or now
+        agent.completed_at = now
+        if agent.started_at is not None:
+            agent.duration_ms = max(0, int((now - agent.started_at).total_seconds() * 1000))
+        agent.error_summary = _PUBLIC_ERROR
+
+
+def _should_skip_bulk_error(message: str) -> bool:
+    return any(fragment in message for fragment in (
+        "Only content with PASSED format status can be audited",
+        "Content version has already been audited",
+        "Content has open review tasks",
+    ))
+
+
+def _try_run_bulk_audit_job(session: Session, job: BatchAuditJob, reviewer: Any) -> bool:
+    """Run a whole batch with one model request when the reviewer supports it."""
+    batch = session.get(Batch, job.batch_id)
+    if batch is None:
+        return False
+    if not isinstance(reviewer, TechMediaReviewer) or not callable(getattr(reviewer, "review_manuscript_batch_structured", None)):
+        return False
+    pending_manuscripts = [row for row in job.manuscripts if row.status not in {"COMPLETED", "SKIPPED"}]
+    if len(pending_manuscripts) <= 1:
+        return False
+
+    now = datetime.utcnow()
+    for manuscript in pending_manuscripts:
+        manuscript.status = "RUNNING"
+        manuscript.started_at = manuscript.started_at or now
+        manuscript.completed_at = None
+        manuscript.error_summary = None
+    job.current_content_item_id = pending_manuscripts[0].content_item_id if pending_manuscripts else None
+    job.current_agent_id = None
+    job.heartbeat_at = now
+    session.commit()
+
+    result = run_batch_audit_once(
+        session,
+        batch,
+        reviewer=reviewer,
+        model=job.model,
+        created_by_user_id=job.created_by_user_id,
+    )
+    if result is None:
+        session.rollback()
+        job = _load_job(session, job.id)
+        if job is not None:
+            for manuscript in job.manuscripts:
+                if manuscript.status == "RUNNING":
+                    manuscript.status = "PENDING"
+                    manuscript.completed_at = None
+            job.current_content_item_id = None
+            job.current_agent_id = None
+            job.heartbeat_at = datetime.utcnow()
+            session.commit()
+        return False
+
+    audits, errors = result
+    job = _load_job(session, job.id)
+    if job is None:
+        return True
+    now = datetime.utcnow()
+    audits_by_content_id = {audit.content_item_id: audit for audit in audits}
+    errors_by_content_id = {content_id: message for content_id, message in errors}
+    for manuscript in job.manuscripts:
+        audit = audits_by_content_id.get(manuscript.content_item_id)
+        if audit is not None:
+            manuscript.status = "COMPLETED"
+            manuscript.completed_at = now
+            manuscript.error_summary = None
+            _complete_agent_progress_from_audit(manuscript, audit, now)
+            continue
+        error = errors_by_content_id.get(manuscript.content_item_id)
+        if error:
+            if _should_skip_bulk_error(error):
+                _mark_manuscript_skipped(manuscript, now, None)
+            else:
+                _release_partial_audit(session, manuscript.content_item_id)
+                _mark_manuscript_failed(manuscript, now, _safe_error(RuntimeError(error)))
+
+    _update_counters(job)
+    job.status = "COMPLETED_WITH_ERRORS" if job.failed_count else "COMPLETED"
+    job.active_key = None
+    job.current_content_item_id = None
+    job.current_agent_id = None
+    job.completed_at = now
+    job.heartbeat_at = now
+    if job.failed_count:
+        job.error_summary = _PUBLIC_ERROR
+    session.commit()
+    return True
+
+
 def _progress_callback(
     session: Session,
     job: BatchAuditJob,
@@ -170,6 +296,8 @@ def run_audit_job(job_id: int, reviewer_factory: Callable[..., Any]) -> None:
 
         try:
             reviewer = _create_reviewer(reviewer_factory, session, job)
+            if _try_run_bulk_audit_job(session, job, reviewer):
+                return
 
             for manuscript in job.manuscripts:
                 if manuscript.status in {"COMPLETED", "SKIPPED"}:

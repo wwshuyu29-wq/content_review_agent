@@ -505,6 +505,7 @@ class ContentTableRow(BaseModel):
     note: Optional[str]
     row_number: Optional[int]
     format_status: FormatStatus
+    format_errors: List[str] = Field(default_factory=list)
     review_status: ReviewStatus
     publish_status: PublishStatus
     issues: List[IssueRead] = Field(default_factory=list)

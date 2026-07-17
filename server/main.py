@@ -557,10 +557,12 @@ def _issue_display_priority(issue: Issue) -> tuple[int, int, int]:
     )
 
 
-def _display_review_issues(issues: Iterable[Issue]) -> list[Issue]:
+def _display_review_issues(issues: Iterable[Issue], *, include_low: bool = False) -> list[Issue]:
     selected: Dict[str, Issue] = {}
     for issue in issues:
         if not _is_visible_review_issue(issue):
+            continue
+        if not include_low and str(issue.severity or "").upper() == "LOW":
             continue
         dimension = _issue_dimension_key(issue)
         current = selected.get(dimension)
@@ -595,7 +597,7 @@ def _audit_detail(audit: AuditRun) -> AuditDetail:
     return AuditDetail(
         **AuditRunRead.model_validate(audit).model_dump(),
         agent_results=[AgentResultRead.model_validate(result) for result in audit.agent_results],
-        issues=[IssueRead.model_validate(issue) for issue in _display_review_issues(audit.issues)],
+        issues=[IssueRead.model_validate(issue) for issue in _display_review_issues(audit.issues, include_low=True)],
     )
 
 
@@ -1301,6 +1303,7 @@ def contents_table(
             final_title=latest.title, final_body=latest.body,
             body_summary=latest.body[:200], publish_time=payload.get("publish_time"), note=payload.get("note"),
             row_number=payload.get("row_number"), format_status=item.format_status,
+            format_errors=list(payload.get("preview_errors") or []),
             review_status=item.review_status, publish_status=item.publish_status,
             issues=[IssueRead.model_validate(issue) for issue in issues], issue_count=len(issues),
             highest_severity=highest_severity((issue.severity for issue in issues)),
@@ -1671,28 +1674,41 @@ def dashboard_overview(
                 pass_rate=round(batch_passed / len(items), 4),
             )
         )
-    supplier_groups: Dict[str, Dict[str, Any]] = {}
+    analyzed_statuses = {
+        ReviewStatus.HUMAN_REVIEW_REQUIRED,
+        ReviewStatus.SUPPLIER_REVISION_REQUIRED,
+        ReviewStatus.AUTO_FIX_PENDING,
+        ReviewStatus.PASSED,
+        ReviewStatus.PASSED_WITH_SUGGESTIONS,
+        ReviewStatus.BLOCKED,
+        ReviewStatus.REJECTED,
+    }
+    supplier_groups: Dict[int, Dict[str, Any]] = {}
     for item in monthly_items:
-        supplier_name = item.batch.supplier_id if item.batch else "未标记供应商"
+        if item.batch is None:
+            continue
         group = supplier_groups.setdefault(
-            supplier_name,
-            {"total_count": 0, "passed_count": 0, "project_names": set()},
+            item.batch.id,
+            {
+                "batch_name": item.batch.name,
+                "project_names": {item.batch.project_type or item.batch.name},
+                "total_count": 0,
+                "analyzed_count": 0,
+            },
         )
         group["total_count"] += 1
-        if item.review_status in passed_statuses:
-            group["passed_count"] += 1
-        if item.batch and item.batch.name:
-            group["project_names"].add(item.batch.name)
+        if item.review_status in analyzed_statuses:
+            group["analyzed_count"] += 1
     supplier_quality = [
         DashboardSupplierQuality(
-            supplier_name=supplier_name,
+            supplier_name=payload["batch_name"],
             project_names=sorted(payload["project_names"]),
             total_count=payload["total_count"],
-            passed_count=payload["passed_count"],
-            pass_rate=round(payload["passed_count"] / payload["total_count"], 4)
+            passed_count=payload["analyzed_count"],
+            pass_rate=round(payload["analyzed_count"] / payload["total_count"], 4)
             if payload["total_count"] else 0,
         )
-        for supplier_name, payload in supplier_groups.items()
+        for _batch_id, payload in supplier_groups.items()
     ]
     supplier_quality.sort(key=lambda item: (-item.total_count, item.supplier_name))
     project_lookup = {project.id: project.name for project in session.scalars(select(Project).order_by(Project.id))}
@@ -1728,6 +1744,8 @@ def dashboard_overview(
     clusters: Dict[str, Dict[str, Any]] = {}
     for issue in issues:
         if issue.category in {"system", "system_suggestion"} or not _is_visible_review_issue(issue):
+            continue
+        if str(issue.severity or "").upper() == "LOW":
             continue
         category_key = _issue_dimension_key(issue)
         cluster = clusters.setdefault(

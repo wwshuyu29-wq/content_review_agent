@@ -46,9 +46,90 @@ FAST_REVIEW_IGNORED_RULE_IDS = {
     "TEST-EVIDENCE-001",
 }
 FAST_REVIEW_IGNORED_TERMS = ("证据", "测试", "实测", "亲测")
+MVP_DIMENSION_KEYS = {
+    "CONTENT_QUALITY",
+    "COMPLIANCE",
+    "BRAND",
+    "PRODUCT_ACCURACY",
+    "CAMPAIGN_EFFECTIVENESS",
+}
+
+
+def _contains_any(value: str, terms: tuple[str, ...]) -> bool:
+    return any(term in value for term in terms)
+
+
+def _normalize_issue_category(
+    category: Any,
+    *,
+    rule_id: Any = "",
+    reason: Any = "",
+    suggestion: Any = "",
+    field: Any = "",
+    evidence_quote: Any = "",
+) -> str:
+    raw_category = str(category or "")
+    if raw_category in {"system", "system_suggestion"}:
+        return raw_category
+    if raw_category in MVP_DIMENSION_KEYS:
+        return raw_category
+    rule = str(rule_id or "")
+    searchable = " ".join(
+        str(value or "")
+        for value in (rule, raw_category, reason, suggestion, field, evidence_quote)
+    )
+    if raw_category in {"内容质量", "基础内容校对", "字符与标签格式", "标点与空格", "标签格式", "标题与正文一致性", "科技测评结构与信息聚焦", "语病"}:
+        return "CONTENT_QUALITY"
+    if raw_category in {"品牌一致性", "产品定位露出", "产品露出清晰度", "品牌与产品名称露出", "品牌标签规范", "品牌露出清晰度"} or rule.startswith("BRAND") or _contains_any(
+        searchable, ("品牌", "官方名称", "产品名", "卖点口径")
+    ):
+        return "BRAND"
+    if raw_category in {"合规表达", "合规审核"} or rule.startswith("CLAIM") or _contains_any(
+        searchable, ("合规", "绝对", "保证", "承诺", "夸大", "广告法", "未经确认")
+    ):
+        return "COMPLIANCE"
+    if raw_category in {"产品准确性"} or _contains_any(
+        searchable, ("功能", "能力", "路线", "规划", "导航", "产品准确", "事实错误", "讲错")
+    ):
+        return "PRODUCT_ACCURACY"
+    if raw_category in {"传播有效性", "核心价值聚焦", "场景聚焦与测评结构"} or _contains_any(
+        searchable, ("传播", "卖点", "转化", "受众", "场景", "标题吸引", "种草")
+    ):
+        return "CAMPAIGN_EFFECTIVENESS"
+    return "CONTENT_QUALITY"
+
+
+def _is_system_unavailable_issue(issue_data: Mapping[str, Any]) -> bool:
+    return (
+        str(issue_data.get("rule_id", "")) == "SYSTEM-LLM-UNAVAILABLE"
+        or str(issue_data.get("category", "")) in {"system", "system_suggestion"}
+    )
+
+
+def _is_system_unavailable_result(result: Mapping[str, Any]) -> bool:
+    issues = list(result.get("issues", []) or [])
+    return bool(issues) and all(
+        isinstance(issue, Mapping) and _is_system_unavailable_issue(issue)
+        for issue in issues
+    )
+
+
+def _agent_review_result_is_unavailable(result: Any) -> bool:
+    issues = list(getattr(result, "issues", []) or [])
+    return bool(issues) and all(
+        getattr(issue, "rule_id", "") == "SYSTEM-LLM-UNAVAILABLE"
+        or getattr(issue, "category", "") in {"system", "system_suggestion"}
+        for issue in issues
+    )
+
+
+def _agent_review_results_are_unavailable(results: list[Any]) -> bool:
+    return bool(results) and all(_agent_review_result_is_unavailable(result) for result in results)
 
 
 def _is_fast_review_ignored_issue(issue_data: Mapping[str, Any]) -> bool:
+    if _is_system_unavailable_issue(issue_data):
+        return True
     rule_id = str(issue_data.get("rule_id", ""))
     if rule_id in FAST_REVIEW_IGNORED_RULE_IDS:
         return True
@@ -60,16 +141,35 @@ def _is_fast_review_ignored_issue(issue_data: Mapping[str, Any]) -> bool:
 
 
 def _simplify_fast_review_agent_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    has_real_result = any(not _is_system_unavailable_result(result) for result in results)
     simplified = []
     for result in results:
         issues = list(result.get("issues", []))
-        kept_issues = [issue for issue in issues if not _is_fast_review_ignored_issue(issue)]
+        if issues and all(isinstance(issue, Mapping) and _is_system_unavailable_issue(issue) for issue in issues):
+            simplified.append(result)
+            continue
+        kept_issues = [
+            issue for issue in issues
+            if not (
+                _is_fast_review_ignored_issue(issue)
+                and (has_real_result or not _is_system_unavailable_issue(issue))
+            )
+        ]
         if len(kept_issues) == len(issues):
             simplified.append(result)
             continue
         updated = {**result, "issues": kept_issues}
-        if not kept_issues and updated.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX"}:
-            updated["decision"] = "PASS"
+        if not kept_issues and updated.get("decision") in {"HUMAN_REVIEW", "BLOCK", "NEED_TEXT_FIX", "PASS_WITH_SUGGESTIONS"}:
+            only_removed_system_unavailable = bool(issues) and all(
+                isinstance(issue, Mapping) and _is_system_unavailable_issue(issue)
+                for issue in issues
+            )
+            if not only_removed_system_unavailable:
+                updated["decision"] = "PASS"
+            if updated.get("score") is None and not only_removed_system_unavailable:
+                updated["score"] = 95
+            if not only_removed_system_unavailable:
+                updated["summary"] = "未发现明确影响发布的问题。"
         simplified.append(updated)
     return simplified
 
@@ -80,7 +180,14 @@ def _normalized_agent_result(result: Any) -> dict[str, Any]:
         evidence = issue.evidence
         issues.append({
             "rule_id": issue.rule_id,
-            "category": issue.category,
+            "category": _normalize_issue_category(
+                issue.category,
+                rule_id=issue.rule_id,
+                reason=issue.reason,
+                suggestion=issue.suggestion,
+                field=issue.field,
+                evidence_quote=evidence.quote,
+            ),
             "severity": issue.severity,
             "field": issue.field,
             "evidence_quote": evidence.quote,
@@ -560,7 +667,25 @@ def run_batch_audit_once(
         })
     if not candidates:
         return [], errors
-    batch_results = reviewer.review_manuscript_batch_structured(candidates, shared_profile)
+
+    def review_candidate_group(group: list[dict[str, Any]]) -> dict[int, list[Any]]:
+        results = reviewer.review_manuscript_batch_structured(group, shared_profile)
+        if len(group) > 2 and all(
+            _agent_review_results_are_unavailable(results.get(int(candidate["content_item_id"]), []))
+            for candidate in group
+        ):
+            split_results: dict[int, list[Any]] = {}
+            for start in range(0, len(group), 2):
+                split_results.update(review_candidate_group(group[start:start + 2]))
+            return split_results
+        return results
+
+    batch_results = review_candidate_group(candidates)
+    if candidates and all(
+        _agent_review_results_are_unavailable(batch_results.get(int(candidate["content_item_id"]), []))
+        for candidate in candidates
+    ):
+        return None
     audits: list[AuditRun] = []
     for candidate in candidates:
         content_id = int(candidate["content_item_id"])
@@ -719,7 +844,14 @@ def run_audit(
         persisted = Issue(
             audit_run=audit,
             rule_id=deterministic.rule_id,
-            category=deterministic.category,
+            category=_normalize_issue_category(
+                deterministic.category,
+                rule_id=deterministic.rule_id,
+                reason=deterministic.reason,
+                suggestion=deterministic.suggestion,
+                field=deterministic.field,
+                evidence_quote=deterministic.evidence,
+            ),
             severity=deterministic.severity,
             field=deterministic.field,
             evidence_quote=deterministic.evidence,
@@ -746,6 +878,7 @@ def run_audit(
     role_boundary_agents = {
         result.get("agent_id") for result in agent_result_data if role_boundary_error(result)
     } if strict_protocol else set()
+    agent_results_have_real = any(not _is_system_unavailable_result(result) for result in agent_result_data)
     persisted_agent_keys: set[tuple[Any, Any, Any]] = set()
     for result_data in agent_result_data:
         persistence_key = (result_data.get("agent_name"),)
@@ -779,8 +912,18 @@ def run_audit(
             missing = [field for field in ISSUE_FIELDS if field not in issue_data]
             if missing:
                 raise ValueError(f"Structured issue missing fields: {', '.join(missing)}")
-            if _is_fast_review_ignored_issue(issue_data):
+            if _is_fast_review_ignored_issue(issue_data) and (
+                agent_results_have_real or not _is_system_unavailable_issue(issue_data)
+            ):
                 continue
+            issue_data["category"] = _normalize_issue_category(
+                issue_data.get("category"),
+                rule_id=issue_data.get("rule_id"),
+                reason=issue_data.get("reason"),
+                suggestion=issue_data.get("suggestion"),
+                field=issue_data.get("field"),
+                evidence_quote=issue_data.get("evidence_quote"),
+            )
             persisted = Issue(
                 audit_run=audit,
                 agent_result=result,

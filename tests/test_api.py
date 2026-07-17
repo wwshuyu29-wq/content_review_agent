@@ -185,7 +185,7 @@ def test_full_http_flow_uploads_audits_resolves_and_reports(api) -> None:
 
     report = client.get("/api/reports", params={"project_id": project["id"], "batch_id": batch["id"]})
     assert report.status_code == 200
-    assert report.json()["totals"] == {"contents": 1, "issues": 1, "tasks": 0}
+    assert report.json()["totals"] == {"contents": 1, "issues": 0, "tasks": 0}
     assert report.json()["historical_totals"] == {"issues": 1, "tasks": 1}
     assert report.json()["status_counts"] == {"PASSED": 1}
 
@@ -388,11 +388,11 @@ def test_dashboard_overview_groups_team_workload_quality_and_issue_clusters(api)
     assert payload["monthly_reviews"][-1] == {"month": "2026-07", "reviewed_count": 1}
     assert payload["supplier_quality"] == [
         {
-            "supplier_name": "internal",
+            "supplier_name": "7 月科技稿件",
             "project_names": ["7 月科技稿件"],
             "total_count": 2,
-            "passed_count": 1,
-            "pass_rate": 0.5,
+            "passed_count": 2,
+            "pass_rate": 1.0,
         }
     ]
     assert payload["workload"][0]["display_name"] == "test-admin"

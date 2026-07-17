@@ -47,6 +47,12 @@ const DEPRECATED_PRESENTATION_RULE_IDS = new Set([
 const label = (value: string | null | undefined) => value ? statusLabel(value) : "—";
 type Message = { type: "ok" | "err"; text: string };
 
+const formatSkipReason = (row: Pick<ContentTableRow, "format_status" | "format_errors">) => (
+  row.format_status === "INCOMPLETE"
+    ? `信息不完整：${row.format_errors.length ? row.format_errors.join("；") : "字段信息不完整"}，未进入自动审核`
+    : ""
+);
+
 function visibleIssue(issue: Issue): boolean {
   return !["system", "system_suggestion"].includes(issue.category) && !DEPRECATED_PRESENTATION_RULE_IDS.has(issue.rule_id);
 }
@@ -174,6 +180,7 @@ function LightweightAnnotationPreview({
   const issues = selectedRow.issues || [];
   const body = selectedRow.final_body || selectedRow.body_summary || "";
   const reviewing = selectedRow.review_status === "AI_REVIEWING";
+  const skipReason = formatSkipReason(selectedRow);
   return (
     <>
       <div className="badge-group annotation-preview-status">
@@ -190,7 +197,7 @@ function LightweightAnnotationPreview({
         </button>
       </div>
       <p className="panel-state compact">
-        {reviewing ? "AI 正在判断，预检结论会随审核进度刷新；完整批注生成后可继续查看明细。" : "已先展示表格风险和可定位批注，完整 Agent 判断可按需加载。"}
+        {skipReason || (reviewing ? "AI 正在判断，预检结论会随审核进度刷新；完整批注生成后可继续查看明细。" : "已先展示表格风险和可定位批注，完整 Agent 判断可按需加载。")}
       </p>
       <article className="manuscript-review annotation-preview">
         <header>
@@ -605,7 +612,7 @@ export default function Review() {
                   <tr key={row.id} className={selectedId === row.id ? "selected-row" : ""}>
                     <td><button type="button" className="row-select-button" aria-label={`选择内容 ${row.final_title || row.supplier_external_id}`} onClick={() => selectRow(row.id)}><b>{row.final_title || row.supplier_external_id}</b><span className="cell-subline">{row.supplier_external_id}{row.row_number ? ` · Excel 行 ${row.row_number}` : ""}</span></button></td>
                     <td>{row.platform || "—"}<div className="cell-subline">{row.account_name || "未提供账号"}</div></td>
-                    <td><span className={`badge status-${row.review_status.toLowerCase()}`}>{label(row.review_status)}</span><div className="cell-subline">发布：{publishStatusLabel(row.publish_status)}</div></td>
+                    <td><span className={`badge status-${row.review_status.toLowerCase()}`}>{label(row.review_status)}</span><div className="cell-subline">{formatSkipReason(row) || `发布：${publishStatusLabel(row.publish_status)}`}</div></td>
                     <td>{row.issue_count ? <><span className={`risk-label severity-${(row.highest_severity || "unknown").toLowerCase()}`}>{severityLabel(row.highest_severity)}</span><div className="cell-subline">{row.categories.map(categoryLabel).join("、") || "未分类"}</div></> : <span className="muted">无命中</span>}</td>
                     <td>{row.open_task_count ? <span className="task-count">{row.open_task_count} 个开放任务</span> : <span className="muted">—</span>}</td>
                   </tr>

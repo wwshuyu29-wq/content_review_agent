@@ -280,6 +280,7 @@ export interface ContentTableRow {
   note: string | null;
   row_number: number | null;
   format_status: FormatStatus;
+  format_errors: string[];
   review_status: ReviewStatus;
   publish_status: PublishStatus;
   issues: Issue[];

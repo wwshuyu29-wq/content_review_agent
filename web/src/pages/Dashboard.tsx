@@ -56,7 +56,7 @@ export default function Dashboard() {
       <div className="page-heading dashboard-heading">
         <div>
           <h2>概览</h2>
-          <p>月度审核量、供应商质量与聚类问题</p>
+          <p>月度审核量、内容质量与聚类问题</p>
         </div>
         <div className="field month-field">
           <label htmlFor="dashboard-month">月份</label>
@@ -77,7 +77,7 @@ export default function Dashboard() {
           </section>
 
           <div className="dashboard-grid">
-            <div className="dashboard-main-column" aria-label="月度审核与供应商质量">
+            <div className="dashboard-main-column" aria-label="月度审核与内容质量">
               <MonthlyReviewChart months={overview.monthly_reviews} />
               <SupplierQualityPanel suppliers={overview.supplier_quality} />
             </div>

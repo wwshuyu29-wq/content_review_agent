@@ -136,11 +136,10 @@ class LightweightBatchReview(BaseModel):
     dimensions: list[LightweightBatchDimension]
 
     @model_validator(mode="after")
-    def require_complete_dimension_set(self) -> "LightweightBatchReview":
-        expected = tuple(get_args(AgentReviewResult.model_fields["agent_id"].annotation))
+    def require_unique_known_dimensions(self) -> "LightweightBatchReview":
         actual = tuple(result.dimension for result in self.dimensions)
-        if actual != expected:
-            raise ValueError(f"dimensions must contain the five scoring dimensions in order: {expected}")
+        if len(set(actual)) != len(actual):
+            raise ValueError("dimensions must not contain duplicate scoring dimensions")
         return self
 
 

@@ -515,6 +515,34 @@ def test_protocol_violations_are_rejected_then_retry_to_controlled_fallback(
         assert result.issues[0].human_required is True
 
 
+def test_batch_prompt_clips_brief_claims_and_manuscript_body_for_mvp_speed() -> None:
+    from server.services.deterministic_rule_service import ReviewContext
+
+    long_body = "正文很长" * 500
+    long_brief = "brief很长" * 500
+    profile = PROFILE.model_copy(update={
+        "project_facts": {"batch_review_brief": long_brief},
+        "approved_claims": tuple(f"approved-{index}" for index in range(50)),
+        "pending_claims": tuple(f"pending-{index}" for index in range(50)),
+    })
+    prompt = TechMediaReviewer().build_batch_scoring_prompt(
+        [{
+            "content_item_id": 123,
+            "external_id": "mvp-1",
+            "context": ReviewContext(title="标题", body=long_body, platform="视频号"),
+        }],
+        profile,
+    )
+
+    assert len(prompt) < 9000
+    assert "approved-19" in prompt
+    assert "approved-20" not in prompt
+    assert "pending-19" in prompt
+    assert "pending-20" not in prompt
+    assert long_body not in prompt
+    assert long_brief not in prompt
+
+
 def test_llm_parse_retry_succeeds_on_third_call():
     class LLM:
         def __init__(self):

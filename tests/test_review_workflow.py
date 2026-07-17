@@ -212,6 +212,82 @@ class LightweightBatchLLM:
         }
 
 
+class SparseLightweightBatchLLM:
+    def __init__(self, records):
+        self.records = records
+        self.calls = 0
+
+    def chat_json(self, prompt, _schema):
+        self.calls += 1
+        return {
+            "reviews": [
+                {
+                    "content_id": content_id,
+                    "dimensions": [
+                        {
+                            "dimension": "PRODUCT_ACCURACY",
+                            "decision": "HUMAN_REVIEW",
+                            "score": 65,
+                            "summary": "有一处产品能力需要确认。",
+                            "issues": [
+                                {
+                                    "level": "HIGH",
+                                    "field": "body",
+                                    "quote": "自动帮我订好最划算酒店",
+                                    "problem": "把未确认能力写成确定功能。",
+                                    "advice": "删除该句，或确认能力后再发布。",
+                                    "human": True,
+                                }
+                            ],
+                        }
+                    ],
+                }
+                for content_id, _external_id in self.records
+            ]
+        }
+
+
+class BrokenBatchLLM:
+    def __init__(self):
+        self.calls = 0
+
+    def chat(self, prompt):
+        self.calls += 1
+        return "not json"
+
+
+class SizeSensitiveBatchLLM:
+    def __init__(self):
+        self.batch_sizes = []
+
+    def chat(self, prompt):
+        import json as json_module
+
+        marker = "审核包：\n"
+        payload = json_module.loads(prompt.split(marker, 1)[1])
+        manuscripts = payload["manuscripts"]
+        self.batch_sizes.append(len(manuscripts))
+        if len(manuscripts) > 2:
+            return "not json"
+        return json_module.dumps({
+            "reviews": [
+                {
+                    "content_id": manuscript["content_id"],
+                    "dimensions": [
+                        {
+                            "dimension": "CONTENT_QUALITY",
+                            "decision": "PASS",
+                            "score": 95,
+                            "summary": "未发现明确影响发布的问题。",
+                            "issues": [],
+                        }
+                    ],
+                }
+                for manuscript in manuscripts
+            ]
+        }, ensure_ascii=False)
+
+
 def make_session(tmp_path: Path) -> Session:
     engine = create_db_engine(f"sqlite:///{tmp_path / 'workflow.db'}")
     Base.metadata.create_all(engine)
@@ -934,11 +1010,113 @@ def test_batch_audit_accepts_lightweight_model_response(tmp_path: Path) -> None:
         assert quality.score == 82
         assert quality.summary == "表达基本通顺，但有一处可优化。"
         assert first_audit.issues[0].rule_id == "BATCH-CONTENT_QUALITY-001"
-        assert first_audit.issues[0].category == "内容质量"
+        assert first_audit.issues[0].category == "CONTENT_QUALITY"
         assert first_audit.issues[0].evidence_quote == "正文信息完整"
         assert first_audit.issues[0].reason == "表达偏泛，缺少具体使用场景。"
         assert first_audit.issues[0].suggestion == "补充更明确的出行场景和用户收益。"
         assert first_audit.issues[0].human_required is False
+
+
+def test_sparse_lightweight_batch_response_fills_missing_dimensions_without_system_issues(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-sparse",
+            name="轻结构稀疏审核",
+            contents=[
+                {
+                    "external_id": "sparse-1",
+                    "title": "路线规划体验",
+                    "body": "自动帮我订好最划算酒店，路线规划步骤清晰。",
+                    "payload": {"platform": "xiaohongshu"},
+                }
+            ],
+        )
+        records = [(item.id, item.external_id) for item in batch.content_items]
+
+        result = run_batch_audit_once(
+            session,
+            batch,
+            reviewer=TechMediaReviewer(llm=SparseLightweightBatchLLM(records)),
+            model="sparse-light-batch-model",
+        )
+
+        assert result is not None
+        audits, errors = result
+        assert errors == []
+        audit = audits[0]
+        item = batch.content_items[0]
+        assert [result.agent_id for result in audit.agent_results] == list(AGENT_ORDER)
+        assert not any(issue.rule_id == "SYSTEM-LLM-UNAVAILABLE" for issue in audit.issues)
+        assert [issue.category for issue in audit.issues] == ["PRODUCT_ACCURACY"]
+        assert item.review_status is ReviewStatus.HUMAN_REVIEW_REQUIRED
+
+
+def test_batch_audit_returns_none_when_entire_batch_model_response_is_unavailable(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-broken",
+            name="整批失败降级",
+            contents=[
+                {
+                    "external_id": f"broken-{index}",
+                    "title": f"路线规划体验 {index}",
+                    "body": "路线规划步骤清晰，正文信息完整。",
+                    "payload": {"platform": "xiaohongshu"},
+                }
+                for index in range(2)
+            ],
+        )
+
+        result = run_batch_audit_once(
+            session,
+            batch,
+            reviewer=TechMediaReviewer(llm=BrokenBatchLLM()),
+            model="broken-batch-model",
+        )
+
+        assert result is None
+        assert list(session.scalars(select(AuditRun))) == []
+
+
+def test_batch_audit_splits_large_unavailable_batch_into_smaller_lightweight_calls(tmp_path: Path) -> None:
+    with make_session(tmp_path) as session:
+        project = seed_default_project(session)
+        batch = submit_batch(
+            session,
+            project_id=project.id,
+            supplier_id="supplier-split",
+            name="自动拆分批次",
+            contents=[
+                {
+                    "external_id": f"split-{index}",
+                    "title": f"路线规划体验 {index}",
+                    "body": "路线规划步骤清晰，正文信息完整。",
+                    "payload": {"platform": "xiaohongshu"},
+                }
+                for index in range(5)
+            ],
+        )
+        llm = SizeSensitiveBatchLLM()
+
+        result = run_batch_audit_once(
+            session,
+            batch,
+            reviewer=TechMediaReviewer(llm=llm),
+            model="split-batch-model",
+        )
+
+        assert result is not None
+        audits, errors = result
+        assert errors == []
+        assert len(audits) == 5
+        assert llm.batch_sizes == [5, 5, 5, 2, 2, 1]
+        assert all(item.review_status is ReviewStatus.PASSED for item in batch.content_items)
 
 
 def test_nonzero_score_result_with_unavailable_raw_issue_cannot_be_superseded(tmp_path: Path) -> None:

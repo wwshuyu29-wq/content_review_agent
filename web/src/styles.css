@@ -125,6 +125,18 @@ pre { background: #18212b; color: #d9e2ec; padding: 10px; border-radius: 5px; ov
 .mistake-book article span { color: var(--pending); font-size: 11px; font-weight: 700; white-space: nowrap; }
 .mistake-book article p { margin: 7px 0 4px; font-size: 12px; line-height: 1.5; }
 .mistake-book article small { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.supplier-report-body { display: grid; gap: 16px; }
+.supplier-report-body section { display: grid; gap: 8px; }
+.supplier-report-body h4 { margin: 0; font-size: 13px; color: var(--text); }
+.supplier-report-body p { margin: 0; color: #344054; line-height: 1.75; font-size: 13px; }
+.supplier-report-focus { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.supplier-report-focus article { border: 1px solid var(--border); border-radius: 8px; padding: 12px; background: #f8fafc; }
+.supplier-report-focus article b { display: block; font-size: 14px; margin-bottom: 3px; }
+.supplier-report-focus article span { color: var(--primary); font-size: 12px; font-weight: 700; }
+.supplier-report-focus article p { margin: 8px 0 6px; font-size: 12px; line-height: 1.6; }
+.supplier-report-focus article small { display: block; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.supplier-report-examples { display: grid; gap: 8px; }
+.supplier-report-examples article { border-top: 1px solid var(--border); padding-top: 9px; }
 .metric-list { display: grid; gap: 9px; }
 .metric-row { display: grid; grid-template-columns: minmax(90px, 150px) 1fr 30px; gap: 8px; align-items: center; font-size: 11px; }
 .metric-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -157,6 +169,7 @@ pre { background: #18212b; color: #d9e2ec; padding: 10px; border-radius: 5px; ov
 @media (max-width: 760px) { .workspace-layout { grid-template-columns: 1fr; }.content-workspace { grid-row: auto; }.workspace-side { grid-column: auto; }.stepper { grid-template-columns: 1fr; }.stepper li { padding: 6px 8px; }.identity-grid { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 640px) {
   main { padding: 14px 10px 28px; }
+  .supplier-report-focus { grid-template-columns: 1fr; }
   header.top { padding: 9px 10px; gap: 10px; }
   nav { order: 3; width: 100%; overflow-x: auto; }
   nav a { white-space: nowrap; }

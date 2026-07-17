@@ -4,6 +4,8 @@ import { api, saveBlob, type BatchDetail, type ImportPreview, type Project } fro
 
 type Message = { type: "ok" | "err"; text: string };
 
+const incompleteReason = (errors: string[]) => `信息不完整：${errors.join("；")}，未进入自动审核`;
+
 export default function Upload() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState<Project[]>([]);
@@ -11,6 +13,7 @@ export default function Upload() {
   const [supplierName, setSupplierName] = useState("");
   const [ownerName, setOwnerName] = useState("");
   const [batchName, setBatchName] = useState("");
+  const [projectTypeName, setProjectTypeName] = useState("");
   const [reviewBrief, setReviewBrief] = useState("");
   const [excel, setExcel] = useState<File | null>(null);
   const [briefFile, setBriefFile] = useState<File | null>(null);
@@ -25,6 +28,7 @@ export default function Upload() {
       const techProjects = data.filter((project) => project.content_type === "TECH_MEDIA_REVIEW");
       setProjects(techProjects);
       setProjectId(techProjects[0]?.id || 0);
+      setProjectTypeName((current) => current.trim() ? current : techProjects[0]?.name || "");
     }).catch((error: Error) => setMessage({ type: "err", text: error.message }));
   }, []);
 
@@ -40,12 +44,12 @@ export default function Upload() {
   }, [projectId]);
 
   const selectedProject = projects.find((project) => project.id === projectId) || null;
-  const projectType = selectedProject?.name || "";
+  const projectType = projectTypeName.trim() || selectedProject?.name || "";
   const supplierNameValue = supplierName.trim();
   const ownerNameValue = ownerName.trim();
   const batchNameValue = batchName.trim();
   const briefReady = Boolean(reviewBrief.trim() || briefFile);
-  const identityReady = Boolean(projectId && supplierNameValue && ownerNameValue && batchNameValue && briefReady);
+  const identityReady = Boolean(projectId && projectType && supplierNameValue && ownerNameValue && batchNameValue && briefReady);
   const previewMatches = Boolean(
     preview
     && preview.project_id === projectId
@@ -57,10 +61,8 @@ export default function Upload() {
   const canConfirm = Boolean(
     previewMatches
     && preview?.token
-    && preview.error_count === 0
     && preview.errors.length === 0
-    && preview.valid_count === preview.total_count
-    && preview.total_count > 0,
+    && preview.valid_count > 0,
   );
   const step = result ? 5 : preview ? 4 : excel ? 3 : identityReady ? 2 : 1;
 
@@ -80,7 +82,7 @@ export default function Upload() {
 
   const doPreview = async () => {
     if (!identityReady || !excel) {
-      return setMessage({ type: "err", text: "请填写供应商名称、负责人、批次编号，并上传 Brief 与 Excel 文件" });
+      return setMessage({ type: "err", text: "请填写稿件项目名称、供应商名称、负责人、批次编号，并上传 Brief 与 Excel 文件" });
     }
     setBusy("preview");
     setMessage(null);
@@ -143,7 +145,7 @@ export default function Upload() {
     setAuditBusy(true);
     setMessage(null);
     try {
-      await api.auditBatch(batchId);
+      await api.startAuditJob(batchId);
       navigate(`/review?batch_id=${batchId}`);
     } catch (error) {
       setMessage({ type: "err", text: `审核启动失败：${error instanceof Error ? error.message : "未知错误"}` });
@@ -180,12 +182,15 @@ export default function Upload() {
 
       <div className="form-grid">
         <div className="field span-2">
-          <label htmlFor="upload-project">项目类型 *</label>
+          <label htmlFor="upload-project">审核模板 *</label>
           <select
             id="upload-project"
             value={projectId}
             onChange={(event) => {
-              setProjectId(Number(event.target.value));
+              const nextProjectId = Number(event.target.value);
+              const nextProject = projects.find((project) => project.id === nextProjectId);
+              setProjectId(nextProjectId);
+              setProjectTypeName((current) => current.trim() ? current : nextProject?.name || "");
               setReviewBrief("");
               invalidatePreview();
             }}
@@ -194,6 +199,18 @@ export default function Upload() {
             {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
           </select>
           {projects.length === 0 && <p className="field-help">暂无可导入的项目类型</p>}
+        </div>
+
+        <div className="field span-2">
+          <label htmlFor="project-type-name">稿件项目名称 / 专项名称 *</label>
+          <input
+            id="project-type-name"
+            type="text"
+            value={projectTypeName}
+            onChange={(event) => { setProjectTypeName(event.target.value); invalidatePreview(); }}
+            placeholder="例如：范丞丞vlog二创-娱乐营销号传播"
+          />
+          <p className="field-help">用于看板和报告区分不同稿件项目；上面的审核模板只决定使用哪套审核逻辑。</p>
         </div>
 
         <div className="field">
@@ -281,7 +298,7 @@ export default function Upload() {
         <button type="button" className="btn btn-primary" onClick={doPreview} disabled={!identityReady || !excel || !!busy}>
           {busy === "preview" ? "预检中..." : "预检文件"}
         </button>
-        <button type="button" className="btn btn-pass" onClick={confirm} disabled={!canConfirm || !!busy} title={!canConfirm ? "仅无错误且身份未变化的预检可确认" : "确认导入"}>
+        <button type="button" className="btn btn-pass" onClick={confirm} disabled={!canConfirm || !!busy} title={!canConfirm ? "至少需要 1 条有效内容，且批次信息不能在预检后变化" : "确认导入"}>
           {busy === "confirm" ? "导入中..." : "确认导入"}
         </button>
       </div>
@@ -316,7 +333,7 @@ export default function Upload() {
                 <td><b>第{row.manuscript_index}篇</b><div className="cell-subline">Excel 第{row.row_number}行</div></td>
                 <td><b>{String(row.normalized.supplier_external_id || row.normalized.external_id || "—")}</b><div className="cell-subline">{String(row.normalized.title || row.normalized.original_title || "未提供标题")}</div></td>
                 <td>
-                  {row.valid ? <span className="badge status-passed">通过</span> : row.errors.map((error) => <div className="validation-error" key={error}>{error}</div>)}
+                  {row.valid ? <span className="badge status-passed">通过</span> : <div className="validation-error">{incompleteReason(row.errors)}</div>}
                   {row.warnings.map((warning) => <div className="validation-warning" key={warning}>{warning}</div>)}
                 </td>
               </tr>
@@ -331,6 +348,17 @@ export default function Upload() {
         <div>
           <h3>批次已入库</h3>
           <p className="small">#{result.id} · {result.project_type || projectType} · {result.name} · 供应商 {result.supplier_id} · 负责人 {result.owner_name || ownerNameValue} · {result.content_count} 条</p>
+          {result.contents.some((content) => content.format_status === "INCOMPLETE") && (
+            <div className="validation-summary import-result-warnings">
+              {result.contents
+                .filter((content) => content.format_status === "INCOMPLETE")
+                .map((content) => {
+                  const errors = content.versions[0]?.payload?.preview_errors;
+                  const formatErrors = Array.isArray(errors) ? errors.map(String) : ["字段信息不完整"];
+                  return <p className="validation-error" key={content.id}>{content.title}：{incompleteReason(formatErrors)}</p>;
+                })}
+            </div>
+          )}
         </div>
         <div className="btn-row">
           <button className="btn btn-ghost" onClick={exportResult} disabled={!!busy || auditBusy} aria-label="导出当前批次">↓ {busy === "export" ? "导出中" : "导出批次"}</button>

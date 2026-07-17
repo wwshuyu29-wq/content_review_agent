@@ -143,7 +143,12 @@ def test_dashboard_prioritizes_monthly_reviews_supplier_quality_and_clusters() -
     assert "团队月度工作量" not in dashboard
     assert "monthly_reviews" in api
     assert "supplier_quality" in api
-    assert "供应商质量" in dashboard
+    supplier_panel = (WEB / "components" / "dashboard" / "SupplierQualityPanel.tsx").read_text(encoding="utf-8")
+    assert "内容质量" in supplier_panel
+    assert "已分析" in supplier_panel
+    assert "供应商质量" not in supplier_panel
+    assert "supplier.pass_rate" in supplier_panel
+    assert "supplier.total_count / max" not in supplier_panel
     assert "聚类问题" in dashboard
     assert "问题稿件数" in dashboard
     assert "按五个维度去重统计" in dashboard
@@ -192,6 +197,17 @@ def test_upload_flow_groups_brief_with_files_and_has_supplier_name() -> None:
     assert "publishStandard" not in upload
     assert "手工录入" not in upload
     assert "submitManual" not in upload
+    assert "未进入自动审核" in upload
+    assert "import-result-warnings" in upload
+
+
+def test_review_workspace_shows_format_skip_reason() -> None:
+    review = (WEB / "pages" / "Review.tsx").read_text(encoding="utf-8")
+    api = (WEB / "api.ts").read_text(encoding="utf-8")
+
+    assert "format_errors: string[]" in api
+    assert "formatSkipReason" in review
+    assert "未进入自动审核" in review
 
 
 def test_business_types_do_not_carry_raw_result() -> None:
@@ -234,7 +250,16 @@ def test_report_removes_rule_ranking_and_adds_supplier_learning_prompt() -> None
 
     assert "命中规则排行" not in report
     assert "供应商问题沉淀" in report
-    assert "错题本" in report
+    assert "供应商复盘报告" in report
+    assert "buildSupplierLearningReport" in report
+    assert "reportNarrative" in report
+    assert "整体判断" in report
+    assert "整改重点" in report
+    assert "代表问题" in report
+    assert "metrics.issueExamples.map" not in report
+    styles = (WEB / "styles.css").read_text(encoding="utf-8")
+    assert ".supplier-report-body" in styles
+    assert ".supplier-report-focus" in styles
     assert "语义分析" in prompt
     assert "供应商改稿建议" in prompt
     assert "证据" in prompt

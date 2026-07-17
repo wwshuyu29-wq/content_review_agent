@@ -93,6 +93,17 @@ def new_workbook_bytes() -> bytes:
     return output.getvalue()
 
 
+def new_workbook_missing_platform_bytes() -> bytes:
+    workbook = Workbook()
+    content = workbook.active
+    content.title = "内容清单"
+    content.append(list(NEW_CONTENT_COLUMNS))
+    content.append(["缺平台标题", "缺平台正文", "图文", None, "新作者", "2026-07-21"])
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def zip_bytes(filename: str, content: bytes = b"evidence") -> bytes:
     output = BytesIO()
     with ZipFile(output, "w") as archive:
@@ -410,6 +421,23 @@ def test_contents_table_always_returns_active_canonical_agent_slots(excel_api) -
     row = client.get("/api/contents/table").json()[0]
     assert [agent["agent_id"] for agent in row["agents"]] == ["CONTENT_QUALITY", "COMPLIANCE", "BRAND", "PRODUCT_ACCURACY", "CAMPAIGN_EFFECTIVENESS"]
     assert all(agent["status"] == "NOT_RUN" for agent in row["agents"])
+
+
+def test_contents_table_returns_format_errors_for_incomplete_rows(excel_api) -> None:
+    client, _, _ = excel_api
+    current = project(client)
+    token = preview_request(client, current["id"], xlsx=new_workbook_missing_platform_bytes()).json()["token"]
+    batch = client.post(
+        f"/api/imports/{token}/confirm",
+        json={"project_id": current["id"], "supplier_id": "supplier", "batch_name": "batch"},
+    ).json()
+
+    response = client.get("/api/contents/table", params={"project_id": current["id"], "batch_id": batch["id"]})
+
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["format_status"] == "INCOMPLETE"
+    assert row["format_errors"] == ["目标平台不能为空"]
 
 
 def test_preview_orphan_test_does_not_block_confirmation(excel_api) -> None:

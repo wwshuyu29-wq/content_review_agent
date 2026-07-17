@@ -29,6 +29,8 @@ def _contains_any(value: str, terms: tuple[str, ...]) -> bool:
 def _is_visible_report_issue(issue: Issue) -> bool:
     if issue.category in {"system", "system_suggestion"}:
         return False
+    if str(issue.severity or "").upper() == "LOW":
+        return False
     if issue.rule_id in DEPRECATED_PRESENTATION_RULE_IDS:
         return False
     searchable = " ".join(str(value or "") for value in (issue.rule_id, issue.category, issue.reason, issue.suggestion))
@@ -100,9 +102,11 @@ def build_report(session: Session, *, project_id: int, batch_id: Optional[int] =
         ) or 0
 
     dimension_content_ids: dict[str, set[int]] = {}
+    visible_issues = []
     for issue in issues:
         if not _is_visible_report_issue(issue):
             continue
+        visible_issues.append(issue)
         dimension_content_ids.setdefault(_issue_dimension_key(issue), set()).add(issue.audit_run.content_item_id)
 
     manual_item_ids = {
@@ -114,7 +118,7 @@ def build_report(session: Session, *, project_id: int, batch_id: Optional[int] =
     return {
         "project": {"id": project.id, "name": project.name},
         "batch": {"id": batch.id, "name": batch.name} if batch is not None else None,
-        "totals": {"contents": len(items), "issues": len(issues), "tasks": len(active_tasks)},
+        "totals": {"contents": len(items), "issues": len(visible_issues), "tasks": len(active_tasks)},
         "historical_totals": {"issues": historical_issue_count, "tasks": historical_task_count},
         "status_counts": dict(Counter(item.review_status.value for item in items)),
         "category_counts": {

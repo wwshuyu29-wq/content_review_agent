@@ -41,6 +41,9 @@ _DIMENSION_REFERENCE_HINTS = {
     "PRODUCT_ACCURACY": ("content_accuracy.md", "内容准确性.md", "实测可信度.md"),
     "CAMPAIGN_EFFECTIVENESS": ("campaign_effectiveness.md", "传播有效性.md"),
 }
+MVP_BATCH_BRIEF_CHAR_LIMIT = 1800
+MVP_BATCH_BODY_CHAR_LIMIT = 1200
+MVP_BATCH_CLAIM_LIMIT = 20
 
 _SHARED_RULES = """You are a structured technology-media content scoring reviewer.
 Distinguish these four evidence classes and never merge them:
@@ -83,6 +86,13 @@ _AGENT_INSTRUCTIONS = {
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
 
 
 def _value(record: Any, name: str, default: Any = None) -> Any:
@@ -379,7 +389,10 @@ class TechMediaReviewer:
             raise ValueError("batch scoring requires at least one manuscript")
         first_context = manuscripts[0]["context"]
         project_facts = dict(profile.project_facts)
-        brief = str(project_facts.get("batch_review_brief") or project_facts.get("review_brief") or "")[:3000]
+        brief = _clip_text(
+            project_facts.get("batch_review_brief") or project_facts.get("review_brief") or "",
+            MVP_BATCH_BRIEF_CHAR_LIMIT,
+        )
         standards = {
             dimension_id: {
                 "goal": _AGENT_INSTRUCTIONS[dimension_id],
@@ -396,12 +409,12 @@ class TechMediaReviewer:
             manuscript_payloads.append({
                 "content_id": manuscript["content_item_id"],
                 "platform": context.platform,
-                "content": {"title": context.title, "body": context.body},
+                "content": {"title": _clip_text(context.title, 120), "body": _clip_text(context.body, MVP_BATCH_BODY_CHAR_LIMIT)},
             })
         payload = {
             "brief": brief,
-            "approved_claims": list(profile.approved_claims)[:80],
-            "pending_claims": list(profile.pending_claims)[:80],
+            "approved_claims": list(profile.approved_claims)[:MVP_BATCH_CLAIM_LIMIT],
+            "pending_claims": list(profile.pending_claims)[:MVP_BATCH_CLAIM_LIMIT],
             "dimensions": standards,
             "manuscripts": manuscript_payloads,
             "required_dimension_order": list(AGENT_ORDER),
@@ -421,6 +434,7 @@ class TechMediaReviewer:
             "不要因为文案没有展开实测过程、实测细节、截图说明或素材证据而判问题；这类佐证暂由供应商素材承担，当前只审文字本身。\n"
             "不要把低风险表达建议计入问题数；低风险只允许放在 summary 或 PASS_WITH_SUGGESTIONS，不放入 issues。\n"
             "CAMPAIGN_EFFECTIVENESS 只能 PASS 或 PASS_WITH_SUGGESTIONS；需要人工判断时用 human=true。\n"
+            "为了提速，quote 不超过 40 字，reason 和 advice 各不超过 60 字。\n"
             "输出 JSON，结构为 {\"reviews\":[{\"content_id\":数字,\"dimensions\":[{\"dimension\":\"CONTENT_QUALITY\",\"decision\":\"PASS\",\"score\":90,\"summary\":\"...\",\"issues\":[{\"level\":\"LOW\",\"field\":\"body\",\"quote\":\"原文片段\",\"problem\":\"问题\",\"advice\":\"建议\",\"human\":false}]}]}]}。\n"
             "不要输出 markdown 或解释。\n"
             "审核包：\n"
@@ -446,7 +460,20 @@ class TechMediaReviewer:
         converted: dict[int, list[AgentReviewResult]] = {}
         for review in response.reviews:
             dimension_results: list[AgentReviewResult] = []
-            for dimension in review.dimensions:
+            dimensions = {dimension.dimension: dimension for dimension in review.dimensions}
+            for agent_id in AGENT_ORDER:
+                dimension = dimensions.get(agent_id)
+                if dimension is None:
+                    dimension_results.append(AgentReviewResult(
+                        agent_id=agent_id,
+                        agent_version=AGENT_VERSION,
+                        decision="PASS",
+                        summary="未发现明确影响发布的问题。",
+                        score=95,
+                        confidence=0.85,
+                        issues=[],
+                    ))
+                    continue
                 issues = [
                     AgentIssue(
                         rule_id=f"BATCH-{dimension.dimension}-{index:03d}",

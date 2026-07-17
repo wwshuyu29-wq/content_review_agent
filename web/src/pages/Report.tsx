@@ -32,6 +32,59 @@ const pct = (value: number) => Number.isFinite(value) ? `${Math.round(value * 10
 const mvpResultLabel = (value: string) => ({ CLEAR: "未发现明显问题", ATTENTION: "需关注稿件" }[value] || value);
 const analysisProgressLabel = (value: string) => ({ ANALYZED: "已完成分析", PENDING: "待分析" }[value] || value);
 
+type SupplierReportPoint = { label: string; count: number; reason: string; suggestion: string };
+type SupplierReportExample = { title: string; label: string; severity: string; reason: string; suggestion: string };
+type SupplierLearningReport = {
+  summary: string;
+  focus: SupplierReportPoint[];
+  action: string;
+  examples: SupplierReportExample[];
+};
+
+function shortText(value: string, max = 86): string {
+  const text = value.trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function buildSupplierLearningReport(rows: ContentTableRow[]): SupplierLearningReport {
+  const issues = rows.flatMap((row) => row.issues.map((issue) => ({ row, issue })));
+  const affectedIds = new Set(issues.map(({ row }) => row.id));
+  const dimensionMap = new Map<string, { count: number; reasons: Map<string, number>; suggestions: Map<string, number> }>();
+  for (const { issue } of issues) {
+    const key = categoryLabel(issue.category);
+    const group = dimensionMap.get(key) || { count: 0, reasons: new Map<string, number>(), suggestions: new Map<string, number>() };
+    group.count += 1;
+    if (issue.reason) group.reasons.set(issue.reason, (group.reasons.get(issue.reason) || 0) + 1);
+    if (issue.suggestion) group.suggestions.set(issue.suggestion, (group.suggestions.get(issue.suggestion) || 0) + 1);
+    dimensionMap.set(key, group);
+  }
+  const focus = Array.from(dimensionMap.entries())
+    .map(([label, group]) => {
+      const topReason = Array.from(group.reasons.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || "暂无明确原因";
+      const topSuggestion = Array.from(group.suggestions.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || "下轮提交前按该维度复查。";
+      return { label, count: group.count, reason: shortText(topReason, 96), suggestion: shortText(topSuggestion, 96) };
+    })
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 3);
+  const summary = issues.length === 0
+    ? `本次共分析 ${rows.length} 篇稿件，当前未发现需要沉淀给供应商复盘的中高风险问题。`
+    : `本次共分析 ${rows.length} 篇稿件，其中 ${affectedIds.size} 篇存在需要关注的问题。问题主要集中在${focus.map((item) => item.label).join("、")}，说明供应商在产品能力边界、合规表达和基础校对上仍需要前置把关。`;
+  const action = issues.length === 0
+    ? "后续可继续沿用当前提交方式，并保持品牌名、功能边界和标题正文一致性的提交前自检。"
+    : `建议供应商下轮先按“${focus[0]?.label || "重点维度"}”建立提交前检查清单：未经确认的产品能力不要写成确定功能，绝对化或保证式表达改成有边界的体验描述，发布前再做一次标题、正文和标签格式校对。`;
+  const examples = issues
+    .sort((a, b) => b.issue.confidence - a.issue.confidence)
+    .slice(0, 3)
+    .map(({ row, issue }) => ({
+      title: row.final_title || row.supplier_external_id,
+      label: categoryLabel(issue.category),
+      severity: severityLabel(issue.severity),
+      reason: shortText(issue.reason, 86),
+      suggestion: shortText(issue.suggestion || "暂无建议", 86),
+    }));
+  return { summary, focus, action, examples };
+}
+
 export default function Report() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [batches, setBatches] = useState<Batch[]>([]);
@@ -96,6 +149,7 @@ export default function Report() {
       .flatMap((row) => row.issues.map((issue) => ({ row, issue })))
       .sort((a, b) => b.issue.confidence - a.issue.confidence)
       .slice(0, 6);
+    const reportNarrative = buildSupplierLearningReport(rows);
     return {
       clearRows,
       passRate: rows.length ? clearRows / rows.length : 0,
@@ -104,6 +158,7 @@ export default function Report() {
       resultCounts: { CLEAR: clearRows, ATTENTION: attentionRows.length },
       progressCounts: { ANALYZED: analyzedRows, PENDING: Math.max(0, rows.length - analyzedRows) },
       issueExamples,
+      reportNarrative,
     };
   }, [report?.category_counts, rows]);
 
@@ -139,14 +194,45 @@ export default function Report() {
             <Distribution title="项目问题维度汇总" values={report.category_counts} label={categoryLabel} detail="按当前项目/批次的稿件问题归类汇总" />
           </div>
           <section className="report-panel mistake-book">
-            <div className="section-heading"><div><h3>供应商问题沉淀 / 错题本</h3><p className="small">结合脚本内容、命中问题、证据片段和改稿建议，沉淀给供应商复盘的高频问题。</p></div></div>
-            {metrics.issueExamples.length === 0 ? <p className="empty">当前筛选范围暂无问题。</p> : metrics.issueExamples.map(({ row, issue }) => (
-              <article key={`${row.id}-${issue.id}`}>
-                <div><b>{row.final_title || row.supplier_external_id}</b><span>{categoryLabel(issue.category)} · {severityLabel(issue.severity)}</span></div>
-                <p>{issue.reason}</p>
-                <small>{issue.suggestion || "暂无建议"}</small>
-              </article>
-            ))}
+            <div className="section-heading"><div><h3>供应商问题沉淀 / 供应商复盘报告</h3><p className="small">根据当前项目/批次的全部命中问题，汇总成便于复盘和沟通的文字报告。</p></div></div>
+            <div className="supplier-report-body">
+              <section>
+                <h4>整体判断</h4>
+                <p>{metrics.reportNarrative.summary}</p>
+              </section>
+              {metrics.reportNarrative.focus.length > 0 && (
+                <section>
+                  <h4>主要问题</h4>
+                  <div className="supplier-report-focus">
+                    {metrics.reportNarrative.focus.map((item) => (
+                      <article key={item.label}>
+                        <b>{item.label}</b><span>{item.count} 个问题</span>
+                        <p>{item.reason}</p>
+                        <small>{item.suggestion}</small>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+              <section>
+                <h4>整改重点</h4>
+                <p>{metrics.reportNarrative.action}</p>
+              </section>
+              {metrics.reportNarrative.examples.length > 0 && (
+                <section>
+                  <h4>代表问题</h4>
+                  <div className="supplier-report-examples">
+                    {metrics.reportNarrative.examples.map((example) => (
+                      <article key={`${example.title}-${example.label}-${example.reason}`}>
+                        <div><b>{example.title}</b><span>{example.label} · {example.severity}</span></div>
+                        <p>{example.reason}</p>
+                        <small>{example.suggestion}</small>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
           </section>
         </>
       )}
