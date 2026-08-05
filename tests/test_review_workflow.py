@@ -671,7 +671,7 @@ def test_run_audit_uses_rule_version_snapshot_and_approves_no_issue_content(tmp_
         assert audit.content_version.version == 1
         assert audit.rule_version_id == project.current_rule_version_id
         assert audit.model == "model-v1"
-        assert audit.prompt_version == "tech_media_review-1.3"
+        assert audit.prompt_version == "tech_media_review-1.4"
         assert audit.status == "COMPLETED"
         assert reviewer.received_standards.deny_words == []
         assert reviewer.received_standards.recommended == {}
@@ -902,11 +902,11 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
             session.delete(issue)
         previous_rules = project.current_rule_version
         current_dimensions = json.loads(json.dumps(previous_rules.dimension_standards))
-        current_dimensions["metadata"]["version"] = "1.4"
+        current_dimensions["metadata"]["version"] = "1.5"
         current_rules = RuleVersion(
             project=project,
             version=previous_rules.version + 1,
-            package_version="1.4",
+            package_version="1.5",
             package_digest="current-package-digest",
             business_domain=previous_rules.business_domain,
             document_type=previous_rules.document_type,
@@ -915,7 +915,7 @@ def test_legacy_zero_score_unavailable_audit_can_be_superseded(tmp_path: Path) -
             dimension_standards=current_dimensions,
             project_facts=previous_rules.project_facts,
             structured_rules=previous_rules.structured_rules,
-            prompt_version="tech_media_review-1.4",
+            prompt_version="tech_media_review-1.5",
         )
         current_rules.package_digest = compute_package_digest(_snapshot_compiled(current_rules))
         session.add(current_rules)

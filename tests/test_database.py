@@ -565,7 +565,7 @@ def test_seed_default_project_is_idempotent_and_uses_tech_review_package(tmp_pat
         rules = first.current_rule_version
         assert rules is not None
         assert rules.version == 1
-        assert rules.package_version == "1.3"
+        assert rules.package_version == "1.4"
         assert rules.project_code == "bdmap_xdxx_tech_review_2026"
         assert rules.dimension_standards["metadata"]["content_type"] == "TECH_MEDIA_REVIEW"
         serialized = str({"facts": rules.project_facts, "rules": rules.structured_rules})
@@ -601,7 +601,7 @@ def test_seed_repairs_stale_current_rule_version_pointer(tmp_path: Path) -> None
 
         repaired = seed_default_project(session)
 
-        assert repaired.current_rule_version.package_version == "1.3"
+        assert repaired.current_rule_version.package_version == "1.4"
         assert repaired.current_rule_version.package_digest != "stale"
 
 
@@ -636,9 +636,9 @@ def test_seed_publishes_new_package_version_over_legacy_snapshot(tmp_path: Path)
 
         assert [(version.version, version.package_version) for version in seeded.rule_versions] == [
             (1, "1.0"),
-            (2, "1.3"),
+            (2, "1.4"),
         ]
-        assert seeded.current_rule_version.package_version == "1.3"
+        assert seeded.current_rule_version.package_version == "1.4"
 
 
 def test_seed_preserves_existing_default_version_when_local_files_changed(tmp_path: Path) -> None:

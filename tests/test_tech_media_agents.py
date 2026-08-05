@@ -53,7 +53,7 @@ CONTEXT = ReviewContext(
 def representative_context_and_profile():
     root = Path(__file__).resolve().parents[1]
     draft = json.loads((root / "tests" / "fixtures" / "representative_tech_media_review.json").read_text(encoding="utf-8"))
-    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.3"))
+    compiled = compile_standard_package(load_standard_package(root / "data" / "standards", "bdmap_xdxx_tech_review_2026", "1.4"))
     version = SimpleNamespace(
         business_domain=compiled["metadata"]["business_domain"],
         document_type=compiled["metadata"]["document_type"],

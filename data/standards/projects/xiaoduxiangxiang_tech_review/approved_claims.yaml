@@ -38,6 +38,12 @@ approved_claims:
   - claim_id: WALK-005
     text: 路线规划可以结合终点附近餐厅或商圈需求
     source_reference: [approved_claims.yaml]
+  - claim_id: RIDE-001
+    text: 支持通过自然语言提出打车需求，并在用户确认后的打车流程中衔接出行方案
+    source_reference: [approved_claims.yaml]
+  - claim_id: VOICE-001
+    text: 支持在活动授权口径下切换或使用合作同款导航语音
+    source_reference: [approved_claims.yaml]
 pending_claims:
   - claim_id: PENDING-001
     text: 记住用户出行习惯和常去地点并在后续规划中自动适配

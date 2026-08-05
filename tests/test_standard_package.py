@@ -44,7 +44,7 @@ EXPECTED_AGENT_IDS = {
 def refresh_manifest(
     standards_root: Path,
     project_code: str = "bdmap_xdxx_tech_review_2026",
-    package_version: str = "1.3",
+    package_version: str = "1.4",
 ) -> None:
     standard_package_service.regenerate_standard_manifest(
         standards_root,
@@ -251,7 +251,7 @@ def test_loads_v1_package_from_canonical_chinese_paths() -> None:
         "bdmap_xdxx_tech_review_2026",
     )
 
-    assert package.metadata.version == "1.3"
+    assert package.metadata.version == "1.4"
     assert package.project.name == "百度地图小度想想"
     assert set(package.global_standards) == CANONICAL_GLOBAL_FILES
     assert set(package.agent_prompt_versions) == EXPECTED_AGENT_IDS
@@ -328,6 +328,26 @@ def test_v1_official_claims_are_approved_while_pending_claims_stay_pending() -> 
     pending_texts = {claim.text for claim in package.pending_claims}
     assert "小度想想可以AI订酒店" in pending_texts
     assert "小度想想可以自动筛选、比较酒店并判断最划算" in pending_texts
+
+
+def test_project_claims_cover_confirmed_taxi_and_voice_capabilities() -> None:
+    package = load_standard_package(REPO_ROOT / "data" / "standards", "bdmap_xdxx_tech_review_2026")
+
+    approved_texts = {claim.text for claim in package.approved_claims}
+    assert "支持通过自然语言提出打车需求，并在用户确认后的打车流程中衔接出行方案" in approved_texts
+    assert "支持在活动授权口径下切换或使用合作同款导航语音" in approved_texts
+
+    pending_texts = {claim.text for claim in package.pending_claims}
+    assert "打车时完全无需输入或确认即可自动完成行程" in pending_texts
+
+
+def test_compliance_standard_distinguishes_safe_headline_hooks_from_absolute_claims() -> None:
+    standard = (REPO_ROOT / "data" / "standards" / "global" / "合规与广告表达.md").read_text(encoding="utf-8")
+
+    assert "标题党/口语化吸引表达的安全边界" in standard
+    assert "不能只按“再也不用”“搞定”“神器”等词本身判风险" in standard
+    assert "标题是吸引眼球的口语化表达，正文只支持单次体验" in standard
+    assert "不应仅因标题修辞判为中风险" in standard
 
 
 def test_loads_only_matching_tech_media_package(standards_root: Path) -> None:
@@ -424,15 +444,15 @@ def test_loads_future_semantic_version_from_matching_project_directory(standards
     project_file.write_text(
         project_file.read_text(encoding="utf-8")
         .replace("bdmap_xdxx_tech_review_2026", "future_tech_review_2027")
-        .replace('version: "1.3"', 'version: "1.4"'),
+        .replace('version: "1.4"', 'version: "1.5"'),
         encoding="utf-8",
     )
-    refresh_manifest(standards_root, "future_tech_review_2027", "1.4")
+    refresh_manifest(standards_root, "future_tech_review_2027", "1.5")
 
-    package = load_standard_package(standards_root, "future_tech_review_2027", "1.4")
+    package = load_standard_package(standards_root, "future_tech_review_2027", "1.5")
 
     assert package.metadata.project_code == "future_tech_review_2027"
-    assert package.metadata.version == "1.4"
+    assert package.metadata.version == "1.5"
 
 
 def test_rejects_unknown_top_level_package_fields(standards_root: Path) -> None:
@@ -444,7 +464,7 @@ def test_rejects_unknown_top_level_package_fields(standards_root: Path) -> None:
     refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="unexpected_field"):
-        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.3")
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.4")
 
 
 def test_rejects_rule_reference_to_unknown_claim(standards_root: Path) -> None:
@@ -484,11 +504,11 @@ def test_rejects_legacy_rule_arrays(standards_root: Path) -> None:
     refresh_manifest(standards_root)
 
     with pytest.raises(ValueError, match="deny_words"):
-        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.3")
+        load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.4")
 
 
 def test_same_version_tampering_is_rejected_by_digest(standards_root: Path, tmp_path: Path) -> None:
-    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.3")
+    package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026", "1.4")
     engine = create_db_engine(f"sqlite:///{tmp_path / 'tamper.db'}")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -506,7 +526,7 @@ def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path
     package = load_standard_package(standards_root, "bdmap_xdxx_tech_review_2026")
     compiled = compile_standard_package(package)
 
-    assert compiled["metadata"]["version"] == "1.3"
+    assert compiled["metadata"]["version"] == "1.4"
     assert compiled["structured_rules"]["rules"]
     assert compiled["project_facts"]["project_code"] == "bdmap_xdxx_tech_review_2026"
 
@@ -526,7 +546,7 @@ def test_compiles_and_publishes_immutable_standard_snapshot(standards_root: Path
 
         assert version.id == same_version.id
         assert version.version == 1
-        assert version.package_version == "1.3"
+        assert version.package_version == "1.4"
         assert version.package_digest == compute_package_digest(compiled)
         assert version.project_code == "bdmap_xdxx_tech_review_2026"
         assert version.dimension_standards["metadata"] == compiled["metadata"]
