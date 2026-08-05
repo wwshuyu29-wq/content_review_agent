@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   AGENT_ORDER,
@@ -499,6 +499,11 @@ export default function Review() {
     setDetailError("");
     setDetailLoading(false);
   };
+  const selectRowByKeyboard = (event: KeyboardEvent<HTMLTableRowElement>, id: number) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    selectRow(id);
+  };
   const loadSelectedDetail = () => {
     if (!selectedId) return;
     setDetailRequestId(selectedId);
@@ -609,7 +614,14 @@ export default function Review() {
               <thead><tr><th>内容 / 版本</th><th>平台 / 账号</th><th>状态</th><th>风险</th><th>任务</th></tr></thead>
               <tbody>
                 {rows.map((row) => (
-                  <tr key={row.id} className={selectedId === row.id ? "selected-row" : ""}>
+                  <tr
+                    key={row.id}
+                    className={selectedId === row.id ? "selected-row" : ""}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => selectRow(row.id)}
+                    onKeyDown={(event) => selectRowByKeyboard(event, row.id)}
+                  >
                     <td><button type="button" className="row-select-button" aria-label={`选择内容 ${row.final_title || row.supplier_external_id}`} onClick={() => selectRow(row.id)}><b>{row.final_title || row.supplier_external_id}</b><span className="cell-subline">{row.supplier_external_id}{row.row_number ? ` · Excel 行 ${row.row_number}` : ""}</span></button></td>
                     <td>{row.platform || "—"}<div className="cell-subline">{row.account_name || "未提供账号"}</div></td>
                     <td><span className={`badge status-${row.review_status.toLowerCase()}`}>{label(row.review_status)}</span><div className="cell-subline">{formatSkipReason(row) || `发布：${publishStatusLabel(row.publish_status)}`}</div></td>

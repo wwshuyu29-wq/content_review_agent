@@ -292,7 +292,7 @@ def test_team_users_are_bootstrapped_from_environment(
         assert [user.username for user in users] == ["cj", "jhz", "lsy", "lxl", "lyx", "qj"]
         assert all(user.role == "REVIEWER" for user in users)
         assert all(user.is_active for user in users)
-        assert all(user.oneapi_model == "GPT 5.6 SOL" for user in users)
+        assert all(user.oneapi_model == "gpt-5.6-luna" for user in users)
         assert all(verify_password(user.password_hash, "team-password-123") for user in users)
 
 
@@ -656,17 +656,17 @@ def test_team_member_api_config_is_saved_per_account_without_plaintext_key(auth_
     saved = client.put(
         "/api/config",
         headers=headers,
-        json={"reviewer": "oneapi", "model": "GPT 5.6 SOL", "api_key": "sk-member-secret"},
+        json={"reviewer": "oneapi", "model": "gpt-5.6-luna", "api_key": "sk-member-secret"},
     )
 
     assert saved.status_code == 200
-    assert saved.json() == {"reviewer": "oneapi", "model": "GPT 5.6 SOL", "key_set": True}
+    assert saved.json() == {"reviewer": "oneapi", "model": "gpt-5.6-luna", "key_set": True}
     assert client.get("/api/config").json() == saved.json()
 
     with Session(engine) as session:
         member = session.scalar(select(User).where(User.username == "member"))
         admin = session.scalar(select(User).where(User.username == "admin"))
-        assert member.oneapi_model == "GPT 5.6 SOL"
+        assert member.oneapi_model == "gpt-5.6-luna"
         assert member.oneapi_key_ciphertext
         assert "sk-member-secret" not in member.oneapi_key_ciphertext
         assert admin.oneapi_key_ciphertext is None

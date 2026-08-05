@@ -805,6 +805,17 @@ input:focus, textarea:focus, select:focus {
   background: #f0f5ff;
 }
 
+.ops-table tbody tr[role="button"] {
+  cursor: pointer;
+}
+
+.ops-table tbody tr[role="button"]:hover,
+.ops-table tbody tr[role="button"]:focus-visible {
+  background: #f7faff;
+  outline: 2px solid rgba(31, 94, 255, .28);
+  outline-offset: -2px;
+}
+
 .badge,
 .count,
 .task-count {

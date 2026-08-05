@@ -257,7 +257,7 @@ def test_dashboard_overview_groups_team_workload_quality_and_issue_clusters(api)
             content_item_id=second.id,
             content_version_id=second_version.id,
             rule_version_id=project["current_rule_version_id"],
-            model="GPT 5.6 SOL",
+            model="gpt-5.6-luna",
             prompt_version="test",
             status="COMPLETED",
             created_by_user_id=member.id,
@@ -695,12 +695,12 @@ def test_config_accepts_api_key_without_exposing_secret_or_legacy_key_fields(api
         "/api/config",
         json={
             "reviewer": "oneapi",
-            "model": "GPT 5.6 SOL",
+            "model": "gpt-5.6-luna",
             "api_key": "must-not-be-exposed",
         },
     )
     assert updated.status_code == 200
-    assert updated.json() == {"reviewer": "oneapi", "model": "GPT 5.6 SOL", "key_set": True}
+    assert updated.json() == {"reviewer": "oneapi", "model": "gpt-5.6-luna", "key_set": True}
     assert "must-not-be-exposed" not in updated.text
 
     rejected = client.put(

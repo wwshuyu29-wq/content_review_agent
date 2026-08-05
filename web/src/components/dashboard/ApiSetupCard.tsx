@@ -4,7 +4,6 @@ import { api, type Config } from "../../api";
 const DEFAULT_MODEL = "gpt-5.6-luna";
 const MODEL_OPTIONS = [
   "gpt-5.6-luna",
-  "GPT 5.6 SOL",
 ];
 
 export default function ApiSetupCard({ config, onSaved }: { config: Config | null; onSaved: (config: Config) => void }) {

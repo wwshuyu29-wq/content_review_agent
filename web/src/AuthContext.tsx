@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, onUnauthorized, setCsrfToken, type AuthUser } from "./api";
 
 interface AuthState {
@@ -13,16 +13,10 @@ const AuthContext = createContext<AuthState | undefined>(undefined);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
-  const redirecting = useRef(false);
 
   const clearSession = useCallback(() => {
     setCsrfToken(null);
     setUser(null);
-    // Avoid stacking multiple redirects when several 401s fire in the same tick.
-    if (!redirecting.current && window.location.pathname !== "/login") {
-      redirecting.current = true;
-      window.location.assign("/login");
-    }
   }, []);
 
   useEffect(() => onUnauthorized(clearSession), [clearSession]);

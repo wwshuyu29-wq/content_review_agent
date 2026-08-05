@@ -78,7 +78,7 @@ export ONEAPI_BASE_URL="https://oneapi-comate.baidu-int.com/v1"
 ```bash
 export TEAM_USERNAMES="jhz,lsy,lyx,qj,lxl,cj"
 export TEAM_USER_PASSWORD="至少12位的团队初始密码"
-export TEAM_USER_MODEL="GPT 5.6 SOL"
+export TEAM_USER_MODEL="gpt-5.6-luna"
 ```
 
 这些账号默认是 `REVIEWER`。每个成员登录后在首页/看板的 One API 配置卡片中填写自己的 API key；key 按账号加密保存，不会与其他成员共享。

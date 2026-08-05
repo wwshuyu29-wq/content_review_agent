@@ -25,7 +25,7 @@ from server.models import User, UserSession
 
 SESSION_COOKIE_NAME = "content_review_session"
 DEFAULT_SESSION_TTL = timedelta(hours=12)
-DEFAULT_TEAM_MODEL = "GPT 5.6 SOL"
+DEFAULT_TEAM_MODEL = "gpt-5.6-luna"
 _PASSWORD_HASHER = PasswordHasher(type=Type.ID)
 _DUMMY_PASSWORD_HASH: Optional[str] = None
 

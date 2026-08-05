@@ -20,6 +20,15 @@ def test_login_success_uses_router_navigation_without_hard_reload() -> None:
     assert "window.location.assign" not in source
 
 
+def test_unauthorized_session_clear_uses_router_gate_without_hard_reload() -> None:
+    auth = (WEB / "AuthContext.tsx").read_text(encoding="utf-8")
+    app = (WEB / "App.tsx").read_text(encoding="utf-8")
+
+    assert "window.location.assign" not in auth
+    assert "window.location.href" not in auth
+    assert 'path="*" element={<Navigate to="/login" replace />}' in app
+
+
 def test_authenticated_shell_uses_baidu_maps_sidebar_navigation() -> None:
     app = (WEB / "App.tsx").read_text(encoding="utf-8")
     styles = (WEB / "styles.css").read_text(encoding="utf-8")
@@ -170,8 +179,8 @@ def test_api_setup_allows_team_members_to_choose_or_type_models() -> None:
     assert '<datalist id="dashboard-model-options">' in setup
     assert "可选择常用模型，也可以直接输入团队可用的模型名" in setup
     assert "团队成员各自保存自己的 key 和模型" in setup
-    assert "GPT 5.6 SOL" in setup
     assert "gpt-5.6-luna" in setup
+    assert "GPT 5.6 SOL" not in setup
     assert "<select" not in setup
 
 
@@ -208,6 +217,16 @@ def test_review_workspace_shows_format_skip_reason() -> None:
     assert "format_errors: string[]" in api
     assert "formatSkipReason" in review
     assert "未进入自动审核" in review
+
+
+def test_review_content_table_rows_are_clickable_beyond_title_button() -> None:
+    review = (WEB / "pages" / "Review.tsx").read_text(encoding="utf-8")
+
+    assert 'role="button"' in review
+    assert "tabIndex={0}" in review
+    assert "onKeyDown={(event) => selectRowByKeyboard(event, row.id)}" in review
+    assert "onClick={() => selectRow(row.id)}" in review
+    assert "selectRowByKeyboard" in review
 
 
 def test_business_types_do_not_carry_raw_result() -> None:
